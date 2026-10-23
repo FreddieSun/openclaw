@@ -41,10 +41,7 @@
   align-items: center;
   gap: 6px;
   width: 100%;
-  min-height: 30px;
-  padding: 4px 2px;
   border: 0;
-  border-radius: 4px;
   background: transparent;
   color: var(--text);
   text-align: start;
@@ -60,6 +57,9 @@
 .chat-context__label {
   overflow-wrap: anywhere;
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .chat-context__tokens {
   text-align: end;
@@ -90,11 +90,6 @@
 }
 .chat-context--popover .chat-context__swatch {
   justify-self: center;
-}
-.chat-context--popover .chat-context__label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .chat-context--popover .chat-context__note {
   margin: 0;
@@ -228,7 +223,6 @@ openclaw-chat-context-panel {
   color: var(--warn);
 }
 .chat-context-page .chat-context__bar {
-  height: 7px;
   margin: 12px 0 0;
 }
 .chat-context-page .chat-context__segment {
@@ -276,15 +270,11 @@ openclaw-chat-context-panel {
   column-gap: 10px;
   border-radius: var(--radius-sm);
   font: inherit;
-  color: var(--text);
   opacity: 1;
   transition: background-color 0.2s ease-out;
 }
 .chat-context-page .chat-context__label {
   min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
 }
 .chat-context-page .chat-context__label small {
   margin-left: 6px;
@@ -422,12 +412,15 @@ openclaw-chat-context-panel {
 .chat-context-page .chat-context__row.chat-context__highlighted {
   background: var(--bg-hover);
 }
-.chat-context-page--loading .chat-context-page__numbers > *,
-.chat-context-page--loading .chat-context-page__legend > *,
-.chat-context-page--loading .chat-context-page__latest > *,
-.chat-context-page--loading .chat-context__label,
-.chat-context-page--loading .chat-context__tokens,
-.chat-context-page--loading .chat-context__swatch {
+.chat-context-page--loading
+  :is(
+    .chat-context-page__numbers > *,
+    .chat-context-page__legend > *,
+    .chat-context-page__latest > *,
+    .chat-context__label,
+    .chat-context__tokens,
+    .chat-context__swatch
+  ) {
   color: transparent;
   background: var(--bg-hover);
   border-radius: 3px;
@@ -485,13 +478,16 @@ openclaw-chat-context-panel {
     transition: none;
   }
   .chat-context__refreshing,
-  .chat-context-page--loading .chat-context-page__numbers > *,
-  .chat-context-page--loading .chat-context-page__legend > *,
-  .chat-context-page--loading .chat-context-page__latest > *,
-  .chat-context-page--loading .chat-context__label,
-  .chat-context-page--loading .chat-context__tokens,
-  .chat-context-page--loading .chat-context__swatch,
-  .chat-context-page .chat-context__accordion {
+  .chat-context-page .chat-context__accordion,
+  .chat-context-page--loading
+    :is(
+      .chat-context-page__numbers > *,
+      .chat-context-page__legend > *,
+      .chat-context-page__latest > *,
+      .chat-context__label,
+      .chat-context__tokens,
+      .chat-context__swatch
+    ) {
     animation: none;
   }
 }
