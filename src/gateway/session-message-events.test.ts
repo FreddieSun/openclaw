@@ -73,9 +73,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   subscribedOperatorWs?.close();
-  if (harness) {
-    await harness.close();
-  }
+  await harness?.close();
 });
 
 afterEach(async () => {
@@ -93,9 +91,7 @@ async function createSessionStoreFile(): Promise<string> {
   return storePath;
 }
 
-async function createMainSessionStore(
-  entry: Parameters<typeof writeSessionStore>[0]["entries"][string] = {},
-): Promise<string> {
+async function createMainSessionStore(entry: StoreEntries[string] = {}): Promise<string> {
   return createSessionStore({ main: { sessionId: "sess-main", ...entry } });
 }
 
@@ -346,7 +342,11 @@ describe("session.message websocket events", () => {
         }),
       ]),
     );
-    expect(event.stateVersion?.presence).toBeGreaterThan(declaration.stateVersion?.presence ?? 0);
+    const declaredPresenceVersion = declaration.stateVersion?.presence ?? 0;
+    if (typeof declaredPresenceVersion !== "number") {
+      throw new Error("Expected a numeric declared presence version");
+    }
+    expect(event.stateVersion?.presence).toBeGreaterThan(declaredPresenceVersion);
   });
 
   test("enforces session-scoped chat delivery on real gateway connections", async () => {

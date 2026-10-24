@@ -328,7 +328,13 @@ describe("recoverEmbeddedRunAttempt", () => {
       });
       const { recovery, recover, failoverRetryController, continueFromCurrentTranscript } = fixture;
       expect(recovery).toMatchObject({ action: "retry", lastRetryFailoverReason: null });
-      expectTranscriptRetry(fixture, 2);
+      expect(fixture.markOwnedTranscriptRetry).toHaveBeenCalledTimes(2);
+      expect(fixture.continueFromCurrentTranscript).toHaveBeenCalledExactlyOnceWith({
+        includeToolFailureInstruction: false,
+        messages: fixture.attempt.messagesSnapshot,
+      });
+      expect(fixture.failoverRetryController.transientRetryCount).toBe(1);
+      expectNoProfileFailure(fixture);
       expect(fixture.onAgentEvent).toHaveBeenCalledWith(
         expect.objectContaining({
           stream: "run_status",

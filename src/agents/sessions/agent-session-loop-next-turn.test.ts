@@ -85,6 +85,10 @@ function recordRequests(
   return requests;
 }
 
+type NextTurnContext = Parameters<
+  NonNullable<AgentSession["agent"]["prepareNextTurnWithContext"]>
+>[0]["context"];
+
 function nextTurnPreparer(session: AgentSession) {
   const hook = session.agent.prepareNextTurnWithContext;
   if (!hook) {
@@ -92,7 +96,7 @@ function nextTurnPreparer(session: AgentSession) {
   }
   const message = createAssistant(testModel, "turn complete");
   const newMessages = [message];
-  return (context: Context) => hook({ message, toolResults: [], context, newMessages });
+  return (context: NextTurnContext) => hook({ message, toolResults: [], context, newMessages });
 }
 
 function heldResponse(model: Model, signal?: AbortSignal) {
@@ -754,7 +758,7 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
     async (fields) => {
       const hookTool = makeTool("hook_tool");
       const hookModel = { ...testModel, id: "hook-model" };
-      const context: Context = {
+      const context: NextTurnContext = {
         systemPrompt: "hook prompt",
         messages: [],
         ...(fields === "explicit" ? { tools: [hookTool] } : {}),

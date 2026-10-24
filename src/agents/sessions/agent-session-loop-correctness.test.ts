@@ -29,6 +29,7 @@ import {
 import type { AgentSessionEvent } from "./agent-session-types.js";
 import type {
   ExtensionAPI,
+  ExtensionFactory,
   ToolDefinition,
   TurnEndEvent,
   TurnStartEvent,

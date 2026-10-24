@@ -58,9 +58,11 @@ vi.mock("./in-process-gateway.js", () => ({
   runWithGatewayToolContinuationContext: async <T>(run: () => Promise<T>): Promise<T> => run(),
 }));
 
+// mock-isolation: Exercise send orchestration without starting A2A agent turns.
 vi.mock("./sessions-send-tool.a2a.js", () => ({
   runSessionsSendA2AFlow,
 }));
+// mock-isolation: Participant persistence is separate from this mocked Gateway boundary.
 vi.mock("../../sessions/session-participant-recording.js", () => ({
   recordSessionParticipantBestEffort: vi.fn(),
 }));
@@ -102,6 +104,7 @@ function sessionList(
 function gatewayParams(method: string) {
   return requireRecord(
     callGatewayMock.mock.calls.find(([request]) => request.method === method)?.[0]?.params,
+    `${method} params`,
   );
 }
 

@@ -219,7 +219,7 @@ describe("model transitions after SQLite write admission", () => {
       .spyOn(metadataRuntime, "withSessionMetadataWorker")
       .mockImplementation(observeCommands);
     try {
-      const { session, sessionManager, target } = await createModelSession(
+      const { session, manager, target } = await createModelSession(
         undefined,
         undefined,
         undefined,
@@ -228,7 +228,7 @@ describe("model transitions after SQLite write admission", () => {
       const before = await loadTranscriptEvents(target);
       await session.setModel(nextModel);
       expect(commands).toEqual(new Set(["session.metadata.initialize", "session.metadata.append"]));
-      expect(sessionManager.getSessionTarget()?.env?.OPENCLAW_STATE_DIR).toBe(stateDir);
+      expect(manager.getSessionTarget()?.env?.OPENCLAW_STATE_DIR).toBe(stateDir);
       const after = await loadTranscriptEvents(target);
       expect(after.slice(0, before.length)).toEqual(before);
       expect(after.slice(before.length)).toMatchObject([
