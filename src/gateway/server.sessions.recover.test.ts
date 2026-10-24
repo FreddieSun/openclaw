@@ -774,7 +774,7 @@ test("sessions.recover revalidates participation at the recovery writer commit",
 test("sessions.recover revalidates runtime authority after its cloud placement reclaim", async () => {
   const fixture = await recoveryFixture("recovery-cloud-authority-race");
   let authorityActive = true;
-  let placement = fixture.placement("active");
+  let placement: WorkerSessionPlacementRecord = fixture.placement("active");
   const reclaim = vi.fn(async (_request: unknown, authorize?: () => void) => {
     authorize?.();
     authorityActive = false;

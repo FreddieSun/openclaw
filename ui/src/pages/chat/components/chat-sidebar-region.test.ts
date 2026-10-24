@@ -143,7 +143,9 @@ function pointerFocus(target: Element) {
 
 function fakeAnimationFrames() {
   vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
-  onTestFinished(() => vi.useRealTimers());
+  onTestFinished(() => {
+    vi.useRealTimers();
+  });
 }
 
 function mobilePanelHost(region: Region) {

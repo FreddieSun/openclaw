@@ -365,12 +365,12 @@ it("keeps exact-run usage visible through final event batching and later correct
   rerender({
     runId: null,
     runWorking: false,
-    selectedSession: {
+    selectedSession: session(sessionKey, {
       ...props.selectedSession,
       lastRunId: runId,
       endedAt: 16_000,
       runtimeMs: 14_000,
-    },
+    }),
   });
   expectRecap("7k output tokens");
   usage(runId, 4, 7_094);
