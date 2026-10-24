@@ -97,7 +97,7 @@ function root(region: Region): HTMLElement {
   return region.parentElement!;
 }
 
-function query<T extends HTMLElement = HTMLElement>(region: Region, selector: string) {
+function query<T extends HTMLElement = HTMLElement>(region: Region, selector: string): T | null {
   return root(region).querySelector<T>(selector);
 }
 

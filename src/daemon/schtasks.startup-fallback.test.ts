@@ -118,6 +118,7 @@ vi.mock("node:child_process", async () => {
     },
   };
 });
+// mock-isolation: Windows fallback cases must not inspect or signal live gateway processes.
 vi.mock("../infra/gateway-processes.js", () => ({
   findVerifiedGatewayListenerPidsOnPortSync: (port: number) => verifiedGatewayPids(port),
 }));
@@ -986,4 +987,3 @@ describe("Windows startup fallback", () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 });
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

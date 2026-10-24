@@ -56,7 +56,7 @@ const viewer = (id: string, name = id): PresenceEntry => ({
 const query = <T extends Element = HTMLElement & { updateComplete?: Promise<unknown> }>(
   root: ParentNode,
   selector: string,
-) => root.querySelector<T>(selector)!;
+): T => root.querySelector<T>(selector)!;
 const text = (root: ParentNode, selector: string) => query(root, selector)?.textContent?.trim();
 const absent = (root: ParentNode, selectors: string) =>
   expect(root.querySelector(selectors)).toBeNull();

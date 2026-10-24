@@ -26,7 +26,7 @@ import {
 
 let container: HTMLDivElement;
 
-const query = <T extends Element = HTMLElement>(selector: string) =>
+const query = <T extends Element = HTMLElement>(selector: string): T | null =>
   container.querySelector<T>(selector);
 const text = (selector: string) => query(selector)?.textContent;
 const click = (selector: string) => query<HTMLButtonElement>(selector)?.click();

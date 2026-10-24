@@ -44,7 +44,7 @@ const settings = (): HeaderMenuElement["settings"] => ({
   chatShowToolCalls: true,
   chatPersistCommentary: true,
 });
-const query = <T extends Element = HTMLButtonElement>(root: ParentNode, selector: string) =>
+const query = <T extends Element = HTMLButtonElement>(root: ParentNode, selector: string): T =>
   expectDefined(root.querySelector<T>(selector), selector);
 const panel = (menu: ParentNode) => query<HTMLElement>(menu, ".chat-header-session-menu__panel");
 const itemLabel = (item: Element) =>

@@ -60,6 +60,8 @@ const sessionDirs = useSessionStoreTempDirs(afterAll, "openclaw-codex-compact-")
 
 let tempDir: string;
 let finishCompactionTestCleanup: ReturnType<typeof beginCompactionTestCleanup>;
+const createFakeCodexClient = (options?: Parameters<typeof createFakeCodexCompactionClient>[1]) =>
+  createFakeCodexCompactionClient(tempDir, options);
 
 const INCOGNITO_COMPACT_KEY = "agent:main:dashboard:incognito-compact-catalog";
 
@@ -1143,11 +1145,12 @@ describe("maybeCompactCodexAppServerSession", () => {
   });
 
   it("requires a Codex binding instead of delegating to an owning context engine", async () => {
+    const compact = vi.fn();
     const contextEngine: ContextEngine = {
       info: { id: "lossless-claw", name: "Lossless Claw", ownsCompaction: true },
       assemble: vi.fn() as never,
       ingest: vi.fn() as never,
-      compact: vi.fn(),
+      compact,
     };
 
     const result = await maybeCompactCodexAppServerSession(
@@ -1159,11 +1162,8 @@ describe("maybeCompactCodexAppServerSession", () => {
       compacted: false,
       failure: { reason: "missing_thread_binding" },
     });
-    expect(contextEngine.compact).not.toHaveBeenCalled();
+    expect(compact).not.toHaveBeenCalled();
   });
 });
 
-function createFakeCodexClient(options?: Parameters<typeof createFakeCodexCompactionClient>[1]) {
-  return createFakeCodexCompactionClient(tempDir, options);
-}
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
