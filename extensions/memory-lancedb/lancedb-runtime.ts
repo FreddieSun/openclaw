@@ -1,5 +1,7 @@
 type LanceDbModule = typeof import("@lancedb/lancedb");
 
+export { acquireMemoryTableUsage } from "./lancedb-custody.js";
+
 const platform = process.platform;
 const arch = process.arch;
 let loadPromise: Promise<LanceDbModule> | null = null;

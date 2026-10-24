@@ -60,6 +60,7 @@ export async function connect(mode, options) {
   };
 }
 export async function loadLanceDbModule() { return { connect }; }
+export async function acquireMemoryTableUsage() { return null; }
 `)}`;
 
 afterEach(async () => {

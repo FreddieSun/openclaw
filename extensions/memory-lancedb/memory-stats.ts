@@ -25,9 +25,11 @@ import { readFileSync } from "node:fs";
 const input = JSON.parse(readFileSync(0, "utf8"));
 let db;
 let table;
+let usage;
 const result = {};
 try {
-  const { loadLanceDbModule } = await import(input.moduleUrl);
+  const { loadLanceDbModule, acquireMemoryTableUsage } = await import(input.moduleUrl);
+  usage = await acquireMemoryTableUsage(input.dbPath);
   const lancedb = await loadLanceDbModule();
   db = await lancedb.connect(input.dbPath, { storageOptions: input.storageOptions });
   if ((await db.tableNames()).includes(input.tableName)) {
@@ -42,6 +44,7 @@ try {
 } finally {
   table?.close();
   db?.close();
+  await usage?.release();
 }
 process.stdout.write(JSON.stringify(result));
 `;
