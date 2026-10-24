@@ -13,7 +13,7 @@ export function createMemoryCliHarness(
     statsSource?: MemoryStatsSource;
   } = {},
 ) {
-  const program = new Command();
+  const program = new Command().exitOverride().configureOutput({ writeErr: () => {} });
   const registerCli = (register: (context: { program: Command }) => void) => register({ program });
   const embed = vi.fn(async () => [0.1, 0.2]);
   const close = vi.fn(async () => {});

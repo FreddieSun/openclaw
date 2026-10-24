@@ -33,6 +33,9 @@ it("optimizes the whole table offline and closes it after reporting counts", asy
   const { runWithLocalStateOwner } = await import("openclaw/plugin-sdk/cli-state-owner");
   const harness = createHarness();
   await harness.run("optimize");
+  await expect(harness.run("optimize", "--agent", "private")).rejects.toMatchObject({
+    code: "commander.unknownOption",
+  });
 
   expect(runWithLocalStateOwner).toHaveBeenCalledWith(
     expect.objectContaining({ onForeignOwner: "refuse", params: {} }),

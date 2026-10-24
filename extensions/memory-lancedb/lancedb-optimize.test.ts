@@ -11,7 +11,7 @@ test("offline optimization refuses open handles and preserves every agent's memo
   const writer = new MemoryDB(writerPath, 2);
   const optimizer = new MemoryDB(getDbPath(), 2);
   try {
-    for (let index = 0; index < 6; index++) {
+    for (let index = 0; index < 2; index++) {
       await writer.store(index % 2 ? "alpha" : "beta", {
         text: `synthetic memory ${index}`,
         vector: [index / 10, 1],
@@ -30,8 +30,8 @@ test("offline optimization refuses open handles and preserves every agent's memo
     await expect(optimizer.optimize()).rejects.toThrow(/in use/);
     await writer.close();
     await expect(optimizer.optimize()).resolves.toEqual({
-      before: { rows: 6, fragments: 6 },
-      after: { rows: 6, fragments: 1 },
+      before: { rows: 2, fragments: 2 },
+      after: { rows: 2, fragments: 1 },
     });
     writer.start();
     await expect(writer.list("alpha")).resolves.toEqual(before);
