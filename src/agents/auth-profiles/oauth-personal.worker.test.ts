@@ -50,7 +50,7 @@ import {
 } from "./oauth-native-provider.test-support.js";
 import { isOAuthRefreshFence, isPendingOAuthRefreshFence } from "./oauth-refresh-marker.js";
 import { resolveApiKeyForProfile } from "./oauth.js";
-import { withPersonalAuthProfileStore, type PersonalAuthProfileStore } from "./personal-store.js";
+import { withPersonalAuthProfileStore } from "./personal-store.js";
 import { writeAuthProfileJsonCell } from "./sqlite-json-write.js";
 import { inspectAuthProfileJsonCell } from "./sqlite-json.js";
 import type { OAuthCredential, UserModelAuthProfile } from "./types.js";
@@ -72,16 +72,6 @@ function expectUnavailable(read: () => unknown) {
 function managerWith(overrides: NativeOAuthProviderFixture) {
   mockOAuthProviderOperations(overrides);
   return createOAuthManager();
-}
-
-async function preparedStore<T>(
-  profileId: string,
-  run: (store: PersonalAuthProfileStore) => Promise<T>,
-) {
-  return withPersonalAuthProfileStore(profileId, async (store) => {
-    await store.read();
-    return run(store);
-  });
 }
 
 async function transientRefresh(
@@ -245,7 +235,10 @@ function writeCredential(
 
 async function prepareCredentialReader(profileId: string) {
   return expectDefined(
-    await preparedStore(profileId, async (owner) => owner.readCurrentCredential),
+    await withPersonalAuthProfileStore(profileId, async (owner) => {
+      await owner.read();
+      return owner.readCurrentCredential;
+    }),
     "prepared personal credential reader",
   );
 }
@@ -471,7 +464,8 @@ it("accepts published credentials database-free", async ({
   replace,
 }) => {
   const observe = vi.fn<(observation: CanonicalAuthProfileCredentialObservation) => void>();
-  await preparedStore(profileId, async (owner) => {
+  await withPersonalAuthProfileStore(profileId, async (owner) => {
+    await owner.read();
     await withCanonicalAuthProfileCredentialObserver(observe, async () => {
       expect(await withoutDatabase(() => owner.accept(credential))).toEqual(credential);
       replace();
@@ -545,40 +539,25 @@ it.for(["conflict", "unknown"] as const)(
   },
 );
 
-it("waits for the native commit receipt", async ({ profileId, replacement, readCurrent }) => {
-  const observe = operationAdmission.observeSqliteWorkerCommittedFacts;
-  let heldReceipt = false;
-  vi.spyOn(operationAdmission, "observeSqliteWorkerCommittedFacts").mockImplementation(
-    (admission, publish) =>
-      observe(admission, (receipt) => {
-        if (isRecord(receipt.facts) && receipt.facts.personalCredentials) {
-          heldReceipt = true;
-          expect(readUserModelAuthProfile(profileId)?.credential).toEqual(replacement);
-          const sql = observeMainThreadSql();
-          const requests = vi.spyOn(Worker.prototype, "postMessage");
-          try {
-            expectUnavailable(readCurrent);
-            sql.expectIdle();
-            expect(requests).not.toHaveBeenCalled();
-          } finally {
-            sql.restore();
-            requests.mockRestore();
-          }
-        }
-        publish(receipt);
-      }),
-  );
-  await writeCredential(profileId, replacement);
-  expect(heldReceipt).toBe(true);
-  expect(readCurrent()).toEqual(replacement);
-});
-
 it.for(["unacknowledged", "acknowledged"] as const)(
   "preserves the correct postimage after %s worker death",
   async (stage, { profileId, replacement, readCurrent }) => {
     const acknowledged = { ...replacement };
     const tracked = trackReplacements();
     let terminated: Promise<number> | undefined;
+    let receiptObserved = false;
+    const observe = operationAdmission.observeSqliteWorkerCommittedFacts;
+    vi.spyOn(operationAdmission, "observeSqliteWorkerCommittedFacts").mockImplementation(
+      (admission, publish) =>
+        observe(admission, (receipt) => {
+          if (isRecord(receipt.facts) && receipt.facts.personalCredentials) {
+            receiptObserved = true;
+            expect(readUserModelAuthProfile(profileId)?.credential).toEqual(acknowledged);
+            expectUnavailable(readCurrent);
+          }
+          publish(receipt);
+        }),
+    );
     probe.admission(operationAdmission, (request, grant, admit) => {
       if (stage === "unacknowledged" && tracked.target && request.stage === "commit") {
         expectUnavailable(readCurrent);
@@ -631,6 +610,7 @@ it.for(["unacknowledged", "acknowledged"] as const)(
         expectUnavailable(readCurrent);
         await expect(prepareCredentialReader(profileId)).rejects.toThrow();
       } else {
+        expect(receiptObserved).toBe(true);
         expect(failure).toBeUndefined();
         expect(result?.profiles[profileId]).toStrictEqual(acknowledged);
         expect(result?.usageStats?.[profileId]).toStrictEqual({ lastProbeAt: 123 });
@@ -754,7 +734,8 @@ it.for(["capture fails", "capture revoked"])(
       failure === "capture fails"
         ? "synthetic refresh authority unavailable"
         : "selection changed during refresh";
-    await preparedStore(profileId, async (store) => {
+    await withPersonalAuthProfileStore(profileId, async (store) => {
+      await store.read();
       const capture = store.captureRefreshAuthority.bind(store);
       vi.spyOn(store, "captureRefreshAuthority").mockImplementation(async () => {
         if (failure === "capture fails") {

@@ -311,52 +311,41 @@ describe("promoteAuthProfileInOrder", () => {
       ).resolves.toMatchObject({ apiKey: "sk-shared-replacement" });
     }, true));
 
-  it("preserves derived runtime snapshots on a caller-owned main-store no-op", () =>
-    withProfileState(async ({ agentDir, agentDirFor }) => {
-      const derivedAgentDir = agentDirFor("worker");
-      const mainStore: AuthProfileStore = profileStore(
-        "openai:default",
-        apiKey("openai", "sk-main"),
-      );
-      saveAuthProfileStore(mainStore, agentDir);
-      const derivedStore = loadRuntime(derivedAgentDir);
-      publishSnapshots([
-        { agentDir, store: loadRuntime(agentDir) },
-        { agentDir: derivedAgentDir, store: derivedStore },
-      ]);
-
-      runAuthProfileWriteTransaction(agentDir, (database) => {
-        saveAuthProfileStore(mainStore, agentDir, undefined, database);
-      });
-
-      expect(runtimeSnapshot(derivedAgentDir)).toEqual(derivedStore);
-    }));
-
-  it("drops caller-owned publication when a nested savepoint rolls back", () =>
-    withProfileState(async ({ agentDir }) => {
-      const initial: AuthProfileStore = profileStore(
-        "openai:default",
-        apiKey("openai", "sk-initial"),
-      );
-      const candidate: AuthProfileStore = profileStore(
-        "openai:default",
-        apiKey("openai", "sk-candidate"),
-      );
-      saveAuthProfileStore(initial, agentDir);
-      publishSnapshot(agentDir, initial);
-
-      runAuthProfileWriteTransaction(agentDir, () => {
-        expect(() =>
-          runAuthProfileWriteTransaction(agentDir, (database) => {
-            saveAuthProfileStore(candidate, agentDir, undefined, database);
-            throw new Error("rollback savepoint");
-          }),
-        ).toThrow("rollback savepoint");
-      });
-
-      expect(loadPersisted(agentDir)).toMatchObject(initial);
-      expect(runtimeSnapshot(agentDir)).toEqual(initial);
-    }));
+  it.each(["no-op", "savepoint rollback"] as const)(
+    "preserves owner and derived snapshots after a caller-owned %s",
+    (outcome) =>
+      withProfileState(({ agentDir, agentDirFor }) => {
+        const derivedAgentDir = agentDirFor("worker");
+        const initial = profileStore("openai:default", apiKey("openai", "sk-initial"));
+        saveAuthProfileStore(initial, agentDir);
+        const main = loadRuntime(agentDir);
+        const derived = loadRuntime(derivedAgentDir);
+        publishSnapshots([
+          { agentDir, store: main },
+          { agentDir: derivedAgentDir, store: derived },
+        ]);
+        runAuthProfileWriteTransaction(agentDir, (database) => {
+          if (outcome === "no-op") {
+            saveAuthProfileStore(initial, agentDir, undefined, database);
+          } else {
+            expect(() =>
+              runAuthProfileWriteTransaction(agentDir, (nested) => {
+                saveAuthProfileStore(
+                  profileStore("openai:default", apiKey("openai", "sk-candidate")),
+                  agentDir,
+                  undefined,
+                  nested,
+                );
+                throw new Error("rollback savepoint");
+              }),
+            ).toThrow("rollback savepoint");
+          }
+        });
+        expect(loadPersisted(agentDir)).toMatchObject(initial);
+        expect(runtimeSnapshot(agentDir)).toEqual(main);
+        expect(runtimeSnapshot(derivedAgentDir)).toEqual(derived);
+      }),
+  );
 
   it.each(["before save", "before publication"] as const)(
     "preserves a runtime-only OAuth mutation %s",
@@ -628,17 +617,9 @@ describe("promoteAuthProfileInOrder", () => {
       await withProfileState(async ({ agentDir }) => {
         fs.mkdirSync(agentDir, { recursive: true });
         const storedId = matching ? "openai:default" : "openai:user@example.test";
-        const prefix = matching ? "stale" : "good";
-        saveProfile(
-          storedId,
-          oauth(
-            `${prefix}-access-token`,
-            `${prefix}-refresh-token`,
-            Date.now() + (matching ? -60_000 : 60_000),
-          ),
-          agentDir,
-          { lastGood: { openai: storedId } },
-        );
+        saveProfile(storedId, oauth("access", "refresh"), agentDir, {
+          lastGood: { openai: storedId },
+        });
         await clearLastGoodProfileWithLock({
           agentDir,
           provider: "openai",

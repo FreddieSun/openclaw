@@ -46,6 +46,16 @@ function oauth(access: string, refresh: string, overrides: Partial<OAuthCredenti
   return createCredential({ access, refresh, ...overrides });
 }
 
+function refreshed(access: string, refresh: string, identity: Partial<OAuthCredential> = {}) {
+  return {
+    apiKey: access,
+    credential: oauth(access, refresh, {
+      expires: Date.now() + 600_000,
+      ...identity,
+    }),
+  };
+}
+
 function serializedStore(
   credential: OAuthCredential,
   timeoutMs = 1_000,
@@ -173,13 +183,11 @@ describe("OAuth refresh generation fence", () => {
     const peerRefresh = vi.fn(async () => null);
     const peer = run(peerRefresh);
 
-    release.resolve({
-      apiKey: "serialized-rotated-access",
-      credential: oauth("serialized-rotated-access", "serialized-rotated-refresh", {
-        expires: Date.now() + 600_000,
+    release.resolve(
+      refreshed("serialized-rotated-access", "serialized-rotated-refresh", {
         accountId: "acct-123",
       }),
-    });
+    );
     await drain;
     // A peer may have read the fence before rotation; drive its poll, not microtask ordering.
     await vi.advanceTimersByTimeAsync(25);
@@ -219,13 +227,7 @@ describe("OAuth refresh generation fence", () => {
     );
 
     await expect(observer).resolves.toBeNull();
-    release.resolve({
-      apiKey: "rotated-a-access",
-      credential: oauth("rotated-a-access", "rotated-a-refresh", {
-        expires: Date.now() + 600_000,
-        accountId: "acct-a",
-      }),
-    });
+    release.resolve(refreshed("rotated-a-access", "rotated-a-refresh", { accountId: "acct-a" }));
     await expect(owner).rejects.toThrow("owner changed");
     expect(refresh).toHaveBeenCalledOnce();
     expect(peerRefresh).not.toHaveBeenCalled();
@@ -245,13 +247,7 @@ describe("OAuth refresh generation fence", () => {
     const run = storage.run;
 
     await expect(
-      run(async () => ({
-        apiKey: "account-b-access",
-        credential: oauth("account-b-access", "account-b-refresh", {
-          expires: Date.now() + 600_000,
-          accountId: "acct-b",
-        }),
-      })),
+      run(async () => refreshed("account-b-access", "account-b-refresh", { accountId: "acct-b" })),
     ).rejects.toThrow("different OAuth account");
 
     let stored = storage.read();
@@ -570,20 +566,10 @@ describe("OAuth refresh generation fence", () => {
 
     storage.write(firstCredential);
     await expect(
-      run(async () => ({
-        apiKey: "second-rotated-access",
-        credential: oauth("second-rotated-access", "second-rotated-refresh", {
-          expires: Date.now() + 600_000,
-        }),
-      })),
+      run(async () => refreshed("second-rotated-access", "second-rotated-refresh")),
     ).resolves.toMatchObject({ apiKey: "second-rotated-access" });
 
-    settleFirst?.({
-      apiKey: "late-first-access",
-      credential: oauth("late-first-access", "late-first-refresh", {
-        expires: Date.now() + 600_000,
-      }),
-    });
+    settleFirst?.(refreshed("late-first-access", "late-first-refresh"));
     await new Promise<void>((settle) => {
       setImmediate(settle);
     });
