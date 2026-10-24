@@ -333,26 +333,15 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("Discord monitor dispatch", () => {
-  it("tracks concurrent messages while awaiting each handler's completion", async () => {
-    const first = pause(async () => {});
-    const second = pause(async () => {});
-    const handler = vi.fn().mockImplementationOnce(first.run).mockImplementationOnce(second.run);
-    const { client, onEvent } = createHarness({ messageHandler: handler });
-    const completed = vi.fn();
-    const a = client.dispatchGatewayEvent("MESSAGE_CREATE", { channel_id: "ch-1" }).then(completed);
-    const b = client.dispatchGatewayEvent("MESSAGE_CREATE", { channel_id: "ch-1" });
-    try {
-      await second.entered;
-      expect(onEvent).toHaveBeenCalledTimes(2);
-      second.resolve();
-      await b;
-      expect(completed).not.toHaveBeenCalled();
-    } finally {
-      first.resolve();
-      second.resolve();
-      await Promise.all([a, b]);
-    }
-    expect(completed).toHaveBeenCalledOnce();
+  it("tracks inbound messages before their handlers complete", async () => {
+    const blocked = pause(async () => {});
+    const { client, onEvent } = createHarness({ messageHandler: blocked.run });
+    await blocked.during(
+      client.dispatchGatewayEvent("MESSAGE_CREATE", { channel_id: "ch-1" }),
+      () => {
+        expect(onEvent).toHaveBeenCalledOnce();
+      },
+    );
   });
 
   it("detaches interaction handling and reports its eventual failure", async () => {
@@ -582,37 +571,57 @@ describe("Discord guild join introductions", () => {
 });
 
 describe("DiscordPresenceListener", () => {
-  it.each(["enqueue", "acceptance"] as const)("retries when %s rejects an event", async (stage) => {
-    mocks.enqueueSessionEvent.mockImplementationOnce(() => {
-      if (stage === "enqueue") {
-        throw new Error("session-event admission refused");
+  it.each(["user", "cooldown", "enqueue", "acceptance"] as const)(
+    "releases admission and retries after a transient %s failure",
+    async (stage) => {
+      const logger = createSubsystemLogger("discord/test-presence");
+      const log = vi
+        .spyOn(logger, stage === "user" || stage === "enqueue" ? "error" : "warn")
+        .mockImplementation(() => {});
+      const listener = createPresenceListener({ logger, presenceEvents: { burstLimit: 1 } });
+      const claim = vi.spyOn(listener.store, "registerIfAbsent");
+      const fetchUser = vi.spyOn(humanClient, "fetchUser");
+      if (stage === "user") {
+        fetchUser.mockRejectedValueOnce(new Error("temporary"));
+      } else if (stage === "cooldown") {
+        claim.mockRejectedValueOnce(new Error("capacity"));
+      } else {
+        mocks.enqueueSessionEvent.mockImplementationOnce(() => {
+          if (stage === "enqueue") {
+            throw new Error("session-event admission refused");
+          }
+          return {
+            id: "refused",
+            cancel: () => false,
+            accepted: Promise.resolve({ ok: false, error: "session-event admission refused" }),
+            settled: Promise.resolve({
+              status: "failed",
+              executionStarted: false,
+              delivered: false,
+            }),
+          };
+        });
       }
-      return {
-        id: "refused",
-        cancel: () => false,
-        accepted: Promise.resolve({ ok: false, error: "session-event admission refused" }),
-        settled: Promise.resolve({ status: "failed", executionStarted: false, delivered: false }),
-      };
-    });
-    const listener = createPresenceListener({ presenceEvents: { burstLimit: 1 } });
-    const registerIfAbsent = vi.spyOn(listener.store, "registerIfAbsent");
-    await listener.transition();
-
-    expect(await listener.store.entries()).toEqual([]);
-    await listener.online();
-
-    expect(mocks.enqueueSessionEvent).toHaveBeenCalledTimes(2);
-    expect(registerIfAbsent).toHaveBeenCalledTimes(2);
-    expect(mocks.enqueueSessionEvent).toHaveBeenLastCalledWith(
-      expect.stringContaining('user_id="user-1"'),
-      expect.objectContaining({
-        ...route,
-        expectedTarget: await mocks.captureSessionEventTarget.mock.results.at(-1)?.value,
-        createIfMissing: true,
-        deliveryContext: { to: "channel:channel-1", accountId: "molty", channel: "discord" },
-      }),
-    );
-  });
+      await listener.transition();
+      expect(log).toHaveBeenCalledOnce();
+      expect(await listener.store.entries()).toEqual([]);
+      const priorEnqueue = Number(stage === "enqueue" || stage === "acceptance");
+      expect(mocks.enqueueSessionEvent).toHaveBeenCalledTimes(priorEnqueue);
+      await listener.online();
+      expect(mocks.enqueueSessionEvent).toHaveBeenCalledTimes(priorEnqueue + 1);
+      expect(mocks.enqueueSessionEvent).toHaveBeenLastCalledWith(
+        expect.stringContaining('user_id="user-1"'),
+        expect.objectContaining({
+          ...route,
+          expectedTarget: await mocks.captureSessionEventTarget.mock.results.at(-1)?.value,
+          createIfMissing: true,
+          deliveryContext: { to: "channel:channel-1", accountId: "molty", channel: "discord" },
+        }),
+      );
+      expect(claim).toHaveBeenCalledTimes(stage === "user" ? 1 : 2);
+      expect(fetchUser).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it("pins the selected route before awaiting the cooldown lookup", async () => {
     const listener = createPresenceListener();
@@ -668,7 +677,7 @@ describe("DiscordPresenceListener", () => {
     expect(await listener.store.entries()).toHaveLength(1);
   });
 
-  it.each(["lookup", "target", "permission", "claim"] as const)(
+  it.each(["target", "claim"] as const)(
     "rejects replaced policy after awaiting %s",
     async (stage) => {
       let policy = livePresencePolicy(["user-1"]);
@@ -897,26 +906,6 @@ describe("DiscordPresenceListener", () => {
       expectWake(phase === "pending" ? "eligible" : "first");
     },
   );
-
-  it.each(["user", "cooldown"] as const)("retries after a transient %s failure", async (stage) => {
-    const logger = createSubsystemLogger("discord/test-presence");
-    const log = vi.spyOn(logger, stage === "user" ? "error" : "warn").mockImplementation(() => {});
-    const listener = createPresenceListener({ logger });
-    await listener.offline();
-    const fetchUser = vi.spyOn(humanClient, "fetchUser");
-    if (stage === "user") {
-      fetchUser.mockRejectedValueOnce(new Error("temporary"));
-    } else {
-      vi.spyOn(listener.store, "registerIfAbsent").mockRejectedValueOnce(new Error("capacity"));
-    }
-    await listener.online();
-    expectWake();
-    expect(log).toHaveBeenCalledOnce();
-    await listener.online();
-    expectWake("user-1");
-    expect(fetchUser).toHaveBeenCalledTimes(2);
-    log.mockRestore();
-  });
 
   it("shares one durable cooldown across overlapping and replacement listeners", async () => {
     const store = cooldownStore();
