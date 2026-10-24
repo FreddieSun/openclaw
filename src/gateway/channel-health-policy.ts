@@ -54,6 +54,7 @@ export function resolveChannelHealthMonitorEnabled(
   channelId: ChannelId,
   accountId: string,
 ): boolean {
+  // SAFETY: Open-world plugin fields are optional; enabled values are checked as booleans.
   const channelConfig = cfg.channels?.[channelId] as ChannelHealthMonitorConfig | undefined;
   const accountOverride = resolveAccountHealthMonitorOverride(channelConfig, channelId, accountId);
   const channelOverride = channelConfig?.healthMonitor?.enabled;
