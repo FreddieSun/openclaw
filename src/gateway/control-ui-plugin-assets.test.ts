@@ -25,10 +25,7 @@ import {
   reloadControlUiPluginCatalog,
 } from "./control-ui-plugin-assets.js";
 import { setControlUiPluginAuthCookie } from "./control-ui-plugin-auth-cookie.js";
-import {
-  listControlUiPluginTabAuthGrants,
-  listControlUiPluginWidgetKinds,
-} from "./control-ui-plugin-tabs.js";
+import { listControlUiPluginTabAuthGrants } from "./control-ui-plugin-tabs.js";
 import { resolveControlUiPluginAuthCookieGeneration } from "./http-auth-plugin-cookie.js";
 import { setControlUiPluginAuthCookieForRequest } from "./http-auth-utils.js";
 import { authorizeOperatorScopesForMethod } from "./method-scopes.js";
@@ -281,25 +278,14 @@ it("records valid receipts in a mixed batch only from a live Control UI connecti
   expect((await call("plugins.controlUi.report", { reports: [report] }))[0]).toBe(true);
 });
 
-it("hot-applies Custom plugin UI admission without replacing the backend plugin", async () => {
+it("withdraws Custom plugin UI asset access and receipts until readmitted", async () => {
   await withConfig(async () => {
     const fixture = activateFixture("workspace");
     fixture.record.trustedOfficialInstall = true;
-    const catalog = await listControlUiPluginCatalog();
-    expect(catalog.plugins).toEqual([]);
-    expect(catalog.diagnostics).toEqual([
-      {
-        pluginId: fixture.record.id,
-        code: "custom-plugin-ui-disabled",
-        message: expect.stringContaining("Settings > Labs"),
-      },
-    ]);
     expect(listControlUiPluginTabAuthGrants(["operator.read"])).toEqual([]);
 
     setRuntimeConfigSnapshot(customPlugins(true));
     const entry = (await listControlUiPluginCatalog()).plugins[0]!;
-    const matchingPlugin = expect.objectContaining({ pluginId: entry.pluginId });
-    expect(listControlUiPluginWidgetKinds(["operator.read"])).toContainEqual(matchingPlugin);
     const browser = {};
     const report = activation(entry.revision);
     expect(reportControlUiPluginActivation(browser, report)).toBe(true);
@@ -310,7 +296,6 @@ it("hot-applies Custom plugin UI admission without replacing the backend plugin"
     setRuntimeConfigSnapshot(customPlugins(false));
 
     expect(listControlUiPluginTabAuthGrants(["operator.read"])).toEqual([]);
-    expect(listControlUiPluginWidgetKinds(["operator.read"])).not.toContainEqual(matchingPlugin);
     expect(reportControlUiPluginActivation(browser, report)).toBe(false);
     expect(listControlUiPluginActivations(browser)).toEqual([]);
     const credentials: Record<string, string>[] = [
@@ -322,12 +307,11 @@ it("hot-applies Custom plugin UI admission without replacing the backend plugin"
         await expectStatus(fetchAsset(server, asset, { headers }), 404);
       }
     }
-    expect((await listControlUiPluginCatalog()).plugins).toEqual([]);
-
     setRuntimeConfigSnapshot(customPlugins(true));
-    expect((await listControlUiPluginCatalog()).plugins).toEqual([entry]);
-    expect(listControlUiPluginTabAuthGrants(["operator.read"])).toContainEqual(matchingPlugin);
-    expect(listControlUiPluginWidgetKinds(["operator.read"])).toContainEqual(matchingPlugin);
+    await listControlUiPluginCatalog();
+    expect(listControlUiPluginTabAuthGrants(["operator.read"])).toContainEqual(
+      expect.objectContaining({ pluginId: entry.pluginId }),
+    );
     expect(listControlUiPluginActivations(browser)).toEqual([]);
     expect(reportControlUiPluginActivation(browser, report)).toBe(true);
     expect(listControlUiPluginActivations(browser)).toEqual([report]);

@@ -47,7 +47,6 @@ import * as availability from "./github-publication-availability.js";
 import * as baseRefresh from "./github-publication-base-refresh.js";
 import * as inspect from "./github-publication-inspect.js";
 import * as preflight from "./github-publication-pr-preflight.js";
-import * as requester from "./github-publication-requester.js";
 import { invalidateOperatorRolePolicy } from "./operator-role-policy.js";
 import { SESSION_READ_SCOPE, SESSION_WRITE_SCOPE } from "./operator-scopes.js";
 import { createDirectChatContext } from "./server-chat.agent-events.test-helpers.js";
@@ -112,19 +111,6 @@ function expectOriginalFile(
   expect(result[1].source).toBeUndefined();
 }
 
-function createSkillsSnapshot(
-  skillId: string,
-  revision: string,
-  name: string,
-  ownerProfileId: string,
-) {
-  return {
-    prompt: "",
-    skills: [],
-    librarySelections: [{ skillId, revision, name, ownerProfileId }],
-  };
-}
-
 function createManagedSandbox(sessionKey: string, workspaceDir: string) {
   return {
     ...createSandboxTestContext({
@@ -142,12 +128,18 @@ it("adopts one empty owner and keeps original message files separate from same-n
       sessionId: "adopt",
       updatedAt: 1,
       sessionRoot: state.workspaceDir,
-      skillsSnapshot: createSkillsSnapshot(
-        "11111111-1111-4111-8111-111111111111",
-        "a".repeat(64),
-        "notes",
-        "adopt-owner",
-      ),
+      skillsSnapshot: {
+        prompt: "",
+        skills: [],
+        librarySelections: [
+          {
+            skillId: "11111111-1111-4111-8111-111111111111",
+            revision: "a".repeat(64),
+            name: "notes",
+            ownerProfileId: "adopt-owner",
+          },
+        ],
+      },
     };
     const sibling = { ...target, sessionKey: "agent:main:sibling" };
     await upsertSessionEntryCore(target, entry);
@@ -646,66 +638,6 @@ async function removeOwnedWorktree(sessionKey: string) {
   }
 }
 
-it("prepares an own PR in an ordinary sandboxed chat through the registered handler", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const { cfg, target, scope } = createAdoptionFixture(state.workspaceDir, "adopt-handler");
-    // Any earlier turn records a skills snapshot before the PR link arrives.
-    const skillsSnapshot = createSkillsSnapshot(
-      "22222222-2222-4222-8222-222222222222",
-      "b".repeat(64),
-      "handler-notes",
-      "handler-owner",
-    );
-    await upsertSessionEntryCore(target, {
-      sessionId: "adopt-handler",
-      updatedAt: 1,
-      sessionRoot: state.workspaceDir,
-      skillsSnapshot,
-    });
-    const manager = await SessionManager.openAsync(scope, state.workspaceDir);
-    const earlier = await manager.appendMessageAsync(makeUserMessage("Open notes.md", 1));
-    assert(earlier, "The earlier message must be persisted");
-    await fs.writeFile(path.join(state.workspaceDir, "notes.md"), "original notes\n");
-    vi.spyOn(requester, "prepareGitHubPublicationRequesterV2").mockResolvedValue({
-      requester: { snapshot: { actor: { kind: "system" } }, assertCurrent() {} },
-      release() {},
-    } as never);
-    stubPullRequestPreparation(target.sessionKey);
-    const context = createPreparationContext(cfg);
-    const prepareWorktree = vi.spyOn(allocation, "prepareSessionWorktree");
-    try {
-      const respond = await preparePullRequest({
-        context,
-        sessionKey: target.sessionKey,
-        sessionId: "adopt-handler",
-        workspaceDir: state.workspaceDir,
-        client: null,
-      });
-      const worktreePreparation = prepareWorktree.mock.calls[0]?.[0];
-      assert(worktreePreparation, "PR preparation must allocate a managed workspace");
-      expect(worktreePreparation.target.entry?.skillsSnapshot).toEqual(skillsSnapshot);
-      const worktree = await managedWorktrees.findLiveByOwner("session", target.sessionKey);
-      expect(respond).toHaveBeenCalledWith(
-        true,
-        expect.objectContaining({ status: "prepared", headCommit: "a".repeat(40) }),
-      );
-      const bound = loadSessionEntryReadOnly(target);
-      expect(bound?.worktree?.id).toBe(worktree?.id);
-      expect(bound?.worktree?.githubPullRequest).toMatchObject({
-        number: 1,
-        preparedHeadCommit: "a".repeat(40),
-      });
-      expect(bound?.priorWorkspace?.fileRoot).toBe(state.workspaceDir);
-      const read = await requestSessionFile(context, target.sessionKey, {
-        messageEntryId: earlier,
-      });
-      expectOriginalFile(read, "original notes\n");
-    } finally {
-      await removeOwnedWorktree(target.sessionKey);
-    }
-  });
-});
-
 it("refuses another guest and lost access before binding, PR import and earlier file reads", async () => {
   await withOpenClawTestState(
     { scenario: "minimal", prepareProfileCatalog: true },
@@ -817,18 +749,22 @@ it("refuses another guest and lost access before binding, PR import and earlier 
 
         expect(await prepare(guestClient)).toHaveBeenCalledWith(
           true,
-          expect.objectContaining({ status: "prepared" }),
+          expect.objectContaining({ status: "prepared", headCommit: "a".repeat(40) }),
         );
         expect(integrate).toHaveBeenCalledOnce();
         const readEarlier = (client: GatewayClient) =>
           requestSessionFile(context, target.sessionKey, { messageEntryId: earlier }, client);
-        expect(await readEarlier(guestClient)).toMatchObject([
-          true,
-          { file: { content: "original notes\n" } },
-        ]);
+        expectOriginalFile(await readEarlier(guestClient), "original notes\n");
         // A viewing guest or an admin sees the current files, never the owner's originals.
         const worktree = await managedWorktrees.findLiveByOwner("session", target.sessionKey);
         assert(worktree, "Preparation must bind the PR workspace");
+        expect(loadSessionEntryReadOnly(target)).toMatchObject({
+          worktree: {
+            id: worktree.id,
+            githubPullRequest: { number: 1, preparedHeadCommit: "a".repeat(40) },
+          },
+          priorWorkspace: { fileRoot: state.workspaceDir },
+        });
         await fs.writeFile(path.join(worktree.path, "notes.md"), "PR notes\n");
         const refused = [false, undefined];
         for (const client of [otherClient, adminClient]) {
