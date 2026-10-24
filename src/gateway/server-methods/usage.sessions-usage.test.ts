@@ -96,6 +96,20 @@ function discoveredRows(prefix: string, count: number, newestFirst = false) {
     mtime: newestFirst ? count - index : index + 1,
   }));
 }
+function setStoredSessions(
+  store: Record<string, SessionEntry>,
+  agentId = "main",
+  storePath?: string,
+) {
+  projectionFixture = createUsageSessionStoreFixture(
+    store,
+    Object.keys(store).map((key) => [key, agentId] as const),
+    storePath ? () => storePath : undefined,
+  );
+}
+function expectUsageLoad(params: Record<string, unknown>) {
+  expect(summaryLoader).toHaveBeenCalledWith(expect.objectContaining(params));
+}
 function runSessionsUsageMethod(
   method: "sessions.usage" | "sessions.usage.timeseries" | "sessions.usage.logs",
   params: Record<string, unknown>,
@@ -109,6 +123,11 @@ function runSessionsUsageMethod(
 }
 const runSessionsUsage = (params: Record<string, unknown>) =>
   runSessionsUsageMethod("sessions.usage", params);
+const settleUsage = (signal: AbortSignal, respond: ReturnType<typeof vi.fn>) =>
+  runSessionsUsageMethod("sessions.usage", BASE_USAGE_RANGE, { signal, respond }).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
 function readResult(respond: ReturnType<typeof vi.fn>): SessionsUsageResult {
   const [ok, payload] = usageReply(respond);
   expect(ok).toBe(true);
@@ -163,13 +182,7 @@ it.each(["client cancellation", "time budget"] as const)(
       await release.promise;
       return tokenBatch(1);
     });
-    const pending = runSessionsUsageMethod("sessions.usage", BASE_USAGE_RANGE, {
-      signal: controller.signal,
-      respond,
-    }).then(
-      () => undefined,
-      (error: unknown) => error,
-    );
+    const pending = settleUsage(controller.signal, respond);
     try {
       const signal = expectDefined(await started.promise, "request-owned usage work signal");
       expect(signal.aborted).toBe(false);
@@ -312,23 +325,11 @@ it("keeps an identical cold usage request alive when the first client disconnect
       signal.removeEventListener("abort", abort);
     }
   });
-  const first = runSessionsUsageMethod("sessions.usage", BASE_USAGE_RANGE, {
-    signal: firstClient.signal,
-    respond: firstRespond,
-  }).then(
-    () => undefined,
-    (error: unknown) => error,
-  );
+  const first = settleUsage(firstClient.signal, firstRespond);
   let second: Promise<unknown> | undefined;
   try {
     const firstSignal = await withinTest(firstStarted.promise, testSignal);
-    second = runSessionsUsageMethod("sessions.usage", BASE_USAGE_RANGE, {
-      signal: secondClient.signal,
-      respond: secondRespond,
-    }).then(
-      () => undefined,
-      (error: unknown) => error,
-    );
+    second = settleUsage(secondClient.signal, secondRespond);
     firstClient.abort(new Error("first usage client disconnected"));
     expect(await withinTest(first, testSignal)).toBe(firstSignal.reason);
     expect(firstSignal.aborted).toBe(true);
@@ -449,11 +450,7 @@ it("applies the usage size budget to the selected creator", async () => {
     };
     const storePath = state.statePath("agents", "main", "agent", "openclaw-agent.sqlite");
     replaceSessionEntrySync({ agentId: "main", sessionKey: key, storePath }, entry);
-    projectionFixture = createUsageSessionStoreFixture(
-      { [key]: entry },
-      [[key, "main"]],
-      () => storePath,
-    );
+    setStoredSessions({ [key]: entry }, "main", storePath);
     discovery.mockResolvedValueOnce([...unrelated, selected]);
     summaryLoader.mockImplementationOnce(async ({ sessions }) => tokenBatch(sessions.length, 7));
     const result = await readSessionsUsage({ creatorKey: '["system",null]', limit: 1 });
@@ -481,11 +478,7 @@ it.each(["available", "time budget"])(
           mtime: index + 1,
         };
       });
-      projectionFixture = createUsageSessionStoreFixture(
-        store,
-        Object.keys(store).map((key) => [key, "main"] as const),
-        () => storePath,
-      );
+      setStoredSessions(store, "main", storePath);
       discovery.mockResolvedValueOnce(discovered);
       const projection = createSessionRowProjectionFixture({
         cfg: TEST_RUNTIME_CONFIG,
@@ -579,18 +572,8 @@ it.each([
     await withEnvAsync({ TZ: "America/New_York" }, async () => {
       expect(new Date("2026-03-08T05:00:00Z").getTimezoneOffset()).toBe(300);
       expect(new Date("2026-03-09T04:00:00Z").getTimezoneOffset()).toBe(240);
-      const response = await readSessionsUsage({
-        ...params,
-        startDate: date,
-        endDate: date,
-      });
-      expect(loadSessionCostSummariesFromCache).toHaveBeenCalledWith(
-        expect.objectContaining({
-          startMs: Date.parse(start),
-          endMs: Date.parse(end) - 1,
-          dayBucket,
-        }),
-      );
+      const response = await readSessionsUsage({ ...params, startDate: date, endDate: date });
+      expectUsageLoad({ startMs: Date.parse(start), endMs: Date.parse(end) - 1, dayBucket });
       expect(response).toMatchObject({ startDate: date, endDate: date });
     });
   },
@@ -601,31 +584,23 @@ it("does not resolve specific usage keys through out-of-scope sessionId matches"
     const sessionFile = path.join(state.sessionsDir("opus"), "shared.jsonl");
     fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
     fs.writeFileSync(sessionFile, "");
-    projectionFixture = createUsageSessionStoreFixture(
-      {
-        "agent:main:shared": {
-          sessionId: "shared",
-          sessionFile: "shared.jsonl",
-          label: "Main shared",
-          updatedAt: 999,
-        },
+    setStoredSessions({
+      "agent:main:shared": {
+        sessionId: "shared",
+        sessionFile: "shared.jsonl",
+        label: "Main shared",
+        updatedAt: 999,
       },
-      [["agent:main:shared", "main"]],
-    );
+    });
     expect((await readSessionsUsage({ key: "shared", agentId: "opus" })).sessions).toMatchObject([
       { key: "agent:opus:shared", agentId: "opus" },
     ]);
-    expect(loadSessionCostSummariesFromCache).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agentId: "opus",
-        sessions: expect.arrayContaining([
-          expect.objectContaining({
-            sessionFile: fs.realpathSync(sessionFile),
-            sessionId: "shared",
-          }),
-        ]),
-      }),
-    );
+    expectUsageLoad({
+      agentId: "opus",
+      sessions: expect.arrayContaining([
+        expect.objectContaining({ sessionFile: fs.realpathSync(sessionFile), sessionId: "shared" }),
+      ]),
+    });
     for (const method of ["sessions.usage.timeseries", "sessions.usage.logs"] as const) {
       const respond = await runSessionsUsageMethod(method, { key: "shared", agentId: "opus" });
       expect(respond.mock.calls[0]?.[0]).toBe(true);
@@ -664,7 +639,7 @@ it("rolls up known session family ids when historical usage is requested", async
     { sessionId: "oldest", sessionFile: oldestSessionFile, mtime: 900 },
   ]);
 
-  projectionFixture = createUsageSessionStoreFixture({ [storeKey]: entry }, [[storeKey, "opus"]]);
+  setStoredSessions({ [storeKey]: entry }, "opus");
   summaryLoader.mockImplementation(async ({ sessions }) => {
     const summaries = sessions.map((session) => {
       const historical = session.sessionId === "old";
@@ -810,9 +785,7 @@ it("rolls up known session family ids when historical usage is requested", async
 
   TEST_RUNTIME_CONFIG = { ...TEST_RUNTIME_CONFIG };
   const partialEntry = { ...entry, usageFamilySessionIds: ["current", "old"] };
-  projectionFixture = createUsageSessionStoreFixture({ [storeKey]: partialEntry }, [
-    [storeKey, "opus"],
-  ]);
+  setStoredSessions({ [storeKey]: partialEntry }, "opus");
   discovery.mockResolvedValueOnce([
     { sessionId: "old", sessionFile: oldSessionFile, mtime: 1_000 },
   ]);
@@ -852,14 +825,12 @@ it("prefers the deterministic store key when duplicate sessionIds exist", async 
   expect((await readSessionsUsage({ key: "agent:opus:run-dup" })).sessions).toMatchObject([
     { key: preferredKey },
   ]);
-  expect(loadSessionCostSummariesFromCache).toHaveBeenCalledWith(
-    expect.objectContaining({
-      agentId: "opus",
-      sessions: expect.arrayContaining([
-        expect.objectContaining({ sessionFile: expect.stringMatching(/^sqlite:/) }),
-      ]),
-    }),
-  );
+  expectUsageLoad({
+    agentId: "opus",
+    sessions: expect.arrayContaining([
+      expect.objectContaining({ sessionFile: expect.stringMatching(/^sqlite:/) }),
+    ]),
+  });
 });
 
 it("rejects traversal-style keys in specific session usage lookups", async () => {

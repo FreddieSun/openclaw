@@ -186,9 +186,8 @@ describe("sessions.patch", () => {
     withSessionMutationState(async (state) => {
       const sessionKey = "agent:main:dashboard-default";
       const scope = { agentId: "main", env: state.env, sessionKey };
-      await upsertSessionEntryCore(scope, {
+      await seedEntry(state.env, sessionKey, {
         sessionId: "dashboard-default",
-        updatedAt: 1,
         boardFace: "chat",
       });
       const requestContext = context({});
@@ -241,9 +240,8 @@ describe("sessions.patch", () => {
     withSessionMutationState(async (state) => {
       const sessionKey = "agent:main:dashboard-authority";
       const scope = { agentId: "main", env: state.env, sessionKey };
-      await upsertSessionEntryCore(scope, {
+      await seedEntry(state.env, sessionKey, {
         sessionId: "dashboard-authority",
-        updatedAt: 1,
         boardPresentation: "split",
       });
       const before = loadSessionEntry(scope);
@@ -442,8 +440,7 @@ describe("sessions.patch", () => {
       withSessionMutationState(async (state) => {
         const sessionKey = "agent:main:permission-update";
         const sessionId = "session-permission-update";
-        const cfg: OpenClawConfig = {};
-        const requestContext = context(cfg);
+        const requestContext = context({});
         const requestClient = client();
         requestClient.connect.scopes = ["operator.admin"];
         await seedEntry(state.env, sessionKey, { sessionId, permissionMode: "guarded" });
@@ -536,8 +533,7 @@ describe("sessions.patch", () => {
             ...(index === 1 ? { contextWindow: "extended" } : {}),
           });
         }
-        const cfg: OpenClawConfig = {};
-        const requestContext = context(cfg);
+        const requestContext = context({});
         const catalog = pauseCatalog(state, requestContext);
         const handles = keys.map(() => ({
           ...createEmbeddedRunHandle(),

@@ -50,8 +50,46 @@ import { createOperatorWsClient } from "../server/ws-connection/authenticated-re
 import type { GatewayClient, GatewayRequestHandler } from "./types.js";
 import { usersHandlers } from "./users.js";
 
+async function withPreferenceState(run: (prepareProfiles: () => Promise<void>) => Promise<void>) {
+  const state = await createOpenClawTestState({ layout: "state-only", prefix: "users-prefs-" });
+  let releaseProfiles: (() => void) | undefined;
+  try {
+    await run(async () => {
+      releaseProfiles = (await prepareUserProfileCatalog()).release;
+    });
+  } finally {
+    releaseProfiles?.();
+    await state.cleanup();
+  }
+}
+
+type PreferenceMethod = "users.prefs.get" | "users.prefs.set";
+const forbidden = expect.objectContaining({
+  code: "FORBIDDEN",
+  message: "Gateway requester authority changed",
+});
+const preferenceReply = (entries: Record<string, unknown>) => [
+  true,
+  { status: "ok", entries },
+  undefined,
+];
+function attachProfile(
+  client: GatewayClient,
+  profile: { id: string; updatedAt: number },
+  hasAvatar = false,
+) {
+  client.authenticatedUserProfile = {
+    profileId: profile.id,
+    displayName: null,
+    avatarRevision: "",
+    hasAvatar,
+    updatedAt: profile.updatedAt,
+  };
+  prepareGatewayRecipientProfile(client);
+}
+
 async function invokePreferenceMethod(
-  method: "users.prefs.get" | "users.prefs.set",
+  method: PreferenceMethod,
   params: Record<string, unknown>,
   profileId?: string,
   context: Record<string, unknown> = {},
@@ -78,11 +116,7 @@ afterEach(() => {
 });
 
 test("users.prefs returns its captured snapshot when a write commits before read delivery", async () => {
-  const state = await createOpenClawTestState({
-    layout: "state-only",
-    prefix: "prefs-publication-",
-  });
-  try {
+  return withPreferenceState(async () => {
     const profileId = ensureProfileForEmail("reader@example.test").id;
     await preferences.setCanonicalUserPreferences(profileId, { "ui.accent": "#112233" });
     const executeRead = stateRead.executeExistingOpenClawStateRead;
@@ -100,16 +134,13 @@ test("users.prefs returns its captured snapshot when a write commits before read
       payload: { status: "ok", entries: { "ui.accent": "#112233" } },
       error: undefined,
     });
-  } finally {
-    await state.cleanup();
-  }
+  });
 });
 
 test("users.prefs reads merged-profile accents while an unrelated writer reply is pending", async ({
   signal,
 }) => {
-  const state = await createOpenClawTestState({ layout: "state-only", prefix: "prefs-reader-" });
-  try {
+  return withPreferenceState(async () => {
     const source = ensureProfileForEmail("source@example.test").id;
     const target = ensureProfileForEmail("target@example.test").id;
     await preferences.setCanonicalUserPreferences(source, {
@@ -185,9 +216,7 @@ test("users.prefs reads merged-profile accents while an unrelated writer reply i
       publish?.();
       await pendingWriter;
     }
-  } finally {
-    await state.cleanup();
-  }
+  });
 });
 
 async function withPreferenceToolTurn(
@@ -195,22 +224,16 @@ async function withPreferenceToolTurn(
     ownerId: string;
     steer: () => Promise<void>;
     revoke: () => void;
-    request: (
-      method: "users.prefs.get" | "users.prefs.set",
-      params?: Record<string, unknown>,
-    ) => Promise<unknown>;
+    request: (method: PreferenceMethod, params?: Record<string, unknown>) => Promise<unknown>;
   }) => Promise<void>,
 ) {
-  const state = await createOpenClawTestState({ layout: "state-only", prefix: "prefs-tool-turn-" });
-  try {
+  return withPreferenceState(async () => {
     const owner = ensureProfileForEmail("prefs-owner@example.test");
     const guest = ensureProfileForEmail("prefs-guest@example.test");
     const scopes = ["operator.read", "operator.write"];
     const client = createOperatorClient({ profileId: owner.id, scopes });
     const context = createContext();
-    const expectSyntheticOwnerCall = (
-      method: "users.prefs.get" | "users.prefs.set",
-    ): GatewayRequestHandler => {
+    const expectSyntheticOwnerCall = (method: PreferenceMethod): GatewayRequestHandler => {
       const handler = usersHandlers[method];
       if (!handler) {
         throw new Error(`missing ${method} handler`);
@@ -251,9 +274,7 @@ async function withPreferenceToolTurn(
             }),
         ),
     );
-  } finally {
-    await state.cleanup();
-  }
+  });
 }
 
 test("users.prefs rejects mixed-person synthetic turn calls before reading or writing preferences", async () => {
@@ -369,16 +390,7 @@ test.each(["current", "read", "scope", "source", "identity", "error-response", "
         ],
       });
       client.authenticatedUserId = "self-reader@github";
-      const attach = (profile: typeof owner) => {
-        client.authenticatedUserProfile = {
-          profileId: profile.id,
-          displayName: null,
-          avatarRevision: "",
-          hasAvatar: false,
-          updatedAt: profile.updatedAt,
-        };
-        prepareGatewayRecipientProfile(client);
-      };
+      const attach = (profile: typeof owner) => attachProfile(client, profile);
       if (change === "staff") {
         attach(owner);
       }
@@ -437,14 +449,7 @@ test.each(["current", "read", "scope", "source", "identity", "error-response", "
             profile: expect.objectContaining({ id: owner.id }),
           });
         } else {
-          expect(respond).toHaveBeenCalledExactlyOnceWith(
-            false,
-            undefined,
-            expect.objectContaining({
-              code: "FORBIDDEN",
-              message: "Gateway requester authority changed",
-            }),
-          );
+          expect(respond).toHaveBeenCalledExactlyOnceWith(false, undefined, forbidden);
         }
       }
     } finally {
@@ -471,14 +476,7 @@ test("users.prefs.get retains its original scope across the preference read", as
       connId: "preference-reader",
       scopes: ["operator.sessions.read"],
     });
-    client.authenticatedUserProfile = {
-      profileId: owner.id,
-      displayName: null,
-      avatarRevision: "",
-      hasAvatar: false,
-      updatedAt: 1,
-    };
-    prepareGatewayRecipientProfile(client);
+    attachProfile(client, { id: owner.id, updatedAt: 1 });
     const entered = createDeferredCore();
     const release = createDeferredCore();
     const original = preferences.getCanonicalUserPreferences;
@@ -509,14 +507,7 @@ test("users.prefs.get retains its original scope across the preference read", as
       await outcome;
     }
     expect(await outcome).toEqual([{ status: "fulfilled", value: undefined }]);
-    expect(respond).toHaveBeenCalledExactlyOnceWith(
-      false,
-      undefined,
-      expect.objectContaining({
-        code: "FORBIDDEN",
-        message: "Gateway requester authority changed",
-      }),
-    );
+    expect(respond).toHaveBeenCalledExactlyOnceWith(false, undefined, forbidden);
     expect(await original(owner.id)).toMatchObject({ entries: { "ui.theme": "dark" } });
   } finally {
     releaseProfiles?.();
@@ -526,25 +517,16 @@ test("users.prefs.get retains its original scope across the preference read", as
 });
 
 test("users.prefs dispatch saves guest choices only to the authenticated durable profile", async () => {
-  const state = await createOpenClawTestState({ layout: "state-only", prefix: "users-prefs-rpc-" });
-  let releaseProfiles: (() => void) | undefined;
-  try {
+  return withPreferenceState(async (prepareProfiles) => {
     const ada = ensureProfileForEmail("ada@example.test");
     const grace = ensureProfileForEmail("grace@example.test");
-    releaseProfiles = (await prepareUserProfileCatalog()).release;
+    await prepareProfiles();
     const clients = [ada, grace].map((profile) => {
       const client = createOperatorWsClient({
         connId: profile.id,
         scopes: ["operator.sessions.read", "operator.sessions.write"],
       });
-      client.authenticatedUserProfile = {
-        profileId: profile.id,
-        displayName: null,
-        avatarRevision: "",
-        hasAvatar: false,
-        updatedAt: profile.updatedAt,
-      };
-      prepareGatewayRecipientProfile(client);
+      attachProfile(client, profile);
       return client;
     });
     const adaClient = clients[0]!;
@@ -582,16 +564,8 @@ test("users.prefs dispatch saves guest choices only to the authenticated durable
       { status: "ok" },
       undefined,
     ]);
-    expect(await request("users.prefs.get")).toEqual([
-      true,
-      { status: "ok", entries: { [key]: choice } },
-      undefined,
-    ]);
-    expect(await request("users.prefs.get", {}, graceClient)).toEqual([
-      true,
-      { status: "ok", entries: {} },
-      undefined,
-    ]);
+    expect(await request("users.prefs.get")).toEqual(preferenceReply({ [key]: choice }));
+    expect(await request("users.prefs.get", {}, graceClient)).toEqual(preferenceReply({}));
     expect(
       await request("users.prefs.set", {
         entries: { [key]: { folder: "/stale" } },
@@ -632,11 +606,7 @@ test("users.prefs dispatch saves guest choices only to the authenticated durable
         { message: `missing scope: ${scope}` },
       ]);
     }
-    expect(await request("users.prefs.get", {}, graceClient)).toEqual([
-      true,
-      { status: "ok", entries: {} },
-      undefined,
-    ]);
+    expect(await request("users.prefs.get", {}, graceClient)).toEqual(preferenceReply({}));
     const createAdmission = workerAdmission.createSqliteWorkerOperationAdmission;
     let reachedCommit = false;
     using admission = vi.spyOn(workerAdmission, "createSqliteWorkerOperationAdmission");
@@ -658,15 +628,10 @@ test("users.prefs dispatch saves guest choices only to the authenticated durable
     });
     admission.mockRestore();
     linkEmail("ada@example.test", grace.id);
-    expect(await request("users.prefs.get", {}, graceClient)).toEqual([
-      true,
-      { status: "ok", entries: { [key]: { ...choice, worktreeName: "focused-fix" } } },
-      undefined,
-    ]);
-  } finally {
-    releaseProfiles?.();
-    await state.cleanup();
-  }
+    expect(await request("users.prefs.get", {}, graceClient)).toEqual(
+      preferenceReply({ [key]: { ...choice, worktreeName: "focused-fix" } }),
+    );
+  });
 });
 
 test("users.prefs returns a typed result without a durable identity", async () => {
@@ -691,12 +656,7 @@ test("users.prefs returns a typed result without a durable identity", async () =
 });
 
 test("users.prefs.set notifies only the current merged profile without main-thread profile reads", async () => {
-  const state = await createOpenClawTestState({
-    layout: "state-only",
-    prefix: "users-prefs-events-",
-  });
-  let releaseProfiles: (() => void) | undefined;
-  try {
+  return withPreferenceState(async (prepareProfiles) => {
     const retired = ensureProfileForEmail("retired@example.test");
     const owner = ensureProfileForEmail("owner@example.test");
     const other = ensureProfileForEmail("other@example.test");
@@ -704,7 +664,7 @@ test("users.prefs.set notifies only the current merged profile without main-thre
     for (const profile of [retired, owner, other]) {
       expect(setAvatar(profile.id, avatar, "image/png").ok).toBe(true);
     }
-    releaseProfiles = (await prepareUserProfileCatalog()).release;
+    await prepareProfiles();
     linkEmail("retired@example.test", owner.id);
 
     const peers = [
@@ -719,15 +679,10 @@ test("users.prefs.set notifies only the current merged profile without main-thre
       const socket = createGatewayWsTestSocket({ onSend: (data) => frames.push(data) });
       const client = createOperatorWsClient({ connId, socket, scopes: [...scopes] });
       if (profileId) {
-        client.authenticatedUserProfile = {
-          profileId,
-          displayName: null,
-          avatarRevision: "",
-          hasAvatar: true,
-          updatedAt: 1,
-        };
+        attachProfile(client, { id: profileId, updatedAt: 1 }, true);
+      } else {
+        prepareGatewayRecipientProfile(client);
       }
-      prepareGatewayRecipientProfile(client);
       return { client, frames };
     });
     const clients = new GatewayClientRegistry(connected.map(({ client }) => client));
@@ -777,18 +732,11 @@ test("users.prefs.set notifies only the current merged profile without main-thre
     } finally {
       reads.restore();
     }
-  } finally {
-    releaseProfiles?.();
-    await state.cleanup();
-  }
+  });
 });
 
 test("users.prefs.set returns typed profile quota details", async () => {
-  const state = await createOpenClawTestState({
-    layout: "state-only",
-    prefix: "users-prefs-quota-",
-  });
-  try {
+  return withPreferenceState(async () => {
     const profile = ensureProfileForEmail("quota@example.test");
     for (let start = 0; start < 128; start += 32) {
       const entries = Object.fromEntries(
@@ -815,21 +763,14 @@ test("users.prefs.set returns typed profile quota details", async () => {
         },
       },
     });
-  } finally {
-    await state.cleanup();
-  }
+  });
 });
 
 test("users.prefs.set compares canonical preferences atomically and publishes only committed writes", async () => {
-  const state = await createOpenClawTestState({
-    layout: "state-only",
-    prefix: "users-prefs-conditional-",
-  });
-  let releaseProfiles: (() => void) | undefined;
-  try {
+  return withPreferenceState(async (prepareProfiles) => {
     const retired = ensureProfileForEmail("conditional-retired@example.test");
     const owner = ensureProfileForEmail("conditional-owner@example.test");
-    releaseProfiles = (await prepareUserProfileCatalog()).release;
+    await prepareProfiles();
     const original = {
       selection: { folder: "/new", model: "new", nested: [1, { a: 2, b: 3 }] },
       removed: true,
@@ -885,8 +826,5 @@ test("users.prefs.set compares canonical preferences atomically and publishes on
     expect(await invokePreferenceMethod("users.prefs.get", {}, owner.id)).toMatchObject({
       payload: { status: "ok", entries: { selection: original.selection, inserted: true } },
     });
-  } finally {
-    releaseProfiles?.();
-    await state.cleanup();
-  }
+  });
 });
