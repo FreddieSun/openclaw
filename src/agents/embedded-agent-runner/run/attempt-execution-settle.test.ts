@@ -684,7 +684,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
 
     const attempt = await settle(fixture.input);
     expect(attempt.successfulNestedToolNames).toEqual(["read"]);
-    expect(attempt.toolMetas).toEqual([{ toolName: "exec", isError: false }]);
+    expect(attempt.toolMetas).toEqual([{ toolName: "exec", isError: false, replaySafe: false }]);
   });
 
   it("preserves a prompt failure while still completing stream cleanup", async () => {
