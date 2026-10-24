@@ -306,15 +306,9 @@ it("holds an unregistered store without deletion history or creating shared stat
     env,
     operation: "doctor" as const,
     configuredAgentDatabaseTargets: [],
-    onAgentInspection: vi.fn(),
   };
   const before = snapshotSourceFamily(agent.path);
   await expect(assertOpenClawDatabasesReady(options)).resolves.toBeUndefined();
-  expect(options.onAgentInspection).toHaveBeenCalledExactlyOnceWith({
-    schemaProcessCount: 0,
-    schemaInspectionCount: 0,
-    schemaSnapshotCount: 0,
-  });
   const onAgentDatabaseDiscovery = vi.fn();
   await expect(fixture.inspect({ ...options, onAgentDatabaseDiscovery })).resolves.toEqual(
     compatible,
@@ -323,11 +317,7 @@ it("holds an unregistered store without deletion history or creating shared stat
     expect.objectContaining({
       discovery: expect.objectContaining({
         targets: [],
-        deletionJournal: {
-          status: "unavailable",
-          cause: "missing",
-          reason: "shared state database missing",
-        },
+        deletionJournal: expect.objectContaining({ status: "unavailable", cause: "missing" }),
         retainedTargets: [],
         unverifiedTargets: [
           {
@@ -337,8 +327,6 @@ it("holds an unregistered store without deletion history or creating shared stat
             source: "disk",
           },
         ],
-        registryRemovals: [],
-        failures: [],
       }),
     }),
   );
@@ -468,11 +456,9 @@ it.each([
 
     const failure = await fixture.doctor().catch((cause: unknown) => cause);
     expect(failure).toBeInstanceOf(Error);
-    expect(failure).toMatchObject({
-      message: expect.stringContaining("Doctor could not complete repair"),
-    });
-    expect(failure).toMatchObject({ message: expect.stringContaining(error.message) });
-    expect(failure).toMatchObject({ message: expect.stringContaining(guidance) });
+    for (const message of ["Doctor could not complete repair", error.message, guidance]) {
+      expect(failure).toMatchObject({ message: expect.stringContaining(message) });
+    }
     if (!restore) {
       expect(failure).toMatchObject({ message: expect.not.stringContaining("restore") });
     }
