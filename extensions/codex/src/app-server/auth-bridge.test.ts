@@ -1163,38 +1163,63 @@ describe("Codex auth bridge", () => {
     );
   });
 
-  it("rejects conflicting callback workspace identities before refreshing", async ({
-    agentDir,
-  }) => {
-    const credential = oauthProfile("opaque", { expires: Date.now() + 60 * 60_000 });
-    const authProfileStore: AuthProfileStore = profileStore(credential);
-
-    await expect(
-      refreshTokens({
-        ...profileParams(agentDir, authProfileStore),
-        authHandoff: authHandoff(credential.access, "account-a"),
-        previousAccountId: "account-b",
-      }),
-    ).rejects.toThrow("ChatGPT workspace changed before Codex token refresh");
-    expect(oauth.refresh).not.toHaveBeenCalled();
-    expect(authProfileStore.profiles["openai:work"]).toEqual(credential);
-  });
-
-  it("does not let a stale client refresh a newly selected scoped workspace", async ({
-    agentDir,
-  }) => {
-    const credential = oauthProfile("workspace-b", { accountId: "account-b" });
-    const authProfileStore: AuthProfileStore = profileStore(credential);
-
-    await expect(
-      refreshTokens({
-        ...profileParams(agentDir, authProfileStore),
-        authHandoff: authHandoff("workspace-a-access", "account-a"),
-      }),
-    ).rejects.toThrow("ChatGPT workspace changed before Codex token refresh");
-    expect(oauth.refresh).not.toHaveBeenCalled();
-    expect(authProfileStore.profiles["openai:work"]).toEqual(credential);
-  });
+  baseIt.each([
+    [
+      "conflicting callback",
+      () =>
+        oauthProfile("opaque", {
+          expires: Date.now() + 60 * 60_000,
+        }),
+      "account-a",
+      "account-b",
+    ],
+    [
+      "stale client",
+      () => oauthProfile("workspace-b", { accountId: "account-b" }),
+      "account-a",
+      undefined,
+    ],
+    [
+      "token claims",
+      () =>
+        oauthProfile("test", {
+          access: chatgptAccessToken("workspace-selected"),
+          refresh: "workspace-refresh-token",
+        }),
+      undefined,
+      "workspace-original",
+    ],
+  ] as const)(
+    "rejects %s workspace changes before refreshing",
+    async (name, makeCredential, handoffAccount, previousAccountId) => {
+      const agentDir = agentDirs.make();
+      const credential = makeCredential();
+      const authProfileStore = profileStore(credential);
+      if (!handoffAccount) {
+        persistProfile(agentDir, credential);
+      }
+      await expect(
+        refreshTokens({
+          ...profileParams(agentDir, handoffAccount ? authProfileStore : undefined),
+          ...(handoffAccount
+            ? {
+                authHandoff: authHandoff(
+                  name === "stale client" ? "workspace-a-access" : credential.access,
+                  handoffAccount,
+                ),
+              }
+            : {}),
+          previousAccountId,
+        }),
+      ).rejects.toThrow(
+        handoffAccount
+          ? "ChatGPT workspace changed before Codex token refresh"
+          : /ChatGPT workspace changed.*[Rr]etry/,
+      );
+      expect(oauth.refresh).not.toHaveBeenCalled();
+      expect(authProfileStore.profiles["openai:work"]).toEqual(credential);
+    },
+  );
 
   it("does not replace a prepared persisted store changed during refresh", async ({ agentDir }) => {
     const pendingRefresh = createDeferred<Rotation>();
@@ -1500,49 +1525,56 @@ describe("Codex auth bridge", () => {
     expect(await fs.readFile(path.join(codexHome, "auth.json"))).toEqual(nativeBefore);
   });
 
-  it("keeps an existing app-server ChatGPT account over env API-key fallback", async ({
-    agentDir,
-  }) => {
-    const request = requestMock({ type: "chatgpt", email: "codex@example.test", planType: "plus" });
-    vi.stubEnv("CODEX_API_KEY", "codex-env-api-key");
-
-    await applyAuth({
-      client: { request } as never,
-      agentDir,
-      authRequirement: "api-key",
-      startOptions: createStartOptions(),
-    });
-
-    expect(request).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledWith(
-      "account/read",
-      { refreshToken: false },
-      expect.anything(),
-    );
-  });
-
-  it("uses Codex CLI api-key auth.json when no auth profile or env key exists", async ({
-    agentDir: root,
-  }) => {
+  baseIt.each([
+    ["existing ChatGPT account", "account"],
+    ["native auth.json", "native"],
+    ["cleared environment", "cleared"],
+    ["remote connection", "remote"],
+  ] as const)("isolates API-key fallback for %s", async (_name, mode) => {
+    const root = agentDirs.make();
     const agentDir = path.join(root, "agent");
-    const codexHome = path.join(root, "codex-cli");
-    const request = requestMock();
+    const codexHome = path.join(root, "native-cli");
+    const account =
+      mode === "account"
+        ? { type: "chatgpt", email: "codex@example.test", planType: "plus" }
+        : null;
+    const request = requestMock(account);
     vi.stubEnv("CODEX_HOME", codexHome);
-    vi.stubEnv("CODEX_API_KEY", "");
-    vi.stubEnv("OPENAI_API_KEY", "");
-
-    await writeCodexCliApiKeyAuthFile(codexHome);
-
+    vi.stubEnv("HOME", path.join(root, "empty-home"));
+    vi.stubEnv("CODEX_API_KEY", mode === "native" ? "" : "codex-env-api-key");
+    vi.stubEnv("OPENAI_API_KEY", mode === "native" ? "" : "openai-env-api-key");
+    if (mode === "native" || mode === "remote") {
+      await writeCodexCliApiKeyAuthFile(codexHome);
+    }
+    const startOptions = createStartOptions({
+      ...(mode === "native" ? { env: { CODEX_HOME: path.join(root, "isolated-codex-home") } } : {}),
+      ...(mode === "cleared" ? { clearEnv: ["CODEX_API_KEY", "OPENAI_API_KEY"] } : {}),
+      ...(mode === "remote"
+        ? { transport: "websocket", url: "ws://127.0.0.1:1455", clearEnv: ["FOO"] }
+        : {}),
+    });
+    if (mode === "remote") {
+      await expect(bridgeStart({ startOptions, agentDir })).resolves.toBe(startOptions);
+      expect(resolveCodexAppServerFallbackApiKeyCacheKey({ startOptions })).toBeUndefined();
+    }
     await applyAuth({
       client: { request } as never,
       agentDir,
       authRequirement: "api-key",
-      startOptions: createStartOptions({
-        env: { CODEX_HOME: path.join(root, "isolated-codex-home") },
-      }),
+      startOptions,
     });
-
-    expectApiKeyLogin(request, "cli-auth-json-api-key", true);
+    if (mode === "native") {
+      expectApiKeyLogin(request, "cli-auth-json-api-key", true);
+    } else if (mode === "account") {
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(request).toHaveBeenCalledWith(
+        "account/read",
+        { refreshToken: false },
+        expect.anything(),
+      );
+    } else {
+      expect(request).not.toHaveBeenCalled();
+    }
   });
 
   it("includes Codex CLI api-key auth.json in fallback app-server cache keys", async ({
@@ -1568,56 +1600,6 @@ describe("Codex auth bridge", () => {
     expect(second).not.toBe(first);
     expect(first).not.toContain("cli-auth-json-api-key");
     expect(second).not.toContain("second-cli-auth-json-api-key");
-  });
-
-  it("honors clearEnv before env API-key fallback", async ({ agentDir }) => {
-    const request = requestMock();
-    vi.stubEnv("CODEX_API_KEY", "codex-env-api-key");
-    vi.stubEnv("OPENAI_API_KEY", "openai-env-api-key");
-    vi.stubEnv("CODEX_HOME", path.join(agentDir, "empty-codex-home"));
-    vi.stubEnv("HOME", path.join(agentDir, "empty-home"));
-
-    await applyAuth({
-      client: { request } as never,
-      agentDir,
-      authRequirement: "api-key",
-      startOptions: createStartOptions({
-        clearEnv: ["CODEX_API_KEY", "OPENAI_API_KEY"],
-      }),
-    });
-
-    expect(request).not.toHaveBeenCalled();
-  });
-
-  it("does not send env API-key fallback to websocket app-server connections", async ({
-    agentDir,
-  }) => {
-    const request = requestMock();
-    vi.stubEnv("CODEX_API_KEY", "codex-env-api-key");
-    vi.stubEnv("OPENAI_API_KEY", "openai-env-api-key");
-
-    const codexHome = path.join(agentDir, "native-cli");
-    await writeCodexCliApiKeyAuthFile(codexHome);
-    vi.stubEnv("CODEX_HOME", codexHome);
-    const startOptions = createStartOptions({
-      transport: "websocket",
-      url: "ws://127.0.0.1:1455",
-      clearEnv: ["FOO"],
-    });
-    await expect(bridgeStart({ startOptions, agentDir })).resolves.toBe(startOptions);
-    expect(
-      resolveCodexAppServerFallbackApiKeyCacheKey({
-        startOptions,
-      }),
-    ).toBeUndefined();
-    await applyAuth({
-      client: { request } as never,
-      agentDir,
-      authRequirement: "api-key",
-      startOptions,
-    });
-
-    expect(request).not.toHaveBeenCalled();
   });
 
   it("rejects retired openai-codex auth-provider profiles before app-server login", async ({
@@ -1647,26 +1629,6 @@ describe("Codex auth bridge", () => {
     await expect(prepareSnapshot(profileParams(agentDir))).resolves.toBeUndefined();
     expect(oauth.refresh).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
-  });
-
-  it("rejects callback workspace changes against token claims before refresh", async ({
-    agentDir,
-  }) => {
-    persistProfile(
-      agentDir,
-      oauthProfile("test", {
-        access: chatgptAccessToken("workspace-selected"),
-        refresh: "workspace-refresh-token",
-      }),
-    );
-
-    await expect(
-      refreshTokens({
-        ...profileParams(agentDir),
-        previousAccountId: "workspace-original",
-      }),
-    ).rejects.toThrow(/ChatGPT workspace changed.*[Rr]etry/);
-    expect(oauth.refresh).not.toHaveBeenCalled();
   });
 
   it("force-refreshes the owner credential instead of a stale child OAuth clone", async ({
