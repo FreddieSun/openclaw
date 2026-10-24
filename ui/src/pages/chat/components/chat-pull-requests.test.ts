@@ -7,7 +7,10 @@ import { createDeferred } from "../../../../../test/helpers/promise.js";
 import { GatewayBrowserClient } from "../../../api/gateway.ts";
 import { i18n } from "../../../i18n/index.ts";
 import { captureI18nStateForTesting } from "../../../i18n/lib/translate.test-support.ts";
-import { createApplicationGateway } from "../../../test-helpers/application-context-fixtures.ts";
+import {
+  createApplicationGatewaySnapshot,
+  createApplicationGateway,
+} from "../../../test-helpers/application-context-fixtures.ts";
 import { mountSolid } from "../../../test-helpers/mount-solid.ts";
 import { flush } from "../../../test-helpers/solid-settle.ts";
 import type { ChatCiDetailsElement } from "./chat-ci-details.tsx";
@@ -640,17 +643,14 @@ describe("CI job details", () => {
   function harness() {
     const client = new GatewayBrowserClient({ url: "ws://localhost:12345" });
     const request = vi.spyOn(client, "request").mockResolvedValue(details());
-    const { gateway, publish } = createApplicationGateway({
-      client,
-      phase: "connected",
-      offlineStable: false,
-      hello: null,
-      canvasPluginSurfaceUrl: null,
-      assistantAgentId: "main",
-      sessionKey: "agent:main:main",
-      lastError: null,
-      lastErrorCode: null,
-    });
+    const { gateway, publish } = createApplicationGateway(
+      createApplicationGatewaySnapshot({
+        client,
+        phase: "connected",
+        assistantAgentId: "main",
+        sessionKey: "agent:main:main",
+      }),
+    );
     const props = {
       pullRequests: [pullRequest({ headSha })],
       gateway,
