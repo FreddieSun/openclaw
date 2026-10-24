@@ -21,7 +21,12 @@ export const quietFixture = {
 };
 export type QuietOutcome = "blocked" | "no_change" | "progress" | "done" | "error";
 
-function callTool(name: string, args: Record<string, unknown>, sequence: number) {
+function callTool(
+  name: string,
+  args: Record<string, unknown>,
+  sequence: number,
+  preamble?: string,
+) {
   const item = {
     type: "function_call",
     id: "fc_" + sequence,
@@ -29,27 +34,56 @@ function callTool(name: string, args: Record<string, unknown>, sequence: number)
     name,
     arguments: JSON.stringify(args),
   };
+  const message = {
+    type: "message",
+    id: "m_preamble_" + sequence,
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text: preamble, annotations: [] }],
+  };
+  const outputIndex = preamble ? 1 : 0;
   return [
-    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
+    ...(preamble
+      ? [
+          {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { ...message, status: "in_progress", content: [] },
+          },
+          {
+            type: "response.output_text.delta",
+            item_id: message.id,
+            output_index: 0,
+            content_index: 0,
+            delta: preamble,
+          },
+          { type: "response.output_item.done", output_index: 0, item: message },
+        ]
+      : []),
+    {
+      type: "response.output_item.added",
+      output_index: outputIndex,
+      item: { ...item, arguments: "" },
+    },
     {
       type: "response.function_call_arguments.delta",
-      output_index: 0,
+      output_index: outputIndex,
       item_id: item.id,
       delta: item.arguments,
     },
     {
       type: "response.function_call_arguments.done",
-      output_index: 0,
+      output_index: outputIndex,
       item_id: item.id,
       arguments: item.arguments,
     },
-    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.output_item.done", output_index: outputIndex, item },
     {
       type: "response.completed",
       response: {
         id: "r_" + sequence,
         status: "completed",
-        output: [item],
+        output: preamble ? [message, item] : [item],
         usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
       },
     },
@@ -183,6 +217,7 @@ export async function startQuietProvider(options: { baseline?: boolean } = {}) {
                 "automations",
                 { action: "record_result", outcome: step, ...(summary ? { summary } : {}) },
                 id,
+                step === "no_change" ? quietFixture.waiting : undefined,
               ),
             );
           } else {

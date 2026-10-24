@@ -153,8 +153,7 @@ export function createUiE2eVitestConfig(
     expect: { poll: { interval: 100, timeout: 15_000 } },
     globalSetup: [chromiumSetup],
     isolate: true,
-    // Inline projects resolve their own worker defaults; share the root budget
-    // explicitly. Vitest still applies --maxWorkers to every project.
+    // Pin the root cap explicitly; native CLI overrides still apply to every project.
     maxWorkers,
     pool: "forks",
     runner: undefined,

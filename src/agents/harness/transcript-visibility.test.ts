@@ -55,7 +55,8 @@ it("keeps quiet execution artifacts out of history without hiding attention or o
     isError: false,
     timestamp: 0,
   };
-  expect(project(reply)).toBe(reply);
+  // Provisional text cannot become visible before a later no_change result.
+  expect(project(reply)).toMatchObject({ display: false });
   expect(project(call)).toMatchObject({ display: false });
   expect(project(result)).toMatchObject({ display: false });
   createAutomationResultRecorder(runId, "job")({ outcome: "no_change" });

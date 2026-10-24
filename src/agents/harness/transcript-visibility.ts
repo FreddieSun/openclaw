@@ -27,17 +27,18 @@ export function projectAgentHarnessTranscriptMessageForDisplay<T extends AgentMe
   const toolCall =
     params.message.role === "assistant" &&
     params.message.content.some((block) => block.type === "toolCall");
-  const quietAssistant =
+  // Cron final delivery mirrors meaningful output; keep execution prose audit-only.
+  const scheduledAssistant =
     params.message.role === "assistant" &&
     params.message.stopReason !== "error" &&
     params.message.stopReason !== "aborted" &&
-    readAutomationDisplayState(params.runId) === "quiet";
+    readAutomationDisplayState(params.runId) !== "ordinary";
   const executionOnly =
     scheduled &&
     (params.message.role === "user" ||
       toolCall ||
       (params.message.role === "toolResult" && !params.message.isError) ||
-      quietAssistant);
+      scheduledAssistant);
   if (
     !params.hidden &&
     !isSubagentCoordinationInputProvenance(inputProvenance) &&

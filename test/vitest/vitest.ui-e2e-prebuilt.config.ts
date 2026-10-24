@@ -60,8 +60,7 @@ export function createPrebuiltUiE2eVitestConfig(
           include: files.filter((file) => parallelFiles.has(file)),
           name: name.replace("serial", "real-gateway"),
           fileParallelism: true,
-          // Parallel projects use the same explicit budget as the root, not
-          // Vitest's independently resolved per-project worker default.
+          // Both later projects use the same explicit cap as the root worker pool.
           maxWorkers: base.test?.maxWorkers,
           sequence: { ...template.test.sequence, groupOrder: 2 },
         },

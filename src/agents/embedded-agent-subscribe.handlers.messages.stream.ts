@@ -272,7 +272,8 @@ export function shouldSuppressSourceReplyOutput(
   assistant = ctx.state.lastAssistant,
 ): boolean {
   return (
-    (readAutomationDisplayState(ctx.params.runId) === "quiet" &&
+    // Scheduled text remains provisional until cron publishes the settled result.
+    (readAutomationDisplayState(ctx.params.runId) !== "ordinary" &&
       assistant?.stopReason !== "error" &&
       assistant?.stopReason !== "aborted") ||
     ctx.state.sourceReplyDeliveryState === "delivered" ||

@@ -162,7 +162,7 @@ function createDeliveryHarness(
 }
 
 it.each(["no_change", "progress"] as const)(
-  "streams only meaningful automation replies (%s)",
+  "leaves scheduled reply publication to final delivery (%s)",
   async (outcome) => {
     const runId = "run-directive-delivery";
     const claim = claimAgentRunContext(
@@ -173,7 +173,6 @@ it.each(["no_change", "progress"] as const)(
       { trackOwner: true, ownsContext: true },
     );
     onTestFinished(() => releaseAgentRunContext(runId, claim));
-    createAutomationResultRecorder(runId, "job")({ outcome, summary: "Check complete." });
     const harness = createDeliveryHarness();
     const message = makeAgentAssistantMessage({
       content: [{ type: "text", text: "The check completed with a useful result." }],
@@ -185,9 +184,13 @@ it.each(["no_change", "progress"] as const)(
     });
     harness.emit({ type: "message_end", message });
     await harness.flush();
-    expect(harness.delivered.map((payload) => payload.text).join("")).toBe(
-      outcome === "no_change" ? "" : "The check completed with a useful result.",
-    );
+    expect(harness.delivered).toEqual([]);
+    createAutomationResultRecorder(runId, "job")({ outcome, summary: "Check complete." });
+    harness.emit({ type: "message_start", message });
+    emitAssistantTextDelta({ emit: harness.emit, delta: "The check completed." });
+    harness.emit({ type: "message_end", message });
+    await harness.flush();
+    expect(harness.delivered).toEqual([]);
   },
 );
 
