@@ -149,6 +149,13 @@ describe("standalone build interface", () => {
       embedded: { modules: 4, plugins: 1, workers: 2, inlineWorkers: 0 },
       packageManager: undefined,
       plugins: { embedded: ["slack", "codex"], omitted: ["signal", "matrix"] },
+      pluginContract: {
+        schemaVersion: 1,
+        sdk: {
+          "openclaw/plugin-sdk/core": { source: "dist/plugin-sdk/core.js", entry: "/image/core" },
+        },
+        plugins: {},
+      },
       sqlite: structuredClone(sqlite),
       pruning: {
         categories: { pluginAssets: { files: 1, bytes: 24 } },
@@ -169,7 +176,17 @@ describe("standalone build interface", () => {
         sqlite,
       },
       embedded: { modules: 4, plugins: 1, workers: 2, inlineWorkers: 0 },
-      plugins: { embedded: ["codex", "slack"], omitted: ["matrix", "signal"] },
+      plugins: {
+        embedded: ["codex", "slack"],
+        omitted: ["matrix", "signal"],
+        contract: {
+          schemaVersion: 1,
+          sdk: {
+            "openclaw/plugin-sdk/core": { source: "dist/plugin-sdk/core.js", entry: "/image/core" },
+          },
+          plugins: {},
+        },
+      },
     });
     expect(manifest.runtime.sha256).toBe(
       "c1763658d97365c3501098c7326f9a049ec6107223baaea9f96cdb19e7c6cf9a",

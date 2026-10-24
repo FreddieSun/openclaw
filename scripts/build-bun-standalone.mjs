@@ -30,9 +30,11 @@ import { createStandaloneMetadataAdapter } from "./lib/bun-standalone-metadata.m
 import { createStandaloneNativeAdapter } from "./lib/bun-standalone-native.mjs";
 import { planStandalonePackageManager } from "./lib/bun-standalone-package-manager.mjs";
 import {
+  createStandalonePluginContract,
   planStandalonePlugins,
   pruneStandalonePluginDirectories,
   selectStandalonePluginModules,
+  stageStandalonePluginLoader,
 } from "./lib/bun-standalone-plugins.mjs";
 import { createStandaloneRequireAdapter } from "./lib/bun-standalone-require.mjs";
 import {
@@ -317,6 +319,11 @@ for (const [name, entries] of outputNames) {
 const embeddedPaths = Object.fromEntries(
   [...moduleInputs].map(([entry, { output }]) => [entry, `/$bunfs/root/${output}`]),
 );
+const pluginContract = createStandalonePluginContract({ runtimeRoot, plugins, embeddedPaths });
+const pluginLoader =
+  mode === "aot" && !supportDestination
+    ? undefined
+    : await stageStandalonePluginLoader({ runtimeRoot, outputRoot, build: Bun.build });
 for (const [name, entry] of Object.entries(moduleAliases)) {
   embeddedPaths[name] = embeddedPaths[path.relative(runtimeRoot, entry).split(path.sep).join("/")];
 }
@@ -339,10 +346,11 @@ const artifacts = createStandaloneArtifactAdapter({
   buildIdentity: buildId,
 });
 const metadata = createStandaloneMetadataAdapter({ runtimeRoot, embeddedPaths, parse });
-const requireAdapter = createStandaloneRequireAdapter({ runtimeRoot, embeddedPaths });
+const requireAdapter = createStandaloneRequireAdapter({ runtimeRoot, embeddedPaths, pluginLoader });
 fs.writeFileSync(
   runtimeBootstrap,
-  `import path from "node:path";
+  `import Module, { createRequire } from "node:module";
+import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMainThread } from "node:worker_threads";
 const root = path.join(path.dirname(process.execPath), "runtime");
@@ -420,7 +428,11 @@ const codegen = await createStandaloneCodegenAdapter({
 const codegenTransforms = [];
 const artifactTransforms = [];
 const transformedFiles = [];
-const external = ["chromium-bidi/*", "@audio/decode-ape"];
+const external = [
+  "chromium-bidi/*",
+  "@audio/decode-ape",
+  ...(pluginLoader ? [pluginLoader.specifier] : []),
+];
 const result = await Bun.build({
   entrypoints: [
     bootstrap,
@@ -578,7 +590,12 @@ const nativeModules = describeStandaloneNativeModules({
 const packageManager = planStandalonePackageManager(runtimeRoot);
 const resourcePlan = planStandaloneRuntime(
   runtimeRoot,
-  [...nativeResources.files, ...sqlite.files, ...packageManager.files],
+  [
+    ...nativeResources.files,
+    ...sqlite.files,
+    ...packageManager.files,
+    ...(pluginLoader?.files ?? []),
+  ],
   declaredPluginAssets,
   metadata.directories,
 );
@@ -731,6 +748,7 @@ await publishStandaloneArtifacts({
     bun: bunIdentity,
     openclaw: openclawIdentity,
     plugins,
+    pluginContract,
     nativeModules,
     embedded: {
       ...(wasm ? { webAssembly: wasm.assets } : {}),
