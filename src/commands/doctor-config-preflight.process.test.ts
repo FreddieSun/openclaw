@@ -84,8 +84,48 @@ function createDoctorFixture(name: string, configInState = false) {
 }
 
 function writeJson(file: string, value: unknown) {
+  writeText(file, JSON.stringify(value));
+}
+
+function writeText(file: string, value: string) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(value));
+  fs.writeFileSync(file, value);
+}
+
+function expectConfigUntouched(configPath: string, stateDir: string, raw: string) {
+  expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
+  const files = fs.readdirSync(stateDir, { recursive: true, encoding: "utf8" });
+  expect(files.filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file))).toEqual(
+    [],
+  );
+  return files;
+}
+
+function spawnGatewayOwner() {
+  // Windows validates live owners by gateway argv when start time is unavailable.
+  return spawn(
+    process.execPath,
+    ["-e", "setTimeout(() => {}, 120_000)", "src/entry.ts", "gateway"],
+    { cwd: path.resolve("."), stdio: "ignore" },
+  );
+}
+
+function writeGatewayOwnerLock(
+  child: ReturnType<typeof spawn>,
+  stateDir: string,
+  configPath: string,
+) {
+  const startTime = getFileLockProcessStartTime(child.pid!);
+  writeJson(path.join(resolveGatewayLockDir(stateDir), "gateway.state.lock"), {
+    pid: child.pid,
+    ownerId: "live-owner-refusal-test",
+    processNamespace: readGatewayLockProcessNamespace(),
+    createdAt: new Date().toISOString(),
+    configPath,
+    port: 18720,
+    stateDir,
+    ...(startTime !== null ? { startTime } : {}),
+  });
 }
 
 function readDatabase<T>(file: string, read: (db: DatabaseSync) => T): T {
@@ -342,8 +382,7 @@ describe("doctor invalid config process exit", () => {
         source === "include"
           ? JSON.stringify({ database, $include: "broken.json" })
           : `{"database":${JSON.stringify(database)},"agents":{broken json`;
-      fs.mkdirSync(path.dirname(configPath), { recursive: true });
-      fs.writeFileSync(configPath, raw);
+      writeText(configPath, raw);
       if (source === "include") {
         fs.writeFileSync(path.join(path.dirname(configPath), "broken.json"), "{broken json");
       }
@@ -361,11 +400,7 @@ describe("doctor invalid config process exit", () => {
         expect(output).toContain(message);
       }
       expect(output).not.toContain("Building Control UI assets");
-      expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
-      const createdFiles = fs.readdirSync(stateDir, { recursive: true, encoding: "utf8" });
-      expect(
-        createdFiles.filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
-      ).toEqual([]);
+      const createdFiles = expectConfigUntouched(configPath, stateDir, raw);
       expect(createdFiles.filter((file) => file.includes(".clobbered."))).toEqual([]);
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
@@ -384,8 +419,7 @@ describe("doctor invalid config process exit", () => {
         true,
       );
       const raw = `{"database":{"engine":"${engine}"}, broken`;
-      fs.mkdirSync(path.dirname(configPath), { recursive: true });
-      fs.writeFileSync(configPath, raw);
+      writeText(configPath, raw);
 
       const result = await run(
         ["doctor", ...(lint ? ["--lint"] : []), "--json"],
@@ -400,12 +434,7 @@ describe("doctor invalid config process exit", () => {
           message: expect.stringContaining("unknown: config could not be parsed"),
         }),
       );
-      expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
-      expect(
-        fs
-          .readdirSync(stateDir, { recursive: true, encoding: "utf8" })
-          .filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
-      ).toEqual([]);
+      expectConfigUntouched(configPath, stateDir, raw);
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
   );
@@ -419,8 +448,7 @@ describe("doctor invalid config process exit", () => {
     async ({ engine, entry }) => {
       const { stateDir, configPath, run } = createDoctorFixture("setup-invalid-json", true);
       const raw = `{"database":{"engine":"${engine}"}, broken`;
-      fs.mkdirSync(path.dirname(configPath), { recursive: true });
-      fs.writeFileSync(configPath, raw);
+      writeText(configPath, raw);
 
       const result = await run([entry, "--json"], DOCTOR_CHILD_TIMEOUT_MS);
       expect(result, result.stderr).toMatchObject({ code: 1, signal: null });
@@ -429,12 +457,7 @@ describe("doctor invalid config process exit", () => {
         error: { type: "cli_error", message: expect.stringContaining("Invalid config at") },
       });
       expect(result.stderr).not.toContain('Run "openclaw doctor --fix" now?');
-      expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
-      expect(
-        fs
-          .readdirSync(stateDir, { recursive: true, encoding: "utf8" })
-          .filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
-      ).toEqual([]);
+      expectConfigUntouched(configPath, stateDir, raw);
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
   );
@@ -447,8 +470,7 @@ describe("doctor invalid config process exit", () => {
     async ({ args, flag }) => {
       const { stateDir, configPath, env, run } = createDoctorFixture("setup-immutable", true);
       const raw = 'synthetic warning\n{"database":{"engine":"postgres"}}\n';
-      fs.mkdirSync(path.dirname(configPath), { recursive: true });
-      fs.writeFileSync(configPath, raw);
+      writeText(configPath, raw);
 
       const result = await run(args, DOCTOR_CHILD_TIMEOUT_MS, { ...env, [flag]: "1" });
       const output = `${result.stderr}\n${result.stdout}`;
@@ -456,12 +478,7 @@ describe("doctor invalid config process exit", () => {
       expect(output).toContain(`${flag}=1`);
       expect(output).toContain("immutable");
       expect(output).not.toContain('Run "openclaw doctor --fix"');
-      expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
-      expect(
-        fs
-          .readdirSync(stateDir, { recursive: true, encoding: "utf8" })
-          .filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
-      ).toEqual([]);
+      expectConfigUntouched(configPath, stateDir, raw);
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
   );
@@ -473,11 +490,7 @@ describe("doctor invalid config process exit", () => {
         `doctor-prefix-owner-${engine}`,
         true,
       );
-      const ownerChild = spawn(
-        process.execPath,
-        ["-e", "setTimeout(() => {}, 120_000)", "src/entry.ts", "gateway"],
-        { cwd: path.resolve("."), stdio: "ignore" },
-      );
+      const ownerChild = spawnGatewayOwner();
       try {
         const raw = `synthetic warning\n${JSON.stringify({
           database: {
@@ -493,31 +506,16 @@ describe("doctor invalid config process exit", () => {
           gateway: { mode: "local" },
           plugins: { enabled: false },
         })}\n`;
-        fs.mkdirSync(path.dirname(configPath), { recursive: true });
-        fs.writeFileSync(configPath, raw);
-        const startTime = getFileLockProcessStartTime(ownerChild.pid!);
-        writeJson(path.join(resolveGatewayLockDir(stateDir), "gateway.state.lock"), {
-          pid: ownerChild.pid,
-          ownerId: "doctor-prefix-owner",
-          processNamespace: readGatewayLockProcessNamespace(),
-          createdAt: new Date().toISOString(),
-          configPath,
-          port: 18720,
-          stateDir,
-          ...(startTime !== null ? { startTime } : {}),
-        });
+        writeText(configPath, raw);
+        writeGatewayOwnerLock(ownerChild, stateDir, configPath);
 
         const result = await run(doctorArgs("fix"), DOCTOR_CHILD_TIMEOUT_MS);
         const output = `${result.stderr}\n${result.stdout}`;
         expect(result, output).toMatchObject({ code: 0, signal: null });
         expect(output).toContain("exclusive offline");
         expect(output).toContain("unknown: config could not be parsed");
-        expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
-        const files = fs.readdirSync(stateDir, { recursive: true, encoding: "utf8" });
+        const files = expectConfigUntouched(configPath, stateDir, raw);
         expect(files.filter((file) => file.includes(".clobbered."))).toEqual([]);
-        expect(
-          files.filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
-        ).toEqual([]);
       } finally {
         await tempDirs.verifyCleanup(() => stopChildProcess(ownerChild, 5_000));
       }
@@ -536,8 +534,7 @@ describe("doctor invalid config process exit", () => {
         plugins: { enabled: false },
       };
       const raw = `synthetic warning\n${JSON.stringify(config)}\n`;
-      fs.mkdirSync(path.dirname(configPath), { recursive: true });
-      fs.writeFileSync(configPath, raw);
+      writeText(configPath, raw);
 
       const result = await run(doctorArgs("fix"), DOCTOR_CHILD_TIMEOUT_MS);
       const output = `${result.stderr}\n${result.stdout}`;
@@ -923,12 +920,7 @@ describe("Doctor repair followed by gateway readiness", () => {
 
   it("preserves legacy state and orphan sidecars when a live gateway owns the state directory", async () => {
     const { stateDir, configPath, env, run } = createDoctorFixture("live-owner-ready");
-    // Windows validates live owners by gateway argv when start time is unavailable.
-    const ownerChild = spawn(
-      process.execPath,
-      ["-e", "setTimeout(() => {}, 120_000)", "src/entry.ts", "gateway"],
-      { cwd: path.resolve("."), stdio: "ignore" },
-    );
+    const ownerChild = spawnGatewayOwner();
 
     try {
       writeJson(configPath, { gateway: { mode: "local", auth: { mode: "none" } } });
@@ -940,18 +932,7 @@ describe("Doctor repair followed by gateway readiness", () => {
       fs.mkdirSync(sharedStateDbDir, { recursive: true });
       const orphanWalPath = path.join(sharedStateDbDir, "openclaw.sqlite-wal");
       fs.writeFileSync(orphanWalPath, Buffer.alloc(64, 1));
-      const lockDir = resolveGatewayLockDir(stateDir);
-      const startTime = getFileLockProcessStartTime(ownerChild.pid!);
-      writeJson(path.join(lockDir, "gateway.state.lock"), {
-        pid: ownerChild.pid,
-        ownerId: "live-owner-refusal-test",
-        processNamespace: readGatewayLockProcessNamespace(),
-        createdAt: new Date().toISOString(),
-        configPath,
-        port: 18720,
-        stateDir,
-        ...(startTime !== null ? { startTime } : {}),
-      });
+      writeGatewayOwnerLock(ownerChild, stateDir, configPath);
       const result = await run(
         ["gateway", "run", "--port", "18720", "--allow-unconfigured"],
         30_000,
