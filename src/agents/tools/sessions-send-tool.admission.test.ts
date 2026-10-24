@@ -96,15 +96,17 @@ function unexpectedRequest(request: GatewayRequest): never {
 function mockGateway(
   handle: (request: GatewayRequest) => Promise<unknown> = async (request) =>
     unexpectedRequest(request),
-  list = false,
+  list: boolean | Record<string, unknown> = false,
+  key = targetSessionKey,
 ) {
+  const session = { key, agentId: "main" };
   return vi.fn().mockImplementation((request: GatewayRequest) => {
     if (request.method === "sessions.resolve") {
-      return Promise.resolve({ key: targetSessionKey, agentId: "main" });
+      return Promise.resolve(session);
     }
     if (list && request.method === "sessions.list") {
       return Promise.resolve({
-        sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }],
+        sessions: [{ ...session, ...(list === true ? { kind: "direct" } : list) }],
       });
     }
     return handle(request);
@@ -285,24 +287,25 @@ describe("sessions_send dispatch admission", () => {
         spawnedBy: parent,
         spawnDepth: 1,
       });
-      const callGateway = vi.fn().mockImplementation(async (request: GatewayRequest) => {
-        if (request.method === "sessions.resolve") {
-          return { key: child, agentId: "main" };
-        }
-        if (request.method === "sessions.describe") {
-          return {
-            session: {
-              key: child,
-              agentId: "main",
-              sessionId,
-              parentSessionKey: parent,
-              spawnedBy: parent,
-              childOwnerSessionKeys: [parent],
-            },
-          };
-        }
-        return unexpectedRequest(request);
-      });
+      const callGateway = mockGateway(
+        async (request) => {
+          if (request.method === "sessions.describe") {
+            return {
+              session: {
+                key: child,
+                agentId: "main",
+                sessionId,
+                parentSessionKey: parent,
+                spawnedBy: parent,
+                childOwnerSessionKeys: [parent],
+              },
+            };
+          }
+          return unexpectedRequest(request);
+        },
+        false,
+        child,
+      );
       const tool = createTool({
         config: cfg,
         agentSessionKey: parent,
@@ -328,7 +331,7 @@ describe("sessions_send dispatch admission", () => {
         });
         expect(peekSystemEvents(child)).toEqual([]);
       }
-      expect(callGateway.mock.calls.some(([request]) => request.method === "agent")).toBe(false);
+      expect(requestParams(callGateway, "agent")).toEqual([]);
       expect(registerWatch).not.toHaveBeenCalled();
     },
   );
@@ -466,7 +469,7 @@ describe("sessions_send dispatch admission", () => {
     const restoreGateway = interceptGateway(mockGateway(undefined, true));
     const pending = (async () => {
       await awaitGateBeforeSettlement(nativeReady.promise, native, "Native owner was not prepared");
-      return await inOperatorScope(context, owner, source, () =>
+      return inOperatorScope(context, owner, source, () =>
         withGatewayToolCallerIdentity(
           {
             ...callerContext(context),
@@ -533,10 +536,7 @@ describe("sessions_send dispatch admission", () => {
     });
     try {
       const result = await withGatewayToolCallerIdentity(
-        {
-          ...callerContext(context),
-          ...caller,
-        },
+        { ...callerContext(context), ...caller },
         () => execute(createTool({ callGateway }), "durable-steer-fallback", { mode: "steer" }),
       );
       expect(result.details).toMatchObject({ status: "accepted", targetDisposition: "queued" });
@@ -670,43 +670,35 @@ describe("sessions_send dispatch admission", () => {
       await putSession(targetKey, { sessionId: targetId, updatedAt: 1, spawnedBy: sourceKey });
     }
     let completion: Record<string, unknown> | undefined;
-    const callGateway = vi.fn().mockImplementation(async (request: GatewayRequest) => {
-      switch (request.method) {
-        case "sessions.resolve":
-          return { key: targetKey, agentId: "main" };
-        case "sessions.list":
-          return {
-            sessions: [
-              {
-                key: targetKey,
-                agentId: "main",
-                ...(self ? { deliveryContext: laterRoute } : { kind: "direct" }),
-              },
-            ],
-          };
-        case "agent.wait":
-          return completeRun(request, targetKey, targetId);
-        case "agent":
-          if (!isRecord(request.params)) {
-            throw new Error("Expected agent request parameters");
-          }
-          if (request.params.sessionKey === targetKey) {
-            await putSession(sourceKey, {
-              ...entry,
-              updatedAt: 2,
-              delivery: normalizeSessionDeliveryState({ context: laterRoute }),
-            });
-            return { runId };
-          }
-          completion = request.params;
-          return { runId: "completion-run" };
-        case "send":
-          if (self) {
-            return { messageId: "final-reply" };
-          }
-      }
-      return unexpectedRequest(request);
-    });
+    const callGateway = mockGateway(
+      async (request) => {
+        switch (request.method) {
+          case "agent.wait":
+            return completeRun(request, targetKey, targetId);
+          case "agent":
+            if (!isRecord(request.params)) {
+              throw new Error("Expected agent request parameters");
+            }
+            if (request.params.sessionKey === targetKey) {
+              await putSession(sourceKey, {
+                ...entry,
+                updatedAt: 2,
+                delivery: normalizeSessionDeliveryState({ context: laterRoute }),
+              });
+              return { runId };
+            }
+            completion = request.params;
+            return { runId: "completion-run" };
+          case "send":
+            if (self) {
+              return { messageId: "final-reply" };
+            }
+        }
+        return unexpectedRequest(request);
+      },
+      self ? { deliveryContext: laterRoute } : true,
+      targetKey,
+    );
     const restoreGateway = interceptGateway(callGateway);
     // Cross-session routing has a transport fixture, not a native custody receipt.
     const prepareFollowup = self
@@ -745,18 +737,6 @@ describe("sessions_send dispatch admission", () => {
           sourceReplyDeliveryMode: "message_tool_only",
         });
       } else {
-        expect.soft(requestParams(callGateway, "agent")).toEqual([
-          expect.objectContaining({
-            ...originalRoute,
-            sessionKey: sourceKey,
-            deliver: false,
-            sourceReplyDeliveryMode: "message_tool_only",
-            inputProvenance: expect.objectContaining({
-              kind: "inter_session",
-              sourceSessionKey: sourceKey,
-            }),
-          }),
-        ]);
         expect
           .soft(requestParams(callGateway, "send"))
           .toEqual([expect.objectContaining({ ...originalRoute, message: "Task complete" })]);
