@@ -1021,11 +1021,16 @@ describe("discoverOpenClawPlugins", () => {
     }
     const installRecords = { "installed-owner": installedRecord(installedPlugin) };
     withOpenClawPackageArgv(packageRoot, () => {
-      const read = (workspaceDir?: string, extraPaths: string[] = []) => {
+      const verifyRetainedSelection: Array<() => void> = [];
+      for (const [workspaceDir, extraPaths, rootDir, sourcePreferred] of [
+        [undefined, [], installedPlugin, undefined],
+        [path.join(testRoot, "workspace-a"), [bundledPlugin], bundledPlugin, true],
+        [path.join(testRoot, "workspace-b"), [], installedPlugin, undefined],
+      ] as const) {
         const discovery = discoverOpenClawPlugins({
           env,
           workspaceDir,
-          extraPaths,
+          extraPaths: [...extraPaths],
           installRecords,
         });
         const registry = loadPluginManifestRegistryCore({
@@ -1033,35 +1038,20 @@ describe("discoverOpenClawPlugins", () => {
           workspaceDir,
           installRecords,
           discovery,
-          config: { plugins: { load: { paths: extraPaths } } },
+          config: { plugins: { load: { paths: [...extraPaths] } } },
         });
         const winner = registry.plugins.find((plugin) => plugin.id === "shared");
-        if (!winner) {
-          throw new Error("Expected a selected shared manifest");
+        expect(winner).toMatchObject({ rootDir: fs.realpathSync(rootDir) });
+        verifyRetainedSelection.push(() => expect(winner?.sourcePreferred).toBe(sourcePreferred));
+        if (rootDir === installedPlugin) {
+          expect(resolvePluginManifestInstallOwner(winner!)).toBe("installed-owner");
         }
-        return { discovery, winner };
-      };
-      const initial = read();
-      expect(initial.winner.rootDir).toBe(fs.realpathSync(installedPlugin));
-      const workspaceA = path.join(testRoot, "workspace-a");
-      const selected = read(workspaceA, [bundledPlugin]);
-      expect(selected.winner.rootDir).toBe(fs.realpathSync(bundledPlugin));
-      const workspaceB = path.join(testRoot, "workspace-b");
-      const ordinary = read(workspaceB);
-      expect(ordinary.winner.rootDir).toBe(fs.realpathSync(installedPlugin));
-      expect(resolvePluginManifestInstallOwner(ordinary.winner)).toBe("installed-owner");
-      for (const [result, workspaceDir] of [
-        [initial, undefined],
-        [selected, workspaceA],
-        [ordinary, workspaceB],
-      ] as const) {
-        const installed = result.discovery.candidates.find(
-          (candidate) => candidate.origin === "global",
-        );
+        const installed = discovery.candidates.find((candidate) => candidate.origin === "global");
         expectFields(installed, { workspaceDir, installOwner: "installed-owner" });
       }
-      expect(selected.winner.sourcePreferred).toBe(true);
-      expect(ordinary.winner.sourcePreferred).toBeUndefined();
+      for (const verify of verifyRetainedSelection) {
+        verify();
+      }
     });
   });
 

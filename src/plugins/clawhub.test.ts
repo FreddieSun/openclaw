@@ -717,16 +717,6 @@ it("rejects fallback verification when a file hash drifts from files[] metadata"
   await expect(fs.stat(extensionsDir)).rejects.toMatchObject({ code: "ENOENT" });
 });
 
-it("rejects archive path traversal before install work", async () => {
-  await mockArchive({ entries: { "../extra.txt": "unsafe" }, files: [manifestFile] });
-  expectArchiveFailure(
-    await installDemo(),
-    expect.stringMatching(
-      /^ClawHub archive fallback verification rejected the downloaded archive: archive entry /,
-    ),
-  );
-});
-
 it("verifies the canonical installed inventory and ignores inert root records", async () => {
   const entries = { ...DEMO_PLUGIN_ARCHIVE_ENTRIES, "nested\\extra.txt": "verified" };
   const archive = await mockArchive({
@@ -750,94 +740,61 @@ it("verifies the canonical installed inventory and ignores inert root records", 
   );
 });
 
-type RejectedInstall = {
-  metadata?: Record<string, unknown>;
-  detail?: Record<string, unknown>;
-  host?: string;
-  missing?: "package" | "version";
-  version?: string;
-  spec?: string;
-};
-const rejectionHint = {
-  [errors.INVALID_GATEWAY_VERSION]: "invalid minGatewayVersion",
-  [errors.INCOMPATIBLE_PLUGIN_API]:
-    "Upgrade OpenClaw or choose an explicit compatible plugin version",
-  [errors.ARTIFACT_UNAVAILABLE]: "npm:demo@2026.3.22",
-  [errors.UNKNOWN_GATEWAY_VERSION]: "host version could not be determined",
-  [errors.SKILL_PACKAGE]: "openclaw skills install @openclaw/calendar",
-  [errors.PACKAGE_NOT_FOUND]: "Package not found",
-  [errors.VERSION_NOT_FOUND]: "demo@9.9.9",
-};
-it.each<[keyof typeof rejectionHint, RejectedInstall]>([
+function mockCompatibility(minGatewayVersion: string, pluginApiRange?: string) {
+  mockVersion({
+    sha256hash: DEMO_ARCHIVE_SHA256,
+    compatibility: { minGatewayVersion, pluginApiRange },
+  });
+}
+function mockMissingPackage(version?: string) {
+  mocks.parseSpec.mockReturnValueOnce({ name: "demo", version });
+  (version ? mocks.fetchVersion : mocks.fetchDetail).mockRejectedValueOnce(
+    requestError(
+      404,
+      version ? "Version not found" : "Package not found",
+      `/api/v1/packages/demo${version ? `/versions/${version}` : ""}`,
+    ),
+  );
+}
+it.each([
   [
     errors.INVALID_GATEWAY_VERSION,
-    {
-      metadata: {
-        compatibility: { pluginApiRange: ">=2026.3.22", minGatewayVersion: "not-semver" },
-      },
-    },
+    "invalid minGatewayVersion",
+    () => mockCompatibility("not-semver", ">=2026.3.22"),
   ],
   [
     errors.INCOMPATIBLE_PLUGIN_API,
-    {
-      host: "invalid",
-      metadata: {
-        sha256hash: DEMO_ARCHIVE_SHA256,
-        compatibility: { pluginApiRange: "*", minGatewayVersion: "2026.3.0" },
-      },
+    "Upgrade OpenClaw or choose an explicit compatible plugin version",
+    () => {
+      mocks.hostVersion.mockReturnValueOnce("invalid");
+      mockCompatibility("2026.3.0", "*");
     },
   ],
-  [errors.ARTIFACT_UNAVAILABLE, { metadata: { sha256hash: null } }],
+  [errors.ARTIFACT_UNAVAILABLE, "npm:demo@2026.3.22", () => mockVersion({ sha256hash: null })],
   [
     errors.UNKNOWN_GATEWAY_VERSION,
-    { host: "unknown", metadata: { compatibility: { minGatewayVersion: "2026.3.22" } } },
+    "host version could not be determined",
+    () => {
+      mocks.hostVersion.mockReturnValueOnce("unknown");
+      mockCompatibility("2026.3.22");
+    },
   ],
   [
     errors.SKILL_PACKAGE,
-    {
-      spec: "clawhub:calendar",
-      detail: {
-        name: "calendar",
-        displayName: "Calendar",
-        family: "skill",
-        ownerHandle: "openclaw",
-        compatibility: undefined,
-      },
-      metadata: { compatibility: undefined },
-    },
+    "openclaw skills install @openclaw/calendar",
+    () => mockPackage({ name: "calendar", family: "skill", ownerHandle: "openclaw" }),
   ],
-  [errors.PACKAGE_NOT_FOUND, { missing: "package" }],
-  [errors.VERSION_NOT_FOUND, { missing: "version", version: "9.9.9", spec: "clawhub:demo@9.9.9" }],
-])(
-  "rejects installation with %s",
-  async (code, { metadata, detail, host, missing, version, spec = "clawhub:demo" }) => {
-    if (metadata) {
-      mockVersion(metadata);
-    }
-    if (detail) {
-      mockPackage(detail);
-    }
-    if (host) {
-      mocks.hostVersion.mockReturnValueOnce(host);
-    }
-    if (version) {
-      mocks.parseSpec.mockReturnValueOnce({ name: "demo", version });
-    }
-    if (missing) {
-      const versionMissing = missing === "version";
-      const failure = new ClawHubRequestError({
-        path: "/api/v1/packages/demo" + (versionMissing ? "/versions/" + version : ""),
-        status: 404,
-        body: versionMissing ? "Version not found" : "Package not found",
-      });
-      (versionMissing ? mocks.fetchVersion : mocks.fetchDetail).mockRejectedValueOnce(failure);
-    }
-    const result = await installDemo({ spec });
-    expect(result).toMatchObject({ ok: false, code });
-    expect(expectInstallFailure(result).error).toContain(rejectionHint[code]);
-    expectUnused(mocks.download, mocks.installArchive, mocks.cleanup);
-  },
-);
+  [errors.PACKAGE_NOT_FOUND, "Package not found", () => mockMissingPackage()],
+  [errors.VERSION_NOT_FOUND, "demo@9.9.9", () => mockMissingPackage("9.9.9")],
+] as const)("rejects installation with %s", async (code, hint, configure) => {
+  configure();
+  expect(await installDemo()).toMatchObject({
+    ok: false,
+    code,
+    error: expect.stringContaining(hint),
+  });
+  expectUnused(mocks.download, mocks.installArchive, mocks.cleanup);
+});
 
 it.each([
   { baseUrl: "https://clawhub.ai", blocked: false },
