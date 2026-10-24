@@ -1,10 +1,10 @@
+import type { EmbeddingProviderCallOptions } from "openclaw/plugin-sdk/embedding-providers";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
   estimateStructuredEmbeddingInputBytes,
   estimateUtf8Bytes,
   formatEmbeddingModelInput,
   type EmbeddingInput,
-  type MemoryEmbeddingProviderCallOptions,
 } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 import { retryAsync } from "openclaw/plugin-sdk/retry-runtime";
 import {
@@ -17,7 +17,7 @@ export function embedMemoryQuery(
   provider: EmbeddingProvider,
   text: string,
   instruction: string | undefined,
-  options: MemoryEmbeddingProviderCallOptions,
+  options: EmbeddingProviderCallOptions,
 ): Promise<number[]> {
   return provider.embed(
     instruction
