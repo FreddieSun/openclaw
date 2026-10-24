@@ -1,7 +1,7 @@
 // Owner-boundary allocation proof; run on the approved benchmark host with scripts/tsx.mjs.
 import assert from "node:assert/strict";
 import { hash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { Session, type HeapProfiler } from "node:inspector/promises";
 import { registerHooks } from "node:module";
@@ -12,6 +12,7 @@ import { parseArgs } from "node:util";
 import type { SessionActorHotState } from "../../src/config/sessions/session-actor-contract.js";
 import type { PreparedSessionTranscriptHydration } from "../../src/config/sessions/session-history-read.types.js";
 import { startGatewayBenchDiagnostics } from "../lib/gateway-bench-diagnostics.ts";
+import { GATEWAY_GC_TRACE_MARKER, readGatewayGcTrace } from "../lib/gateway-bench-profile.ts";
 import { parseStrictIntegerOption } from "../lib/strict-integer-option.ts";
 
 const { values } = parseArgs({
@@ -22,10 +23,25 @@ const { values } = parseArgs({
     "interval-ms": { type: "string", default: "1" },
     mode: { type: "string", default: "exact" },
     output: { type: "string" },
+    "trace-log": { type: "string" },
     allocations: { type: "boolean", default: false },
   },
 });
 assert(values.output, "--output is required");
+const tracing = process.execArgv.includes("--trace-gc-nvp");
+assert.equal(
+  tracing,
+  Boolean(values["trace-log"]),
+  "--trace-log and --trace-gc-nvp require each other",
+);
+function markGc(phase: string, profilePath?: string) {
+  if (tracing) {
+    writeSync(
+      1,
+      `${GATEWAY_GC_TRACE_MARKER}${JSON.stringify({ phase, pid: process.pid, profilePath })}\n`,
+    );
+  }
+}
 const mode = values.mode;
 assert(mode === "exact" || mode === "window" || mode === "complete", "Invalid --mode");
 const operations = parseStrictIntegerOption({
@@ -63,6 +79,12 @@ if (values["owner-file"]) {
 const { seedSessionActorTranscriptContext: seed, readSessionActorTranscriptContext: read } =
   await import("../../src/config/sessions/session-actor-transcript-replica.js");
 assert(!values["owner-file"] || ownerLoaded, "Requested owner replacement was not loaded");
+if (tracing) {
+  assert(global.gc, "Trace identification requires --expose-gc");
+  markGc("identify-start");
+  global.gc();
+  markGc("identify-stop");
+}
 type Bounded = Extract<PreparedSessionTranscriptHydration, { kind: "bounded" }>;
 const eventCount = 64;
 const textBytes = 16 * 1024;
@@ -107,7 +129,12 @@ function fixture(): Bounded {
       timestamp: "2026-10-24T00:00:00.000Z",
       message: {
         role: index % 2 ? "assistant" : "user",
-        content: [{ type: "text", text: `synthetic-${index}:`.padEnd(textBytes, "x") }],
+        content: [
+          {
+            type: "text",
+            text: Buffer.from(`synthetic-${index}:`.padEnd(textBytes, "x")).toString("utf8"),
+          },
+        ],
       },
     })),
   ];
@@ -205,6 +232,21 @@ if (values["start-file"]) {
 function allocatedBytes(node: HeapProfiler.SamplingHeapProfileNode): number {
   return node.selfSize + node.children.reduce((sum, child) => sum + allocatedBytes(child), 0);
 }
+function functionAllocation(root: HeapProfiler.SamplingHeapProfileNode, functionName: string) {
+  let matchedFrameNodes = 0;
+  const visit = (node: HeapProfiler.SamplingHeapProfileNode): number => {
+    if (node.callFrame.functionName === functionName) {
+      matchedFrameNodes++;
+      return allocatedBytes(node);
+    }
+    return node.children.reduce((sum, child) => sum + visit(child), 0);
+  };
+  const sampledBytes = visit(root);
+  return {
+    matchedFrameNodes,
+    ...(matchedFrameNodes ? { sampledBytes, bytesPerCall: sampledBytes / operations } : {}),
+  };
+}
 const inspector = values.allocations ? new Session() : undefined;
 const latencies = new Float64Array(operations);
 try {
@@ -218,22 +260,37 @@ try {
   }
   const finishDiagnostics = startGatewayBenchDiagnostics();
   const cpuBefore = process.cpuUsage();
+  markGc("diagnostics-start", values.output);
   for (let index = 0; index < operations; index++) {
     const started = performance.now();
     operation();
     latencies[index] = performance.now() - started;
     await delay(intervalMs);
   }
+  markGc("diagnostics-stop", values.output);
   const cpu = process.cpuUsage(cpuBefore);
   const diagnostics = finishDiagnostics();
   const profile = inspector
     ? (await inspector.post("HeapProfiler.stopSampling")).profile
     : undefined;
+  const promotion = values["trace-log"]
+    ? readGatewayGcTrace(values["trace-log"], values.output, "diagnostics")
+    : undefined;
   assert.equal(json(latest), golden, "Measured context changed bytes");
   assert.equal(json(requireRead(seed(undefined, hot, prepared, limits))), golden);
   const sorted = latencies.toSorted();
   const totalMs = sorted.reduce((sum, value) => sum + value, 0);
-  const allocation = profile ? allocatedBytes(profile.head) : undefined;
+  const allocation = profile
+    ? {
+        sampledBytes: allocatedBytes(profile.head),
+        byFunction: Object.fromEntries(
+          ["seedSessionActorTranscriptContext", "readSessionActorTranscriptContext"].map((name) => [
+            name,
+            functionAllocation(profile.head, name),
+          ]),
+        ),
+      }
+    : undefined;
   const result = {
     scope:
       "Synthetic owner seed/read pairs; no Gateway, turn latency, or live allocation-share claim",
@@ -252,7 +309,7 @@ try {
     },
     intervalMs,
     goldenSha256: hash("sha256", golden, "hex"),
-    timingGateEligible: !values.allocations,
+    timingGateEligible: !values.allocations && !tracing,
     latency: {
       count: operations,
       totalMs,
@@ -264,12 +321,20 @@ try {
     cpuMs: (cpu.user + cpu.system) / 1000,
     diagnostics,
     gcMsPerOperation: (diagnostics.gc.durationMs?.total ?? 0) / operations,
+    ...(promotion
+      ? {
+          promotion: {
+            ...promotion,
+            promotedBytesPerOperation: promotion.promotedBytes / operations,
+          },
+        }
+      : {}),
     ...(allocation === undefined
       ? {}
       : {
           allocation: {
-            sampledBytes: allocation,
-            bytesPerSeedReadPair: allocation / operations,
+            ...allocation,
+            bytesPerSeedReadPair: allocation.sampledBytes / operations,
             samplingInterval: 32768,
             includesCollectedObjects: true,
           },
