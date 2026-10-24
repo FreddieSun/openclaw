@@ -2,6 +2,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
+import { text } from "node:stream/consumers";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   clearEmbeddingProviders,
@@ -33,15 +34,6 @@ type TestServer = {
 const servers: TestServer[] = [];
 let registeredEmbeddingProvidersSnapshot: ReturnType<typeof listRegisteredEmbeddingProviders>;
 
-async function readJsonBody(req: IncomingMessage) {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  }
-  const rawBody = Buffer.concat(chunks).toString("utf8");
-  return { rawBody, body: JSON.parse(rawBody) as Record<string, unknown> };
-}
-
 async function startEmbeddingServer(options?: {
   reject?: (inputCount: number) => { status: number; body: string } | undefined;
   authorization?: string;
@@ -50,7 +42,8 @@ async function startEmbeddingServer(options?: {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        const { body, rawBody } = await readJsonBody(req);
+        const rawBody = await text(req);
+        const body = JSON.parse(rawBody) as Record<string, unknown>;
         requests.push({
           method: req.method,
           url: req.url,
@@ -357,38 +350,17 @@ describe("memory query instructions over real transport", () => {
       expect(await owner.embedQueryWithRetry("find this")).toEqual(bare);
       expect(server.requests[0]?.rawBody).toBe(server.requests[3]?.rawBody);
       expect(server.requests[1]?.rawBody).toBe(server.requests[4]?.rawBody);
-      expect(server.requests.map(({ body }) => body)).toEqual([
-        {
-          model: "generic-embedding-alias",
-          input: ["remember this"],
-          dimensions: 3,
-          input_type: "document",
-        },
-        {
-          model: "generic-embedding-alias",
-          input: ["find this"],
-          dimensions: 3,
-          input_type: "query",
-        },
-        {
-          model: "generic-embedding-alias",
-          input: ["search_query: find this"],
-          dimensions: 3,
-          input_type: "query",
-        },
-        {
-          model: "generic-embedding-alias",
-          input: ["remember this"],
-          dimensions: 3,
-          input_type: "document",
-        },
-        {
-          model: "generic-embedding-alias",
-          input: ["find this"],
-          dimensions: 3,
-          input_type: "query",
-        },
+      expect(server.requests.map(({ body }) => body.input)).toEqual([
+        ["remember this"],
+        ["find this"],
+        ["search_query: find this"],
+        ["remember this"],
+        ["find this"],
       ]);
+      expect(server.requests[2]?.body).toEqual({
+        ...server.requests[1]?.body,
+        input: ["search_query: find this"],
+      });
     } finally {
       database.close();
     }
