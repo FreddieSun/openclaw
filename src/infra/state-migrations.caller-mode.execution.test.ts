@@ -23,6 +23,8 @@ let {
   createCallerModeSnapshot,
   expectBlockedTailInPlanOrder,
   expectPlanReceiptDescriptorsToMatch,
+  writeLegacyDoctorAndTuiSources,
+  writeLegacyDoctorSources,
   writeLegacyStateSchemaV1,
 } = await import("./state-migrations.caller-mode.test-helpers.js");
 let {
@@ -64,6 +66,8 @@ async function reloadStateDirFixtureGraph() {
     createCallerModeSnapshot,
     expectBlockedTailInPlanOrder,
     expectPlanReceiptDescriptorsToMatch,
+    writeLegacyDoctorAndTuiSources,
+    writeLegacyDoctorSources,
     writeLegacyStateSchemaV1,
   } = await import("./state-migrations.caller-mode.test-helpers.js"));
   ({
@@ -77,30 +81,6 @@ async function reloadStateDirFixtureGraph() {
     await import("./state-migrations.receipts.js"));
   ({ resolveLegacyProfileWorkspaceMigrationPaths } =
     await import("./state-migrations.state-dir.js"));
-}
-
-function writeLegacyDoctorSources(stateDir: string): { execPath: string } {
-  const execPath = path.join(stateDir, "exec-approvals.json");
-  fs.writeFileSync(
-    execPath,
-    `${JSON.stringify({
-      version: 1,
-      defaults: { security: "allowlist", ask: "on-miss" },
-      agents: { main: { allowlist: [{ pattern: "/usr/bin/rg" }] } },
-    })}\n`,
-  );
-  return { execPath };
-}
-
-function writeLegacyDoctorAndTuiSources(
-  stateDir: string,
-  tuiValue: unknown,
-): { execPath: string; tuiPath: string } {
-  const { execPath } = writeLegacyDoctorSources(stateDir);
-  const tuiPath = path.join(stateDir, "tui", "last-session.json");
-  fs.mkdirSync(path.dirname(tuiPath), { recursive: true });
-  fs.writeFileSync(tuiPath, `${JSON.stringify(tuiValue)}\n`);
-  return { execPath, tuiPath };
 }
 
 function snapshotSqliteArtifacts(databasePath: string): Record<string, string | undefined> {

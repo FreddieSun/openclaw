@@ -37,17 +37,13 @@ import type { GatewayWsClient } from "./server/ws-types.js";
 import { createSessionObserverAudience } from "./session-observer-audience.js";
 import { bindSessionRowProjection } from "./session-row-projection-access.js";
 import { createSessionRowProjection } from "./session-row-projection.js";
-import {
-  canReceiveSessionEvent as canReceiveSessionEventForClient,
-  prepareProjectedSessionSharing,
-  resolveSessionSharingTargetAsync,
-} from "./session-sharing.js";
+import { resolveSessionSharingTargetAsync } from "./session-sharing.js";
 import {
   canReceivePreparedSessionEvent,
+  createProjectedSessionEventPredicate,
   roleClient,
   rolePolicyConfig,
 } from "./session-sharing.test-utils.js";
-import { resolveSessionStoreIdentity } from "./session-store-key.js";
 import { resolveSessionSubscriptionKeys } from "./session-subscription-keys.js";
 import { claimRpcSourceForTest, createRpcSourceForTest } from "./test-helpers.rpc-source.js";
 
@@ -64,40 +60,11 @@ function profilePeer(name: string) {
   Object.assign(peer.client, roleClient("view", name));
   return peer;
 }
-type EventFilter = NonNullable<
-  Parameters<typeof createGatewayBroadcaster>[0]["canReceiveSessionEvent"]
->;
-
 function sharingFilter(
   cfg: OpenClawConfig,
   projection: Awaited<ReturnType<typeof createSessionRowProjection>>,
 ) {
-  return vi.fn<EventFilter>((client, sessionKeys, agentId, event, payload) =>
-    canReceiveSessionEventForClient({
-      cfg,
-      client,
-      sessionKeys,
-      agentId,
-      event,
-      payload,
-      prepared: {
-        sharing: prepareProjectedSessionSharing({
-          cfg,
-          client,
-          isMember: (target, identityId) =>
-            projection.hasMembership(target.storePath, target.storeKey, identityId),
-        }),
-        target: (key, targetAgentId) => {
-          const { agentId: ownerAgentId } = resolveSessionStoreIdentity({
-            cfg,
-            sessionKey: key,
-            agentId: targetAgentId,
-          });
-          return projection.sharingTarget({ key, agentId: ownerAgentId });
-        },
-      },
-    }),
-  );
+  return vi.fn(createProjectedSessionEventPredicate(cfg, projection));
 }
 
 describe("board event scope guards", () => {
