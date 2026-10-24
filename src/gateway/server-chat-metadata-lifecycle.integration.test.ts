@@ -63,6 +63,7 @@ import { resolveGatewayModelSupportsImages } from "./session-utils-model.js";
 const mocks = getPreparedModelRuntimeMocks();
 const main = { agentId: "main" };
 const configured = { view: "configured" as const, preparedOnly: true };
+const modelCatalog = () => ({ entries: [model], routeVariants: [model] });
 const nativeRow = (id: string, name = id) => ({
   provider: "openai",
   id,
@@ -114,10 +115,7 @@ beforeEach(async () => {
       expires: Date.now() + 30 * 60_000,
     },
   });
-  mocks.buildPreparedModelCatalogSnapshot.mockResolvedValue({
-    entries: [model],
-    routeVariants: [model],
-  });
+  mocks.buildPreparedModelCatalogSnapshot.mockResolvedValue(modelCatalog());
   sidecars = createGatewaySidecarStopOwner();
 });
 
@@ -154,6 +152,17 @@ function readOwner(activeConfig = config) {
     readOnly: true,
     allowGatewaySubagentBinding: true,
   });
+}
+
+function holdCatalogBuild() {
+  const entered = createDeferredCore();
+  const release = createDeferredCore();
+  mocks.buildPreparedModelCatalogSnapshot.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    return modelCatalog();
+  });
+  return { entered, release };
 }
 
 function installNativeHarness(
@@ -240,21 +249,8 @@ describe("gateway chat metadata lifecycle composition", () => {
   it("joins superseding owner replacements when an explicit catch-up overlaps publication", async () => {
     await publishOwner();
     const lifecycle = await attachLifecycle();
-    const entered = createDeferredCore();
-    const release = createDeferredCore();
-    const successorEntered = createDeferredCore();
-    const successorRelease = createDeferredCore();
-    mocks.buildPreparedModelCatalogSnapshot
-      .mockImplementationOnce(async () => {
-        entered.resolve();
-        await release.promise;
-        return { entries: [model], routeVariants: [model] };
-      })
-      .mockImplementationOnce(async () => {
-        successorEntered.resolve();
-        await successorRelease.promise;
-        return { entries: [model], routeVariants: [model] };
-      });
+    const { entered, release } = holdCatalogBuild();
+    const { entered: successorEntered, release: successorRelease } = holdCatalogBuild();
     const publication = publishOwner().catch((error: unknown) => error);
     await entered.promise;
     let refreshed = false;

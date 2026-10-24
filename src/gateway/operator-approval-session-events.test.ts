@@ -382,10 +382,7 @@ describe("operator approval session events", () => {
     signal,
   }) => {
     const databaseOptions = createDatabaseOptions();
-    await insertPendingApproval({
-      databaseOptions,
-      id: "committed-before-writer",
-    });
+    await insertPendingApproval({ databaseOptions, id: "committed-before-writer" });
     const reviewer = createClient({ connId: "reviewer", scopes: ["operator.admin"] });
     const { runtime } = createRuntime({ clients: [reviewer], now: () => 5_000 });
     // Warm read admission before holding a real transaction on the same physical database.
@@ -462,7 +459,6 @@ describe("operator approval session events", () => {
     (await runtime.replay(audienceSessionKeys[0]!, reviewer)).release();
     const admissions = vi.spyOn(stateWorkerStore, "runOpenClawStateWorkerOperation");
     const reads = vi.spyOn(stateReads, "executeExistingOpenClawStateRead");
-    const measured: { replays: number; admissions: number; reads: number }[] = [];
     for (const count of [1, 12, 64]) {
       admissions.mockClear();
       reads.mockClear();
@@ -472,20 +468,11 @@ describe("operator approval session events", () => {
       expect(prepared.map(({ replay }) => replay.approvals.map(({ id }) => id))).toEqual(
         Array.from({ length: count }, () => ["replay-admission"]),
       );
-      measured.push({
-        replays: count,
-        admissions: admissions.mock.calls.length,
-        reads: reads.mock.calls.length,
-      });
+      expect([admissions.mock.calls.length, reads.mock.calls.length]).toEqual([count, count]);
       for (const replay of prepared) {
         replay.release();
       }
     }
-    expect(measured).toEqual([
-      { replays: 1, admissions: 1, reads: 1 },
-      { replays: 12, admissions: 12, reads: 12 },
-      { replays: 64, admissions: 64, reads: 64 },
-    ]);
   });
 
   it("shares only matching audiences and reviewers while checking each waiting client", async () => {
@@ -548,10 +535,7 @@ describe("operator approval session events", () => {
 
   it("invalidates pending replay when a decision precedes the worker reply", async () => {
     const databaseOptions = createDatabaseOptions();
-    const pending = await insertPendingApproval({
-      databaseOptions,
-      id: "terminal-during-replay",
-    });
+    const pending = await insertPendingApproval({ databaseOptions, id: "terminal-during-replay" });
     const reviewerClient = createReviewer();
     const { runtime, subscribers, broadcastToConnIds } = createRuntime({
       clients: [reviewerClient],

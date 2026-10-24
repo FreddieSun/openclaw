@@ -71,13 +71,15 @@ async function requestSessionFile(
   sessionKey: string,
   params: Record<string, unknown>,
   client: GatewayClient | null = null,
+  operation: "get" | "set" | "assets" = "get",
 ) {
+  const method = `sessions.files.${operation}`;
   const respond = vi.fn();
   await handleGatewayRequest({
     req: {
       type: "req",
-      id: "sessions.files.get",
-      method: "sessions.files.get",
+      id: method,
+      method,
       params: { sessionKey, path: "notes.md", ...params },
     },
     client,
@@ -90,32 +92,62 @@ async function requestSessionFile(
   return respond.mock.calls[0]!;
 }
 
+function createAdoptionFixture(workspaceDir: string, sessionId: string) {
+  const cfg = { agents: { entries: { main: { workspace: workspaceDir } } } };
+  setRuntimeConfigSnapshot(cfg);
+  const target = {
+    agentId: "main",
+    sessionKey: `agent:main:${sessionId}`,
+    storePath: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+  };
+  return { cfg, target, scope: { ...target, sessionId } };
+}
+
+function expectOriginalFile(
+  result: Awaited<ReturnType<typeof requestSessionFile>>,
+  content: string,
+) {
+  expect(result).toMatchObject([true, { file: { content } }]);
+  expect(result[1].file.hash).toBeUndefined();
+  expect(result[1].source).toBeUndefined();
+}
+
+function createSkillsSnapshot(
+  skillId: string,
+  revision: string,
+  name: string,
+  ownerProfileId: string,
+) {
+  return {
+    prompt: "",
+    skills: [],
+    librarySelections: [{ skillId, revision, name, ownerProfileId }],
+  };
+}
+
+function createManagedSandbox(sessionKey: string, workspaceDir: string) {
+  return {
+    ...createSandboxTestContext({
+      overrides: { sessionKey, workspaceDir, workspaceSource: "managed-worktree" },
+    }),
+    [Symbol.dispose]() {},
+  };
+}
+
 it("adopts one empty owner and keeps original message files separate from same-name current files", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const cfg = { agents: { entries: { main: { workspace: state.workspaceDir } } } };
-    setRuntimeConfigSnapshot(cfg);
-    const target = {
-      agentId: "main",
-      sessionKey: "agent:main:adopt",
-      storePath: resolveSessionStorePathCore(undefined, { agentId: "main" }),
-    };
+    const { cfg, target } = createAdoptionFixture(state.workspaceDir, "adopt");
     // A guest's first turn records its selected skill libraries before adoption.
     const entry = {
       sessionId: "adopt",
       updatedAt: 1,
       sessionRoot: state.workspaceDir,
-      skillsSnapshot: {
-        prompt: "",
-        skills: [],
-        librarySelections: [
-          {
-            skillId: "11111111-1111-4111-8111-111111111111",
-            revision: "a".repeat(64),
-            name: "notes",
-            ownerProfileId: "adopt-owner",
-          },
-        ],
-      },
+      skillsSnapshot: createSkillsSnapshot(
+        "11111111-1111-4111-8111-111111111111",
+        "a".repeat(64),
+        "notes",
+        "adopt-owner",
+      ),
     };
     const sibling = { ...target, sessionKey: "agent:main:sibling" };
     await upsertSessionEntryCore(target, entry);
@@ -133,25 +165,7 @@ it("adopts one empty owner and keeps original message files separate from same-n
     const request = async (
       operation: "get" | "set" | "assets",
       params: Record<string, unknown> = {},
-    ) => {
-      const method = `sessions.files.${operation}`;
-      const respond = vi.fn();
-      await handleGatewayRequest({
-        req: {
-          type: "req",
-          id: method,
-          method,
-          params: { sessionKey: target.sessionKey, path: "notes.md", ...params },
-        },
-        client: null,
-        context,
-        respond,
-        isWebchatConnect: () => false,
-        extraHandlers: sessionsFilesHandlers,
-      });
-      expect(respond).toHaveBeenCalledOnce();
-      return respond.mock.calls[0]!;
-    };
+    ) => requestSessionFile(context, target.sessionKey, params, null, operation);
     const before = await request("get");
     expect(before[0]).toBe(true);
     const oldHash = before[1].file.hash;
@@ -173,6 +187,11 @@ it("adopts one empty owner and keeps original message files separate from same-n
       assertCurrent() {},
       async verifyBeforeBinding() {},
     };
+    const adopt = () =>
+      adoptUnboundPullRequestWorkspace({
+        ...input,
+        entry: loadSessionEntryReadOnly(target)!,
+      });
     const beforeUnsupported = loadSessionEntryReadOnly(target);
     await expect(
       adoptUnboundPullRequestWorkspace({
@@ -284,14 +303,7 @@ it("adopts one empty owner and keeps original message files separate from same-n
       restoreSettlement.forEach((restore) => restore());
       captureAdmission.mockRestore();
     }
-    const adopted = await adoptUnboundPullRequestWorkspace({
-      context,
-      target,
-      entry: loadSessionEntryReadOnly(target)!,
-      sandbox,
-      assertCurrent() {},
-      async verifyBeforeBinding() {},
-    });
+    const adopted = await adopt();
     const worktree = await managedWorktrees.findLiveByOwner("session", target.sessionKey);
     expect(worktree).toBeDefined();
     try {
@@ -336,10 +348,7 @@ it("adopts one empty owner and keeps original message files separate from same-n
       });
       expect(saved[0]).toBe(true);
       const historical = await request("get", { messageEntryId: oldMessage });
-      expect(historical[0]).toBe(true);
-      expect(historical[1].file.content).toBe("same original bytes\n");
-      expect(historical[1].file.hash).toBeUndefined();
-      expect(historical[1].source).toBeUndefined();
+      expectOriginalFile(historical, "same original bytes\n");
       const assistant = makeAssistantMessageFixture({
         stopReason: "stop",
         content: [{ type: "text", text: "Imported the PR" }],
@@ -394,12 +403,7 @@ it("adopts one empty owner and keeps original message files separate from same-n
         resumedMessage,
       ]);
       const originalAfterBranch = await request("get", { messageEntryId: oldMessage });
-      expect(originalAfterBranch).toMatchObject([
-        true,
-        { file: { content: "same original bytes\n" } },
-      ]);
-      expect(originalAfterBranch[1].file.hash).toBeUndefined();
-      expect(originalAfterBranch[1].source).toBeUndefined();
+      expectOriginalFile(originalAfterBranch, "same original bytes\n");
       const currentAfterBranch = await request("get", { messageEntryId: nextMessage });
       expect(currentAfterBranch).toMatchObject([
         true,
@@ -422,14 +426,7 @@ it("adopts one empty owner and keeps original message files separate from same-n
       expect(Buffer.from(assets[1].assets[0].content, "base64").toString()).toBe(
         "body { color: blue; }",
       );
-      const repeated = await adoptUnboundPullRequestWorkspace({
-        context,
-        target,
-        entry: loadSessionEntryReadOnly(target)!,
-        sandbox,
-        assertCurrent() {},
-        async verifyBeforeBinding() {},
-      });
+      const repeated = await adopt();
       expect(repeated.worktree?.id).toBe(worktree!.id);
       expect(await fs.readFile(path.join(worktree!.path, "notes.md"), "utf8")).toBe(
         "current source edit\n",
@@ -452,14 +449,7 @@ it("adopts one empty owner and keeps original message files separate from same-n
 
 it("keeps earlier message files original after a maintenance rewrite re-appends them", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const cfg = { agents: { entries: { main: { workspace: state.workspaceDir } } } };
-    setRuntimeConfigSnapshot(cfg);
-    const target = {
-      agentId: "main",
-      sessionKey: "agent:main:adopt-rewrite",
-      storePath: resolveSessionStorePathCore(undefined, { agentId: "main" }),
-    };
-    const scope = { ...target, sessionId: "adopt-rewrite" };
+    const { cfg, target, scope } = createAdoptionFixture(state.workspaceDir, "adopt-rewrite");
     await upsertSessionEntryCore(target, {
       sessionId: scope.sessionId,
       updatedAt: 1,
@@ -498,8 +488,8 @@ it("keeps earlier message files original after a maintenance rewrite re-appends 
     await adoptUnboundPullRequestWorkspace({
       context,
       target,
-      entry: loadSessionEntryReadOnly(target)!,
       sandbox,
+      entry: loadSessionEntryReadOnly(target)!,
       assertCurrent() {},
       async verifyBeforeBinding() {},
     });
@@ -529,9 +519,7 @@ it("keeps earlier message files original after a maintenance rewrite re-appends 
       const original = await requestSessionFile(context, target.sessionKey, {
         messageEntryId: copyOf("Saved notes.md"),
       });
-      expect(original).toMatchObject([true, { file: { content: "original notes\n" } }]);
-      expect(original[1].file.hash).toBeUndefined();
-      expect(original[1].source).toBeUndefined();
+      expectOriginalFile(original, "original notes\n");
       const current = await requestSessionFile(context, target.sessionKey, {
         messageEntryId: copyOf("Open the PR notes.md"),
       });
@@ -570,19 +558,11 @@ function stubPullRequestPreparation(sessionKey: string) {
   } as never);
   vi.spyOn(availability, "matchesCurrentGitHubPublicationIdentity").mockReturnValue(true);
   vi.spyOn(preflight, "assertExistingPullRequestWriteAccess").mockResolvedValue(undefined);
-  const resolveSandbox = vi.spyOn(sandboxContext, "resolveSandboxContext").mockImplementation(
-    async (params) =>
-      ({
-        ...createSandboxTestContext({
-          overrides: {
-            sessionKey,
-            workspaceDir: params.workspaceDir,
-            workspaceSource: "managed-worktree",
-          },
-        }),
-        [Symbol.dispose]() {},
-      }) as never,
-  );
+  const resolveSandbox = vi
+    .spyOn(sandboxContext, "resolveSandboxContext")
+    .mockImplementation(
+      async (params) => createManagedSandbox(sessionKey, params.workspaceDir) as never,
+    );
   const integrate = vi
     .spyOn(baseRefresh, "integrateManagedWorkspaceSource")
     .mockImplementation(async (params) => {
@@ -668,36 +648,21 @@ async function removeOwnedWorktree(sessionKey: string) {
 
 it("prepares an own PR in an ordinary sandboxed chat through the registered handler", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const cfg = { agents: { entries: { main: { workspace: state.workspaceDir } } } };
-    setRuntimeConfigSnapshot(cfg);
-    const target = {
-      agentId: "main",
-      sessionKey: "agent:main:adopt-handler",
-      storePath: resolveSessionStorePathCore(undefined, { agentId: "main" }),
-    };
+    const { cfg, target, scope } = createAdoptionFixture(state.workspaceDir, "adopt-handler");
     // Any earlier turn records a skills snapshot before the PR link arrives.
-    const skillsSnapshot = {
-      prompt: "",
-      skills: [],
-      librarySelections: [
-        {
-          skillId: "22222222-2222-4222-8222-222222222222",
-          revision: "b".repeat(64),
-          name: "handler-notes",
-          ownerProfileId: "handler-owner",
-        },
-      ],
-    };
+    const skillsSnapshot = createSkillsSnapshot(
+      "22222222-2222-4222-8222-222222222222",
+      "b".repeat(64),
+      "handler-notes",
+      "handler-owner",
+    );
     await upsertSessionEntryCore(target, {
       sessionId: "adopt-handler",
       updatedAt: 1,
       sessionRoot: state.workspaceDir,
       skillsSnapshot,
     });
-    const manager = await SessionManager.openAsync(
-      { ...target, sessionId: "adopt-handler" },
-      state.workspaceDir,
-    );
+    const manager = await SessionManager.openAsync(scope, state.workspaceDir);
     const earlier = await manager.appendMessageAsync(makeUserMessage("Open notes.md", 1));
     assert(earlier, "The earlier message must be persisted");
     await fs.writeFile(path.join(state.workspaceDir, "notes.md"), "original notes\n");
@@ -734,10 +699,7 @@ it("prepares an own PR in an ordinary sandboxed chat through the registered hand
       const read = await requestSessionFile(context, target.sessionKey, {
         messageEntryId: earlier,
       });
-      expect(read[0]).toBe(true);
-      expect(read[1].file.content).toBe("original notes\n");
-      expect(read[1].file.hash).toBeUndefined();
-      expect(read[1].source).toBeUndefined();
+      expectOriginalFile(read, "original notes\n");
     } finally {
       await removeOwnedWorktree(target.sessionKey);
     }
@@ -846,16 +808,7 @@ it("refuses another guest and lost access before binding, PR import and earlier 
         // Access lost after binding is refused before PR source import.
         resolveSandbox.mockImplementationOnce(async (params) => {
           await setGuestRole("revoked");
-          return {
-            ...createSandboxTestContext({
-              overrides: {
-                sessionKey: target.sessionKey,
-                workspaceDir: params.workspaceDir,
-                workspaceSource: "managed-worktree",
-              },
-            }),
-            [Symbol.dispose]() {},
-          } as never;
+          return createManagedSandbox(target.sessionKey, params.workspaceDir) as never;
         });
         await expect(prepare(guestClient)).rejects.toThrow("no longer authorized");
         expect(integrate).not.toHaveBeenCalled();

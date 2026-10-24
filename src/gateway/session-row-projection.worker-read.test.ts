@@ -69,6 +69,17 @@ import { resolveSessionStoreKey } from "./session-store-key.js";
 import { listProjectedSessions } from "./session-utils-list.js";
 import * as rowInputs from "./session-utils-row.js";
 
+type Projection = Parameters<typeof listProjectedSessions>[0]["projection"];
+
+function invalidateFacts(projection: Projection, query: { agentId: string; key: string }) {
+  sessionChanges.emit({
+    agentId: query.agentId,
+    sessionKey: query.key,
+    storePath: projection.capture(query)!.storeTarget.storePath,
+    factsInvalidated: true,
+  });
+}
+
 // Hold GatewayScheduler timeouts so WAL maintenance stays outside the request SQL budget.
 beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }));
 afterEach(() => {
@@ -153,12 +164,7 @@ it.each([{ workMs: 20, rowCount: 65 }])(
       try {
         for (const [index, { scope, entry }] of entries.entries()) {
           replaceSessionEntrySync(scope, { ...entry, updatedAt: 2, label: `latest-${index}` });
-          sessionChanges.emit({
-            ...scope,
-            storePath: projection.capture({ agentId: scope.agentId, key: scope.sessionKey })!
-              .storeTarget.storePath,
-            factsInvalidated: true,
-          });
+          invalidateFacts(projection, { agentId: scope.agentId, key: scope.sessionKey });
         }
         expect(projection.dirtyRowCount).toBe(rowCount);
         const published = publications;
@@ -240,12 +246,7 @@ it.each([
         });
         for (const { query, entry } of rows) {
           seedRow(query, { ...entry, updatedAt: 2, label: "Committed" });
-          sessionChanges.emit({
-            agentId: query.agentId,
-            sessionKey: query.key,
-            storePath: projection.capture(query)!.storeTarget.storePath,
-            factsInvalidated: true,
-          });
+          invalidateFacts(projection, query);
         }
         const selected = rows[0]!;
         const describe = () =>
@@ -640,26 +641,14 @@ it.each([
         return reply;
       });
       replaceSessionEntrySync(scope, { ...entry, updatedAt: 2, label: "Fresh stored label" });
-      sessionChanges.emit({
-        ...scope,
-        storePath: projection.capture({ agentId: scope.agentId, key: scope.sessionKey })!
-          .storeTarget.storePath,
-        factsInvalidated: true,
-      });
+      invalidateFacts(projection, { agentId: scope.agentId, key: scope.sessionKey });
       if (change === "captured sibling row") {
         replaceSessionEntrySync(unrelated, {
           sessionId: "unrelated",
           updatedAt: 0,
           label: "Previous sibling",
         });
-        sessionChanges.emit({
-          ...unrelated,
-          storePath: projection.capture({
-            agentId: unrelated.agentId,
-            key: unrelated.sessionKey,
-          })!.storeTarget.storePath,
-          factsInvalidated: true,
-        });
+        invalidateFacts(projection, { agentId: unrelated.agentId, key: unrelated.sessionKey });
       }
       reading = listSessions({ client, context, request });
       await Promise.race([

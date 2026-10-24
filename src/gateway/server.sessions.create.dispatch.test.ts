@@ -68,6 +68,25 @@ type CreatedSessionPayload = {
   runId?: string;
 };
 
+function expectCreationEvent(
+  broadcast: ReturnType<typeof vi.fn>,
+  agentId: string,
+  subscriptionKeys = [`agent:${agentId}:global`],
+) {
+  expect(broadcast).toHaveBeenCalledWith(
+    "sessions.changed",
+    expect.objectContaining({ sessionKey: "global", agentId, reason: "create" }),
+    new Set(["conn-1"]),
+    {
+      dropIfSlow: true,
+      agentId,
+      sessionKeys: ["global"],
+      sessionEventSubscriptionKeys: subscriptionKeys,
+      prepareSessionProjection: expect.any(Function),
+    },
+  );
+}
+
 async function createDashboard(ws: WebSocket, key: string) {
   const created = await rpcReq<CreatedSessionPayload>(ws, "sessions.create", {
     agentId: "main",
@@ -150,17 +169,14 @@ test("sessions.create publishes repository metadata before the next socket read"
   const { ws } = await openClient();
   const key = "agent:main:dashboard:repository-worker";
   try {
-    const created = await rpcReq<{
-      key: string;
-      entry: { repositoryWorkspaceId: string };
-    }>(ws, "sessions.create", {
+    const created = await rpcReq<CreatedSessionPayload>(ws, "sessions.create", {
       agentId: "main",
       key,
       repository: { url: "https://github.com/example/repository.git", ref: "main" },
     });
     expect(created.ok, JSON.stringify(created.error)).toBe(true);
     const workspaceId = requireNonEmptyString(
-      created.payload?.entry.repositoryWorkspaceId,
+      created.payload?.entry?.repositoryWorkspaceId,
       "created repository workspace",
     );
     expect(created.payload?.key).toBe(key);
@@ -168,13 +184,10 @@ test("sessions.create publishes repository metadata before the next socket read"
       repositoryWorkspaceId: workspaceId,
     });
 
-    const listed = await rpcReq<{
-      sessions: Array<{
-        key: string;
-        repositoryWorkspaceId?: string;
-        repository?: { url: string; ref?: string; branch: string };
-      }>;
-    }>(ws, "sessions.list", { agentId: "main", limit: 100 });
+    const listed = await rpcReq<SessionsListResult>(ws, "sessions.list", {
+      agentId: "main",
+      limit: 100,
+    });
     expect(listed.ok, JSON.stringify(listed.error)).toBe(true);
     expect(listed.payload?.sessions.find((row) => row.key === key)).toMatchObject({
       repositoryWorkspaceId: workspaceId,
@@ -567,18 +580,7 @@ test("sessions.create applies configured fixed-store ownership to bare keys", as
     expect(loadSessionEntry({ agentId: "ops", sessionKey: "global", storePath })?.sessionId).toBe(
       created.payload?.sessionId,
     );
-    expect(broadcastToConnIds).toHaveBeenCalledWith(
-      "sessions.changed",
-      expect.objectContaining({ sessionKey: "global", agentId: "ops", reason: "create" }),
-      new Set(["conn-1"]),
-      {
-        dropIfSlow: true,
-        agentId: "ops",
-        sessionKeys: ["global"],
-        sessionEventSubscriptionKeys: ["agent:ops:global", "global"],
-        prepareSessionProjection: expect.any(Function),
-      },
-    );
+    expectCreationEvent(broadcastToConnIds, "ops", ["agent:ops:global", "global"]);
 
     const conflict = await directSessionReq("sessions.create", {
       key: "global",
@@ -707,18 +709,7 @@ test("sessions.create checks selected global initialization in the requested age
       sessionId: "sess-main-initializing",
       initializationPending: true,
     });
-    expect(broadcastToConnIds).toHaveBeenCalledWith(
-      "sessions.changed",
-      expect.objectContaining({ sessionKey: "global", agentId: "work", reason: "create" }),
-      new Set(["conn-1"]),
-      {
-        dropIfSlow: true,
-        agentId: "work",
-        sessionKeys: ["global"],
-        sessionEventSubscriptionKeys: ["agent:work:global"],
-        prepareSessionProjection: expect.any(Function),
-      },
-    );
+    expectCreationEvent(broadcastToConnIds, "work");
 
     await f.seed("work", "sess-work-initializing", { initializationPending: true });
     expect(
@@ -763,18 +754,13 @@ test("sessions.create sends selected global initial tasks to the requested agent
   const runId = requireNonEmptyString(created.payload?.runId, "selected global run id");
   const wait = await rpcReq(ws, "agent.wait", { runId, timeoutMs: 1_000 });
   expect(wait.ok).toBe(true);
-  const workEntry = loadSessionEntry({
-    agentId: "work",
-    sessionKey: "global",
-    storePath: workStorePath,
-  });
+  const workTarget = { agentId: "work", sessionKey: "global", storePath: workStorePath };
+  const workEntry = loadSessionEntry(workTarget);
   const workSessionId = requireNonEmptyString(workEntry?.sessionId, "selected global session id");
   await expect(
     loadTranscriptEvents({
-      agentId: "work",
+      ...workTarget,
       sessionId: workSessionId,
-      sessionKey: "global",
-      storePath: workStorePath,
     }),
   ).resolves.toContainEqual(
     expect.objectContaining({
@@ -862,13 +848,14 @@ test.each<
       );
       expect(described.ok, JSON.stringify(described.error)).toBe(true);
       expect(described.payload?.session).toMatchObject({ key: childKey, agentId: expectedAgent });
-      expect(
-        loadSessionEntry({
-          agentId: expectedAgent,
-          sessionKey: childKey,
-          storePath: expectedAgent === "work" ? workStorePath : mainStorePath,
-        }),
-      ).toMatchObject({ sessionId: created.payload?.sessionId });
+      const childTarget = {
+        agentId: expectedAgent,
+        sessionKey: childKey,
+        storePath: expectedAgent === "work" ? workStorePath : mainStorePath,
+      };
+      expect(loadSessionEntry(childTarget)).toMatchObject({
+        sessionId: created.payload?.sessionId,
+      });
       expect(
         loadSessionEntry({
           agentId: expectedAgent === "work" ? "main" : "work",
@@ -890,13 +877,12 @@ test.each<
       expect(created.payload?.entry?.forkedFromParent).toBe(true);
       await expect(
         loadTranscriptEvents({
+          ...childTarget,
+          sessionKey: created.payload?.key ?? "",
           sessionId: requireNonEmptyString(
             created.payload?.sessionId,
             "agent-qualified forked session id",
           ),
-          sessionKey: created.payload?.key ?? "",
-          agentId: expectedAgent,
-          storePath: expectedAgent === "work" ? workStorePath : mainStorePath,
         }),
       ).resolves.toEqual(
         expect.arrayContaining([
