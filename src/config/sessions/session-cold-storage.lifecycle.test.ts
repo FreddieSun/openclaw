@@ -163,24 +163,16 @@ async function createColdCurrentSession(
     await replaceSessionEntry(scope, entry);
     await replaceTranscriptEvents(scope, [
       { type: "session", id: scope.sessionId, version: 3 },
-      {
+      ...[
+        { id: "question", parentId: null, role: "user", content: "Question" },
+        { id: "answer", parentId: "question", role: "assistant", content: "Original answer" },
+        { id: "alternate", parentId: "question", role: "assistant", content: "Alternate answer" },
+      ].map(({ id, parentId, role, content }) => ({
         type: "message",
-        id: "question",
-        parentId: null,
-        message: { role: "user", content: "Question" },
-      },
-      {
-        type: "message",
-        id: "answer",
-        parentId: "question",
-        message: { role: "assistant", content: "Original answer" },
-      },
-      {
-        type: "message",
-        id: "alternate",
-        parentId: "question",
-        message: { role: "assistant", content: "Alternate answer" },
-      },
+        id,
+        parentId,
+        message: { role, content },
+      })),
       { type: "leaf", id: "selection", parentId: "alternate", targetId: "answer" },
     ]);
     await waitForSessionTranscriptIndexReconcile(options);
