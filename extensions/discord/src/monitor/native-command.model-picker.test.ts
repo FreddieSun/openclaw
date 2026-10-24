@@ -53,7 +53,7 @@ type PickerComponent = {
   label?: string;
   custom_id?: string;
   disabled?: boolean;
-  options?: Array<{ label: string; value: string }>;
+  options?: Array<{ label: string; value: string; default?: boolean }>;
   components?: PickerComponent[];
 };
 
@@ -120,8 +120,8 @@ function createInteraction(params?: { userId?: string; values?: string[] }) {
   return interaction;
 }
 
-function createModelCommandDefinition(): ChatCommandDefinition {
-  return {
+function mockModelCommandPipeline() {
+  const modelCommand: ChatCommandDefinition = {
     key: "model",
     nativeName: "model",
     description: "Switch model",
@@ -130,9 +130,6 @@ function createModelCommandDefinition(): ChatCommandDefinition {
     argsParsing: "none",
     scope: "native",
   };
-}
-
-function mockModelCommandPipeline(modelCommand = createModelCommandDefinition()) {
   vi.spyOn(commandRegistryModule, "findCommandByNativeName").mockImplementation((name) =>
     name === "model" ? modelCommand : undefined,
   );
@@ -248,8 +245,9 @@ async function runSubmitButton(
   data: PickerButtonData,
   dispatchCommandInteraction: DispatchDiscordCommandInteraction = createDispatchSpy(),
   interaction = createInteraction(),
+  select = false,
 ) {
-  await createPicker(false, dispatchCommandInteraction).run(
+  await createPicker(select, dispatchCommandInteraction).run(
     interaction as unknown as PickerButtonInteraction,
     data,
   );
@@ -273,16 +271,12 @@ async function runModelSelect(params: {
   userId?: string;
   values?: string[];
 }) {
-  const select = createPicker(true, params.dispatchCommandInteraction);
-  const selectInteraction = createInteraction({
-    userId: params.userId ?? "owner",
-    values: params.values ?? ["gpt-4o"],
-  });
-  await select.run(
-    selectInteraction as unknown as PickerButtonInteraction,
+  return runSubmitButton(
     params.data ?? createModelsViewSelectData(),
+    params.dispatchCommandInteraction,
+    createInteraction({ userId: params.userId ?? "owner", values: params.values ?? ["gpt-4o"] }),
+    true,
   );
-  return selectInteraction;
 }
 
 function expectSelection(
@@ -571,8 +565,9 @@ it.each(["models", "recents"] as const)(
 );
 
 it("keeps full long model identity through pick selection and rendered Submit", async () => {
-  const model = `${"a".repeat(100)}x`;
-  const sibling = `${"a".repeat(100)}y`;
+  const label = "😀".repeat(100);
+  const model = `${label}x`;
+  const sibling = `${label}y`;
   const pickerData = createModelsProviderData({ ollama: [model, sibling] });
   const { dispatchSpy, submit } = prepareModelPicker(pickerData);
   const rendered = renderedControls(
@@ -581,15 +576,17 @@ it("keeps full long model identity through pick selection and rendered Submit", 
       userId: "owner",
       data: pickerData,
       provider: "ollama",
+      currentModel: `ollama/${model}`,
     }),
   );
   const modelSelect = rendered.find((component) =>
-    component.options?.some((option) => option.label === "a".repeat(100)),
+    component.options?.some((option) => option.label === label),
   );
   expect(modelSelect?.options?.map((option) => option.value)).toEqual([
     modelPickerModule.createDiscordModelPickerModelToken("ollama", model),
     modelPickerModule.createDiscordModelPickerModelToken("ollama", sibling),
   ]);
+  expect(modelSelect?.options).toMatchObject([{ label, default: true }, { label }]);
   const selectData = parseCustomId(modelSelect?.custom_id ?? "").data;
   const selection = await runModelSelect({
     dispatchCommandInteraction: dispatchSpy,

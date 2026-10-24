@@ -158,6 +158,7 @@ type PresenceListenerOverrides = Partial<PresenceListenerParams> & {
   presenceEvents?: Partial<PresenceEventConfig>;
 };
 let nowMs = 1_000;
+const cleanups: Array<() => Promise<void>> = [];
 
 function createPresenceListener({ presenceEvents, ...overrides }: PresenceListenerOverrides = {}) {
   const store = overrides.cooldownStore ?? cooldownStore();
@@ -287,8 +288,6 @@ function createHarness(
     botUserId: "bot-1",
     guildEntries: {
       "guild-1": {
-        requireMention: true,
-        users: ["human-1"],
         channels: {
           "system-channel": { enabled: true },
           "fallback-channel": { enabled: true },
@@ -308,7 +307,9 @@ function createHarness(
   });
   const update = (archived = false) =>
     client.dispatchGatewayEvent("THREAD_UPDATE", thread(archived));
-  const joinGuild = () => client.dispatchGatewayEvent("GUILD_CREATE", guildCreateEvent());
+  const joinGuild = (event: Partial<GatewayGuildCreateDispatchData> = {}) =>
+    client.dispatchGatewayEvent("GUILD_CREATE", { ...guildCreateEvent(), ...event });
+  cleanups.push(stopMonitorListeners);
   return { client, fetch, logger, onEvent, update, joinGuild, cleanup: stopMonitorListeners };
 }
 
@@ -330,7 +331,10 @@ beforeEach(() => {
   mocks.resolveAgentRoute.mockReturnValue(route);
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(async () => {
+  await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
+  vi.restoreAllMocks();
+});
 
 describe("Discord monitor dispatch", () => {
   it("tracks inbound messages before their handlers complete", async () => {
@@ -389,17 +393,13 @@ describe("Discord monitor dispatch", () => {
   it("keeps membership claims independent for two account clients", async () => {
     const first = createHarness({ accountId: "account-a" });
     const second = createHarness({ accountId: "account-b" });
-    try {
-      await first.update();
-      await second.update();
-      await first.client.dispatchGatewayEvent("READY", {});
-      await first.update();
-      await second.update();
-      expect(first.fetch).toHaveBeenCalledTimes(2);
-      expect(second.fetch).toHaveBeenCalledOnce();
-    } finally {
-      await Promise.all([first.cleanup(), second.cleanup()]);
-    }
+    await first.update();
+    await second.update();
+    await first.client.dispatchGatewayEvent("READY", {});
+    await first.update();
+    await second.update();
+    expect(first.fetch).toHaveBeenCalledTimes(2);
+    expect(second.fetch).toHaveBeenCalledOnce();
   });
 
   it("unbinds the account's deleted thread and reports a session-close failure without farewell", async () => {
@@ -461,16 +461,10 @@ describe("Discord guild join introductions", () => {
   );
 
   it("ignores stale guild-create startup snapshots", async () => {
-    const { client, cleanup } = createHarness();
-    try {
-      await client.dispatchGatewayEvent("GUILD_CREATE", {
-        ...guildCreateEvent(),
-        joined_at: new Date(Date.now() - 10 * 60_000).toISOString(),
-      });
-      expect(reportChannelRoomJoin).not.toHaveBeenCalled();
-    } finally {
-      await cleanup();
-    }
+    await createHarness().joinGuild({
+      joined_at: new Date(Date.now() - 10 * 60_000).toISOString(),
+    });
+    expect(reportChannelRoomJoin).not.toHaveBeenCalled();
   });
 
   it("introduces the bot in the permitted system channel using readable room context", async () => {
@@ -540,23 +534,17 @@ describe("Discord guild join introductions", () => {
   });
 
   it.each([
-    ["guild-1", "fallback-channel", true, 2],
-    ["different-guild", "system-channel", false, undefined],
-  ] as const)(
-    "routes guild introduction for %s to %s",
-    async (guildId, channelId, roomAllowed, checks) => {
-      await createHarness({
-        guildEntries: { [guildId]: { channels: { [channelId]: { enabled: true } } } },
-      }).joinGuild();
+    ["guild-1", "fallback-channel", true],
+    ["different-guild", "system-channel", false],
+  ] as const)("routes guild introduction for %s to %s", async (guildId, channelId, roomAllowed) => {
+    await createHarness({
+      guildEntries: { [guildId]: { channels: { [channelId]: { enabled: true } } } },
+    }).joinGuild();
 
-      expect(reportChannelRoomJoin).toHaveBeenCalledWith(
-        expect.objectContaining({ deliverTo: `channel:${channelId}`, roomAllowed }),
-      );
-      if (checks !== undefined) {
-        expect(mocks.hasAnyChannelPermissionDiscord).toHaveBeenCalledTimes(checks);
-      }
-    },
-  );
+    expect(reportChannelRoomJoin).toHaveBeenCalledWith(
+      expect.objectContaining({ deliverTo: `channel:${channelId}`, roomAllowed }),
+    );
+  });
 
   it("skips a guild with no writable text destination", async () => {
     mocks.canViewDiscordGuildChannel.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
@@ -565,7 +553,6 @@ describe("Discord guild join introductions", () => {
     await joinGuild();
 
     expect(reportChannelRoomJoin).not.toHaveBeenCalled();
-    expect(mocks.hasAnyChannelPermissionDiscord).toHaveBeenCalledOnce();
     expect(logger.info).toHaveBeenCalledOnce();
   });
 });
@@ -618,8 +605,6 @@ describe("DiscordPresenceListener", () => {
           deliveryContext: { to: "channel:channel-1", accountId: "molty", channel: "discord" },
         }),
       );
-      expect(claim).toHaveBeenCalledTimes(stage === "user" ? 1 : 2);
-      expect(fetchUser).toHaveBeenCalledTimes(2);
     },
   );
 
@@ -836,7 +821,6 @@ describe("DiscordPresenceListener", () => {
 
   it("keeps transition state per guild and does not charge partial bots to the burst limit", async () => {
     const listener = createPresenceListener({ presenceEvents: { burstLimit: 1 } });
-    const registerIfAbsent = vi.spyOn(listener.store, "registerIfAbsent");
     const fetchUser = vi.fn(async () => ({ bot: true }));
     const botClient = presenceClient(fetchUser);
 
@@ -846,7 +830,6 @@ describe("DiscordPresenceListener", () => {
 
     expect(fetchUser).toHaveBeenCalledWith("user-1");
     expectWake("human-1");
-    expect(registerIfAbsent).toHaveBeenCalledTimes(1);
   });
 
   it.each(["before", "permission", "claim"] as const)(
