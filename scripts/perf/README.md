@@ -4631,3 +4631,27 @@ alternating samples per side, counterbalance launch order and CPU placement, and
 keep CPU timing separate from heap inspection and allocation sampling. Compare
 absolute CPU per retain and table bytes; report the owner source hashes, total
 estimated residency, entry counts, and sample counts. Estimates must match exactly.
+
+## Actor transcript context cloning
+
+`transcript-context-clone-measure.ts` measures the real actor context seed/read
+functions with 64 synthetic 16 KiB messages. Each operation seeds one replica and
+reads it once. It checks byte-equivalent output and isolation from nested payload,
+array, and navigation-map mutations before capture.
+
+```sh
+node --import ./scripts/tsx.mjs scripts/perf/transcript-context-clone-measure.ts \
+  --owner-file /path/to/session-actor-transcript-replica.ts --mode exact \
+  --operations 10000 --interval-ms 1 --start-file /path/to/pair-start \
+  --output /path/to/result.json
+```
+
+Use the same replacement hook on both sides, prepared fixtures, a synchronized
+warm start, and swapped interleaved CPU sets under the shared measurement lock and
+guard. `--mode window` and `--mode complete` cover the other residency shapes.
+`--allocations` enables a separate collected-object sampling pass; its timing is
+ineligible for natural-GC gates. Report bytes per seed/read pair, per-kind GC,
+latency and loop sample counts, and both pause maxima. Apply the campaign's A/A
+calibration and paired-delta rules. This owner workload does not measure Gateway
+turn latency or establish a deployed allocation reduction; use the real
+`memory-soak` turn workload for that evidence.
