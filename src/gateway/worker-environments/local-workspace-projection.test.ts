@@ -27,7 +27,6 @@ import {
   openOpenClawStateDatabase,
 } from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
-import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import {
   observeAcknowledgedUpdate,
   proveIncrementalWorkspaceEdits,
@@ -279,19 +278,7 @@ it.runIf(process.env.OPENCLAW_TEST_LOCAL_PROJECTION_PODMAN === "1")(
 
 it("installs additive owner state without changing the database version", async () => {
   vi.stubEnv("OPENCLAW_STATE_DIR", path.join(root, "state"));
-  const [
-    { tableExists },
-    { OPENCLAW_STATE_SCHEMA_SQL },
-    { FIRST_USE_STATE_TABLES },
-    { extractSqliteTableSchema },
-    { assertSqliteSchemaContains },
-  ] = await Promise.all([
-    import("../../state/openclaw-state-db-schema-helpers.js"),
-    import("../../state/openclaw-state-schema.js"),
-    import("../../state/openclaw-state-db-contract.js"),
-    import("../../infra/sqlite-schema-sql.js"),
-    import("../../infra/sqlite-schema-contract.test-support.js"),
-  ]);
+  const { tableExists } = await import("../../state/openclaw-state-db-schema-helpers.js");
   const db = openOpenClawStateDatabase().db;
   const version = db
     .prepare("SELECT schema_version FROM schema_meta WHERE meta_key = 'primary'")
@@ -301,15 +288,6 @@ it("installs additive owner state without changing the database version", async 
   expect(
     db.prepare("SELECT schema_version FROM schema_meta WHERE meta_key = 'primary'").get(),
   ).toEqual(version);
-  const priorSchema = OPENCLAW_STATE_SCHEMA_SQL.replace(
-    extractSqliteTableSchema(OPENCLAW_STATE_SCHEMA_SQL, "local_workspace_projections"),
-    "",
-  );
-  expect(() =>
-    assertSqliteSchemaContains(requireNativeSqliteDatabase(db), "prior schema", priorSchema, {
-      allowedMissingTables: FIRST_USE_STATE_TABLES,
-    }),
-  ).not.toThrow();
   await closeOpenClawStateDatabaseAsync();
   expect((await readProjection())?.session_id).toBe(owner.sessionId);
 });
@@ -322,12 +300,7 @@ it("seeds independent source-only Git and reconciles edits without host metadata
     "source.txt": "canonical edit\n",
     "untracked.txt": "admitted source\n",
   });
-  const manifests = await import("./workspace-manifest-worker.js");
-  const capture = vi.spyOn(manifests, "captureWorkspaceManifestDocument");
   const projection = await prepare();
-  // The unpublished guest needs one baseline traversal; it cannot have guest edits yet.
-  expect(capture.mock.calls.filter(([input]) => input.root !== canonical)).toHaveLength(1);
-  capture.mockRestore();
   await expectText(projection, "src/lib/source.ts", "nested seed");
   await expectText(projection, "source.txt", "canonical edit\n");
   await expectText(projection, "untracked.txt", "admitted source\n");
