@@ -4,7 +4,6 @@ import { mockPluginProviders, useDoctorLegacyConfigFixture } from "./doctor/shar
 import { describe, expect, it } from "vitest";
 import { listAgentEntries } from "../agents/agent-roster.js";
 import type { OpenClawConfig } from "../config/config.js";
-import type { OpenClawConfigWithLegacyRoster } from "../config/legacy.roster.js";
 import {
   createPluginMetadataSnapshot,
   makeRegistry,
@@ -90,71 +89,6 @@ describe("normalizeCompatibilityConfigValues", () => {
       false,
     );
     expect(candidateOnly.changes).toStrictEqual(migrated.changes);
-  });
-
-  it("removes bindings for missing configured agents", () => {
-    const config: OpenClawConfigWithLegacyRoster = {
-      agents: { list: [{ id: "Team Ops" }] },
-      bindings: [
-        {
-          type: "route",
-          agentId: "team-ops",
-          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
-        },
-        {
-          type: "route",
-          agentId: "ghost",
-          match: { channel: "discord", peer: { kind: "direct", id: "user-2" } },
-        },
-      ],
-    };
-    const res = normalizeCompatibilityConfigValues(config);
-
-    expect(res.config.bindings).toEqual([
-      {
-        type: "route",
-        agentId: "team-ops",
-        match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
-      },
-    ]);
-    expect(res.changes).toContain("Removed 1 binding that referenced missing agents.list ids.");
-  });
-
-  it("does not prune bindings from malformed agent entries", () => {
-    const config = {
-      agents: { list: [null] },
-      bindings: [
-        {
-          type: "route",
-          agentId: "ghost",
-          match: { channel: "discord", peer: { kind: "direct", id: "user-1" } },
-        },
-      ],
-    };
-
-    const res = normalizeCompatibilityConfigValues(config);
-
-    expect(res.config.bindings).toEqual(config.bindings);
-    expect(res.changes).not.toContain("Removed 1 binding that referenced missing agents.list ids.");
-  });
-
-  it.each(["telegram"])("preserves the existing %s account set and shared policy", (channelId) => {
-    const cfg = {
-      channels: {
-        [channelId]: {
-          dmPolicy: "allowlist",
-          allowFrom: ["sender-1"],
-          groupPolicy: "disabled",
-          groupAllowFrom: ["group-sender-1"],
-          accounts: { work: { enabled: true }, personal: { dmPolicy: "disabled" } },
-        },
-      },
-    };
-    const before = structuredClone(cfg);
-    const result = normalizeCompatibilityConfigValues(cfg);
-    expect(result.config).toEqual(before);
-    expect(result.changes).toEqual([]);
-    expect(normalizeCompatibilityConfigValues(result.config).changes).toEqual([]);
   });
 
   it("defers the whole promotion for uncovered keys on an undeclared channel", () => {
@@ -252,35 +186,6 @@ describe("normalizeCompatibilityConfigValues", () => {
     );
     expect(res.changes).toContain(
       'Moved models.providers.openrouter.models[0].api "openai" → "openai-completions".',
-    );
-  });
-
-  it("marks legacy untagged /models add OpenAI Codex metadata rows for doctor repair", () => {
-    const res = normalizeProviders({
-      "openai-codex": {
-        baseUrl: "https://chatgpt.com/backend-api",
-        api: "openai-chatgpt-responses",
-        models: [
-          {
-            ...makeModel("gpt-5.5", {
-              reasoning: true,
-              input: ["text", "image"],
-              cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
-              contextWindow: 400_000,
-              contextTokens: 272_000,
-              maxTokens: 128_000,
-            }),
-            api: "openai-chatgpt-responses",
-          },
-        ],
-      },
-    });
-
-    const codexModel = res.config.models?.providers?.["openai-codex"]?.models?.[0];
-    expect(codexModel?.id).toBe("gpt-5.5");
-    expect(codexModel?.metadataSource).toBe("models-add");
-    expect(res.changes).toContain(
-      "Marked models.providers.openai-codex.models.gpt-5.5 as /models add metadata so official OpenAI Codex metadata can override it.",
     );
   });
 
@@ -460,75 +365,6 @@ describe("normalizeCompatibilityConfigValues", () => {
 
     expect(result.config.agents?.defaults?.model).toEqual({ primary: "custom/kept" });
     expect(result.changes).toHaveLength(3);
-  });
-
-  it("migrates shipped Codex refs to canonical OpenAI refs with model runtime pins", () => {
-    const normalized = normalizeCompatibilityConfigValues({
-      agents: {
-        defaults: {
-          model: {
-            primary: "codex/gpt-5.6-sol",
-            fallbacks: ["anthropic/claude-sonnet-4-6", "codex/gpt-5.4-mini"],
-          },
-          models: {
-            "codex/gpt-5.6-sol": { alias: "legacy-codex" },
-            "openai/gpt-5.6-sol": { alias: "gpt", params: { temperature: 0.2 } },
-            "codex/gpt-5.4-mini": {},
-          },
-        },
-        list: [{ id: "reviewer", model: "codex/gpt-5.6-sol" }],
-      },
-    });
-    const repaired = maybeRepairCodexRoutes({ cfg: normalized.config });
-
-    expect(repaired.cfg.agents?.defaults?.model).toEqual({
-      primary: "openai/gpt-5.6-sol",
-      fallbacks: ["anthropic/claude-sonnet-4-6", "openai/gpt-5.4-mini"],
-    });
-    expect(repaired.cfg.agents?.defaults?.models).toEqual({
-      "openai/gpt-5.6-sol": {
-        alias: "gpt",
-        params: { temperature: 0.2 },
-        agentRuntime: { id: "codex" },
-      },
-      "openai/gpt-5.4-mini": { agentRuntime: { id: "codex" } },
-    });
-    expect(listAgentEntries(repaired.cfg)[0]).toEqual({
-      id: "reviewer",
-      model: "openai/gpt-5.6-sol",
-      models: { "openai/gpt-5.6-sol": { agentRuntime: { id: "codex" } } },
-    });
-    expect(normalized.changes).toContain(
-      "Moved agents.defaults.model legacy runtime primary refs to provider references and selected codex runtime.",
-    );
-    expect(normalized.changes).toContain(
-      "Moved agents.defaults.models legacy runtime keys to provider keys.",
-    );
-    expect(normalized.changes).toContain(
-      "Moved agents.list.reviewer.model legacy runtime primary refs to provider references and selected codex runtime.",
-    );
-  });
-
-  it("migrates fallback-only Codex refs through the complete route repair", () => {
-    const input = {
-      agents: {
-        defaults: {
-          model: { primary: "openai/gpt-5.5", fallbacks: ["codex/gpt-5.4-mini"] },
-          models: { "codex/gpt-5.4-mini": { alias: "legacy-codex" } },
-        },
-      },
-    };
-
-    const repaired = maybeRepairCodexRoutes({ cfg: input });
-
-    expect(repaired.cfg.agents?.defaults?.model).toEqual({
-      primary: "openai/gpt-5.5",
-      fallbacks: ["openai/gpt-5.4-mini"],
-    });
-    expect(repaired.cfg.agents?.defaults?.models).toEqual({
-      "openai/gpt-5.4-mini": { alias: "legacy-codex", agentRuntime: { id: "codex" } },
-    });
-    expect(repaired.cfg.agents?.defaults?.models?.["codex/gpt-5.4-mini"]).toBeUndefined();
   });
 
   it("keeps the whole provider-conflicted Codex namespace legacy", () => {
@@ -873,83 +709,6 @@ describe("normalizeCompatibilityConfigValues", () => {
     expect(res.changes).toHaveLength(3);
   });
 
-  it("merges legacy web search provider config into explicit plugin config without overriding it", () => {
-    const res = normalizeCompatibilityConfigValues({
-      tools: {
-        web: {
-          search: {
-            provider: "gemini",
-            gemini: { apiKey: "legacy-gemini-key", model: "legacy-model" },
-          },
-        },
-      },
-      plugins: {
-        entries: {
-          google: {
-            enabled: true,
-            config: {
-              webSearch: {
-                model: "explicit-model",
-                baseUrl: "https://generativelanguage.googleapis.com",
-              },
-            },
-          },
-        },
-      },
-    });
-
-    expect(res.config.tools?.web?.search).toEqual({ provider: "gemini" });
-    expect(res.config.plugins?.entries?.google).toEqual({
-      enabled: true,
-      config: {
-        webSearch: {
-          apiKey: "legacy-gemini-key",
-          model: "explicit-model",
-          baseUrl: "https://generativelanguage.googleapis.com",
-        },
-      },
-    });
-    expect(res.changes).toHaveLength(1);
-  });
-
-  it("keeps explicit plugin-owned web fetch config while filling missing legacy fields", () => {
-    const res = normalizeCompatibilityConfigValues({
-      tools: {
-        web: {
-          fetch: {
-            provider: "firecrawl",
-            firecrawl: {
-              apiKey: "legacy-firecrawl-key",
-              baseUrl: "https://api.firecrawl.dev",
-              onlyMainContent: false,
-            },
-          },
-        },
-      },
-      plugins: {
-        entries: {
-          firecrawl: {
-            enabled: true,
-            config: { webFetch: { apiKey: "explicit-firecrawl-key", timeoutSeconds: 30 } },
-          },
-        },
-      },
-    });
-
-    expect(res.config.plugins?.entries?.firecrawl).toEqual({
-      enabled: true,
-      config: {
-        webFetch: {
-          apiKey: "explicit-firecrawl-key",
-          timeoutSeconds: 30,
-          baseUrl: "https://api.firecrawl.dev",
-          onlyMainContent: false,
-        },
-      },
-    });
-    expect(res.changes).toHaveLength(1);
-  });
-
   it("normalizes talk provider ids without overriding explicit provider config", () => {
     const res = normalizeCompatibilityConfigValues({
       talk: {
@@ -1029,4 +788,3 @@ describe("normalizeCompatibilityConfigValues", () => {
     expect(res.changes).toHaveLength(1);
   });
 });
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

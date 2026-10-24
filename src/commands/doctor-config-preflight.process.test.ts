@@ -337,36 +337,68 @@ describe("doctor invalid config process exit", () => {
     getCliProcessTestTimeout(LEGACY_APPROVAL_CHILD_TIMEOUT_MS),
   );
 
-  it.each([
-    { engine: "sqlite", fix: false, source: "root" },
-    { engine: "sqlite", fix: true, source: "root" },
-    { engine: "postgres", fix: false, source: "root" },
-    { engine: "postgres", fix: true, source: "root" },
-    { engine: "sqlite", fix: true, source: "include" },
-    { engine: "postgres", fix: true, source: "include" },
+  const invalidCommands = {
+    report: doctorArgs(),
+    fix: doctorArgs("fix"),
+    lint: ["doctor", "--lint", "--json"],
+    json: ["doctor", "--json"],
+    onboard: ["onboard", "--json"],
+    setup: ["setup", "--json"],
+    readonly: ["onboard"],
+    nix: ["setup", "--wizard"],
+  };
+  it.each<{
+    mode: keyof typeof invalidCommands;
+    engine: "sqlite" | "postgres";
+    include?: boolean;
+  }>([
+    { mode: "report", engine: "sqlite" },
+    { mode: "fix", engine: "sqlite" },
+    { mode: "report", engine: "postgres" },
+    { mode: "fix", engine: "postgres" },
+    { mode: "fix", engine: "sqlite", include: true },
+    { mode: "fix", engine: "postgres", include: true },
+    { mode: "lint", engine: "sqlite" },
+    { mode: "lint", engine: "postgres" },
+    { mode: "json", engine: "sqlite" },
+    { mode: "json", engine: "postgres" },
+    { mode: "onboard", engine: "sqlite" },
+    { mode: "setup", engine: "sqlite" },
+    { mode: "onboard", engine: "postgres" },
+    { mode: "setup", engine: "postgres" },
+    { mode: "readonly", engine: "postgres" },
+    { mode: "nix", engine: "postgres" },
   ])(
-    "reports unknown storage without creating databases for unparseable $engine $source config (fix: $fix)",
-    async ({ engine, fix, source }) => {
-      const { stateDir, configPath, env, run } = createDoctorFixture(
-        `doctor-invalid-${engine}-${source}-${fix ? "fix" : "report"}`,
-        true,
-      );
-      Object.assign(env, { OPENCLAW_NO_RESPAWN: "1", OPENCLAW_SKIP_CHANNELS: "1" });
-      for (const key of [
-        "NODE_OPTIONS",
-        "OPENCLAW_GATEWAY_PASSWORD",
-        "OPENCLAW_GATEWAY_TOKEN",
-        "OPENCLAW_GATEWAY_URL",
-        "OPENCLAW_TEST_MISSING_DOCTOR_DSN",
-        "VITEST_POOL_ID",
-        "VITEST_WORKER_ID",
-      ]) {
-        delete env[key];
+    "preserves invalid config and unopened storage: $mode/$engine (include=$include)",
+    async ({ mode, engine, include }) => {
+      const { stateDir, configPath, env, run } = createDoctorFixture("invalid-config", true);
+      const human = mode === "report" || mode === "fix";
+      const flag =
+        mode === "readonly"
+          ? "OPENCLAW_CONFIG_READONLY"
+          : mode === "nix"
+            ? "OPENCLAW_NIX_MODE"
+            : undefined;
+      if (human) {
+        Object.assign(env, { OPENCLAW_NO_RESPAWN: "1", OPENCLAW_SKIP_CHANNELS: "1" });
+        for (const key of [
+          "NODE_OPTIONS",
+          "OPENCLAW_GATEWAY_PASSWORD",
+          "OPENCLAW_GATEWAY_TOKEN",
+          "OPENCLAW_GATEWAY_URL",
+          "OPENCLAW_TEST_MISSING_DOCTOR_DSN",
+          "VITEST_POOL_ID",
+          "VITEST_WORKER_ID",
+        ]) {
+          delete env[key];
+        }
       }
-
+      if (flag) {
+        env[flag] = "1";
+      }
       const database = {
         engine,
-        ...(engine === "postgres"
+        ...(human && engine === "postgres"
           ? {
               postgres: {
                 connection: {
@@ -378,107 +410,57 @@ describe("doctor invalid config process exit", () => {
             }
           : {}),
       };
-      const raw =
-        source === "include"
+      const raw = flag
+        ? 'synthetic warning\n{"database":{"engine":"postgres"}}\n'
+        : include
           ? JSON.stringify({ database, $include: "broken.json" })
-          : `{"database":${JSON.stringify(database)},"agents":{broken json`;
+          : human
+            ? `{"database":${JSON.stringify(database)},"agents":{broken json`
+            : `{"database":{"engine":"${engine}"}, broken`;
       writeText(configPath, raw);
-      if (source === "include") {
-        fs.writeFileSync(path.join(path.dirname(configPath), "broken.json"), "{broken json");
+      if (include) {
+        writeText(path.join(path.dirname(configPath), "broken.json"), "{broken json");
       }
-
-      const result = await run(doctorArgs(fix ? "fix" : undefined), DOCTOR_CHILD_TIMEOUT_MS);
+      const result = await run(invalidCommands[mode], DOCTOR_CHILD_TIMEOUT_MS);
       const output = `${result.stderr}\n${result.stdout}`;
-
-      expect(result, output).toMatchObject({ code: 0, signal: null });
-      for (const message of [
-        "Config invalid; doctor will run with best-effort config.",
-        "unknown: config could not be parsed; fix config",
-        "Run `openclaw config validate` to inspect the parse error.",
-        "Doctor complete.",
-      ]) {
-        expect(output).toContain(message);
-      }
-      expect(output).not.toContain("Building Control UI assets");
-      const createdFiles = expectConfigUntouched(configPath, stateDir, raw);
-      expect(createdFiles.filter((file) => file.includes(".clobbered."))).toEqual([]);
-    },
-    getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
-  );
-
-  it.each([
-    { engine: "sqlite", lint: true },
-    { engine: "postgres", lint: true },
-    { engine: "sqlite", lint: false },
-    { engine: "postgres", lint: false },
-  ])(
-    "preserves the JSON failure envelope without opening storage for malformed $engine config (lint: $lint)",
-    async ({ engine, lint }) => {
-      const { stateDir, configPath, run } = createDoctorFixture(
-        `doctor-invalid-lint-${engine}`,
-        true,
-      );
-      const raw = `{"database":{"engine":"${engine}"}, broken`;
-      writeText(configPath, raw);
-
-      const result = await run(
-        ["doctor", ...(lint ? ["--lint"] : []), "--json"],
-        DOCTOR_CHILD_TIMEOUT_MS,
-      );
-      expect(result, result.stderr).toMatchObject({ code: lint ? 2 : 0, signal: null });
-      const report = JSON.parse(result.stdout);
-      expect(report).toMatchObject({ schemaVersion: 1, ok: false, checksRun: 0 });
-      expect(report.findings).toContainEqual(
-        expect.objectContaining({
-          severity: "error",
-          message: expect.stringContaining("unknown: config could not be parsed"),
-        }),
-      );
-      expectConfigUntouched(configPath, stateDir, raw);
-    },
-    getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
-  );
-
-  it.each(
-    ["sqlite", "postgres"].flatMap((engine) =>
-      ["onboard", "setup"].map((entry) => ({ engine, entry })),
-    ),
-  )(
-    "preserves setup JSON failure output for malformed $engine config through $entry",
-    async ({ engine, entry }) => {
-      const { stateDir, configPath, run } = createDoctorFixture("setup-invalid-json", true);
-      const raw = `{"database":{"engine":"${engine}"}, broken`;
-      writeText(configPath, raw);
-
-      const result = await run([entry, "--json"], DOCTOR_CHILD_TIMEOUT_MS);
-      expect(result, result.stderr).toMatchObject({ code: 1, signal: null });
-      expect(JSON.parse(result.stdout)).toMatchObject({
-        ok: false,
-        error: { type: "cli_error", message: expect.stringContaining("Invalid config at") },
+      expect(result, output).toMatchObject({
+        code: human || mode === "json" ? 0 : mode === "lint" ? 2 : 1,
+        signal: null,
       });
-      expect(result.stderr).not.toContain('Run "openclaw doctor --fix" now?');
-      expectConfigUntouched(configPath, stateDir, raw);
-    },
-    getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
-  );
-
-  it.each([
-    { args: ["onboard"], flag: "OPENCLAW_CONFIG_READONLY" },
-    { args: ["setup", "--wizard"], flag: "OPENCLAW_NIX_MODE" },
-  ])(
-    "preserves immutable setup guidance for $flag without opening storage",
-    async ({ args, flag }) => {
-      const { stateDir, configPath, env, run } = createDoctorFixture("setup-immutable", true);
-      const raw = 'synthetic warning\n{"database":{"engine":"postgres"}}\n';
-      writeText(configPath, raw);
-
-      const result = await run(args, DOCTOR_CHILD_TIMEOUT_MS, { ...env, [flag]: "1" });
-      const output = `${result.stderr}\n${result.stdout}`;
-      expect(result, output).toMatchObject({ code: 1, signal: null });
-      expect(output).toContain(`${flag}=1`);
-      expect(output).toContain("immutable");
-      expect(output).not.toContain('Run "openclaw doctor --fix"');
-      expectConfigUntouched(configPath, stateDir, raw);
+      if (human) {
+        for (const message of [
+          "Config invalid; doctor will run with best-effort config.",
+          "unknown: config could not be parsed; fix config",
+          "Run `openclaw config validate` to inspect the parse error.",
+          "Doctor complete.",
+        ]) {
+          expect(output).toContain(message);
+        }
+        expect(output).not.toContain("Building Control UI assets");
+      } else if (flag) {
+        expect(output).toContain(`${flag}=1`);
+        expect(output).toContain("immutable");
+        expect(output).not.toContain('Run "openclaw doctor --fix"');
+      } else if (mode === "json" || mode === "lint") {
+        const report = JSON.parse(result.stdout);
+        expect(report).toMatchObject({ schemaVersion: 1, ok: false, checksRun: 0 });
+        expect(report.findings).toContainEqual(
+          expect.objectContaining({
+            severity: "error",
+            message: expect.stringContaining("unknown: config could not be parsed"),
+          }),
+        );
+      } else {
+        expect(JSON.parse(result.stdout)).toMatchObject({
+          ok: false,
+          error: { type: "cli_error", message: expect.stringContaining("Invalid config at") },
+        });
+        expect(result.stderr).not.toContain('Run "openclaw doctor --fix" now?');
+      }
+      const files = expectConfigUntouched(configPath, stateDir, raw);
+      if (human) {
+        expect(files.filter((file) => file.includes(".clobbered."))).toEqual([]);
+      }
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
   );
@@ -559,18 +541,11 @@ describe("doctor invalid config process exit", () => {
 describe("Doctor repair followed by gateway readiness", () => {
   it(
     "serves canonical state after Doctor repairs cron and preserves retired plugin sidecars",
-    async ({ signal, onTestFailed }) => {
-      const phases: Array<{ name: string; elapsedMs: number }> = [];
-      const startedAt = performance.now();
-      const mark = (name: string) =>
-        phases.push({ name, elapsedMs: performance.now() - startedAt });
-      mark("runtime fixture");
-      onTestFailed(() => console.error("[doctor-cron-readiness]", JSON.stringify(phases)));
+    async ({ signal }) => {
       const nodeExecutable = resolveTestNodeExecPath();
       const runtimeRoot = createBuiltRuntime(
         tempDirs.createTempDir("openclaw-cron-upgrade-runtime-"),
       );
-      mark("instance fixture");
       const instance = await createOpenClawTestInstance({
         name: "cron-upgrade-ready",
         signal,
@@ -602,7 +577,6 @@ describe("Doctor repair followed by gateway readiness", () => {
       const databasePath = path.join(stateDir, "state", "openclaw.sqlite");
 
       try {
-        mark("seed state");
         await instance.state.writeConfig({
           agents: { entries: { main: {} } },
           gateway: { mode: "local", port, auth: { mode: "none" } },
@@ -660,13 +634,10 @@ describe("Doctor repair followed by gateway readiness", () => {
         } finally {
           database.close();
         }
-
-        mark("doctor CLI");
         const doctor = await instance.cli(doctorArgs("fix"), {
           execPath: nodeExecutable,
           timeoutMs: READINESS_CHILD_TIMEOUT_MS,
         });
-        mark("verify Doctor repair");
         const doctorOutput = `${doctor.stdout}\n${doctor.stderr}`;
         expect(doctor.code, doctorOutput).toBe(0);
         expect(doctorOutput).not.toContain("Building Control UI assets");
@@ -693,15 +664,12 @@ describe("Doctor repair followed by gateway readiness", () => {
         );
 
         try {
-          mark("Gateway start");
           await instance.startGateway();
-          mark("readyz");
           const response = await fetch(`http://127.0.0.1:${port}/readyz`, { signal });
           await expect(response.json()).resolves.toMatchObject({ ready: true, failing: [] });
           const logs = instance.logs();
           expect(logs).not.toContain("Left plugin-state sidecar in place");
           expect(logs).not.toContain(STARTUP_REFUSAL);
-          mark("status CLI");
           const status = await instance.cli(["gateway", "call", "status", "--json"], {
             execPath: nodeExecutable,
             timeoutMs: READINESS_CHILD_TIMEOUT_MS,
@@ -710,12 +678,9 @@ describe("Doctor repair followed by gateway readiness", () => {
           expect(JSON.parse(status.stdout).startupMigrationWarning).toBeUndefined();
           expect(fs.readFileSync(sidecarPath)).toEqual(preservedSidecar);
         } finally {
-          mark("Gateway stop");
           await instance.stopGateway();
         }
         expect(readPluginState()).toEqual({ value_json: '{"ok":false}', created_at: 2_000 });
-
-        mark("read canonical cron");
         const loaded = await loadCronJobsStoreWithConfigJobsReadOnly(storePath, env);
         expect(loaded.store.jobs.map((entry) => entry.id)).toContain("valid-job");
         // SQLite config decoding quarantines the trigger before Doctor validates runtime state.
@@ -731,9 +696,7 @@ describe("Doctor repair followed by gateway readiness", () => {
         ]);
         expect(fs.existsSync(storePath)).toBe(false);
       } finally {
-        mark("cleanup");
         await instance.cleanup();
-        mark("cleanup settled");
       }
     },
     READINESS_TEST_TIMEOUT_MS,
