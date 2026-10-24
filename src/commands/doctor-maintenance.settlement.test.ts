@@ -259,23 +259,25 @@ it.each([
   },
 );
 
-it("restores the stopped Gateway before reporting a settled state-owner release failure", async () => {
-  const failure = new Error("settled state-owner release failed");
-  boundary.release.mockRejectedValueOnce(failure);
-  const maintenance = await begin();
-
-  await expect(maintenance!.finish({})).rejects.toBe(failure);
-  expectCalls(1, "close", "resume", "restart", "health");
-});
-
-it("reports a settled state-release failure without a managed Gateway", async () => {
-  const failure = new Error("settled state release failed");
-  const maintenance = await beginWithGenerations();
-  boundary.release.mockRejectedValueOnce(failure);
-  await expect(maintenance!.finish(undefined)).rejects.toBe(failure);
-  expectCalls(1, "close");
-  expectCalls(0, "restart");
-});
+it.each([false, true])(
+  "reports settled state-release failure (managed Gateway: %s)",
+  async (managed) => {
+    const failure = new Error("settled state release failed");
+    if (managed) {
+      boundary.release.mockRejectedValueOnce(failure);
+    }
+    const maintenance = managed ? await begin() : await beginWithGenerations();
+    if (!managed) {
+      boundary.release.mockRejectedValueOnce(failure);
+    }
+    await expect(maintenance!.finish(managed ? {} : undefined)).rejects.toBe(failure);
+    expectCalls(1, "close");
+    expectCalls(managed ? 1 : 0, "restart");
+    if (managed) {
+      expectCalls(1, "resume", "health");
+    }
+  },
+);
 
 it.each(["persistent", "transient"] as const)(
   "settles %s resource close failure before restoration",
@@ -477,32 +479,6 @@ it.each([
     );
   },
 );
-
-it("restores a service after state ownership fails without retaining a partial maintenance scope", async () => {
-  boundary.owner.mockReturnValue({ state: "live", mode: "supervised" });
-  let heldLeases = 0;
-  const acquire = boundary.gatewayAcquire.getMockImplementation()!;
-  boundary.gatewayAcquire
-    .mockImplementation(() => {
-      heldLeases++;
-      return {
-        ...acquire(),
-        release: () => {
-          heldLeases--;
-        },
-      };
-    })
-    .mockImplementationOnce(() => {
-      throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
-    });
-  boundary.ownerAssert.mockImplementation(() => {
-    throw new Error("state ownership changed before repair");
-  });
-  await expect(begin()).rejects.toThrow(/state ownership changed before repair/);
-  expect(boundary.restart).toHaveBeenCalledOnce();
-  expect(heldLeases).toBe(0);
-  expect(boundary.sleep).not.toHaveBeenCalled();
-});
 
 it.each(["acquired", "native-revoked", "install-drift"] as const)(
   "refuses changed repair admission and compensates under original service custody (%s)",

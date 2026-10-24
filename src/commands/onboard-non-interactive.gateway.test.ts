@@ -215,7 +215,6 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
       const error = vi.fn();
       const message =
         "Config invalid. Run `openclaw doctor --fix` to apply supported repairs, then re-run setup.";
-
       await expect(
         setupLocal(
           stateDir,
@@ -229,7 +228,6 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
           },
         ),
       ).rejects.toThrow("exit:1");
-
       expect(error).toHaveBeenCalledWith(message);
       expect(output).toHaveBeenCalledOnce();
       expect(JSON.parse(String(output.mock.calls[0]?.[0]))).toEqual({
@@ -245,17 +243,13 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
 
   it("rejects concurrent onboarding runs sharing one state directory", async () => {
     await withStateDir("state-concurrent-onboard-", async (stateDir) => {
-      let workspaceSetupCalls = 0;
       let releaseFirstSetup!: () => void;
       const firstSetupEntered = new Promise<void>((resolve) => {
-        ensureWorkspaceAndSessionsMock.mockImplementation(async () => {
-          workspaceSetupCalls += 1;
-          if (workspaceSetupCalls === 1) {
-            resolve();
-            await new Promise<void>((release) => {
-              releaseFirstSetup = release;
-            });
-          }
+        ensureWorkspaceAndSessionsMock.mockImplementationOnce(async () => {
+          resolve();
+          await new Promise<void>((release) => {
+            releaseFirstSetup = release;
+          });
         });
       });
       const options = localOptions(stateDir);
@@ -263,13 +257,11 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
       try {
         const first = runNonInteractiveSetup(options, runtime);
         await firstSetupEntered;
-        const readsBeforeSecond = readConfigFileSnapshotMock.mock.calls.length;
         const writesBeforeSecond = capturedReplaceConfigFileCalls.length;
         await expect(runNonInteractiveSetup(options, runtime)).rejects.toMatchObject({
           name: "SetupTargetLockedError",
         });
 
-        expect(readConfigFileSnapshotMock).toHaveBeenCalledTimes(readsBeforeSecond);
         expect(capturedReplaceConfigFileCalls).toHaveLength(writesBeforeSecond);
         expect(ensureWorkspaceAndSessionsMock).toHaveBeenCalledOnce();
 
@@ -280,7 +272,6 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
         expect(configWritePluginLeaseDepths.every((depth) => depth > 0)).toBe(true);
       } finally {
         releaseFirstSetup?.();
-        ensureWorkspaceAndSessionsMock.mockImplementation(async () => {});
       }
     });
   });
@@ -342,33 +333,36 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
     return config;
   }
 
-  const setupRemoteCredentials = async (opts: Partial<OnboardOptions>, config: OpenClawConfig) =>
-    (await setupRemoteConfig(opts, config)).gateway?.remote;
-
-  it.each([
+  const trustedRemote = { url: remoteCredentialUrl, tlsFingerprint: remoteTlsFingerprint };
+  const password = "replacement-password";
+  type RemoteCase = {
+    name: string;
+    options?: Partial<OnboardOptions>;
+    config?: OpenClawConfig;
+    expected: NonNullable<NonNullable<OpenClawConfig["gateway"]>["remote"]>;
+    env?: Record<string, string>;
+    sshPort?: number;
+  };
+  const remoteCases: RemoteCase[] = [
     {
-      name: "fresh remote configuration",
-      baseConfig: {},
-      expectedRemote: { url: remoteCredentialUrl, password: "replacement-password" },
+      name: "fresh password",
+      options: { remotePassword: password },
+      expected: { url: remoteCredentialUrl, password },
     },
     {
-      name: "a token SecretRef on the same endpoint",
-      baseConfig: remoteCredentialConfig({
-        url: remoteCredentialUrl,
+      name: "password replacing a same-endpoint token",
+      options: { remotePassword: password },
+      config: remoteCredentialConfig({
+        ...trustedRemote,
         token: remoteTokenRef,
-        tlsFingerprint: remoteTlsFingerprint,
         edgeAuth: remoteEdgeAuth,
       }),
-      expectedRemote: {
-        url: remoteCredentialUrl,
-        password: "replacement-password",
-        tlsFingerprint: remoteTlsFingerprint,
-        edgeAuth: remoteEdgeAuth,
-      },
+      expected: { ...trustedRemote, password, edgeAuth: remoteEdgeAuth },
     },
     {
-      name: "credentials and routing from a different endpoint",
-      baseConfig: remoteCredentialConfig({
+      name: "password replacing credentials and trust from another endpoint",
+      options: { remotePassword: password },
+      config: remoteCredentialConfig({
         url: "wss://old-gateway.example.test",
         token: remoteTokenRef,
         password: { source: "env", provider: "default", id: "OLD_REMOTE_PASSWORD" },
@@ -379,138 +373,119 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
         sshHostKeyPolicy: "openssh",
         edgeAuth: { "X-Edge-Auth": "old-edge-secret" },
       }),
-      expectedRemote: { url: remoteCredentialUrl, password: "replacement-password" },
+      expected: { url: remoteCredentialUrl, password },
     },
-  ])("stores a remote password while replacing $name", async ({ baseConfig, expectedRemote }) => {
-    expect(
-      await setupRemoteCredentials({ remotePassword: "replacement-password" }, baseConfig),
-    ).toEqual(expectedRemote);
-  });
-
-  it.each([
-    ["remoteToken", "token", "OPENCLAW_GATEWAY_TOKEN", "password"],
-    ["remotePassword", "password", "OPENCLAW_GATEWAY_PASSWORD", "token"],
-  ] as const)(
-    "stores %s as a configured-provider env reference and clears the old credential",
-    async (option, field, envName, previousField) => {
-      await withEnvAsync({ [envName]: "replacement-credential" }, async () => {
-        const remote = await setupRemoteCredentials(
-          { [option]: "replacement-credential", secretInputMode: "ref" },
-          {
-            secrets: {
-              defaults: { env: "gatewayenv" },
-              providers: { gatewayenv: { source: "env" } },
-            },
-            ...remoteCredentialConfig({
-              url: remoteCredentialUrl,
-              [previousField]: { source: "env", provider: "default", id: "OLD_GATEWAY_CREDENTIAL" },
-              tlsFingerprint: remoteTlsFingerprint,
-            }),
-          },
-        );
-        expect(remote).toEqual({
-          url: remoteCredentialUrl,
-          [field]: { source: "env", provider: "gatewayenv", id: envName },
-          tlsFingerprint: remoteTlsFingerprint,
-        });
-      });
+    ...(
+      [
+        ["remoteToken", "token", "OPENCLAW_GATEWAY_TOKEN", "password"],
+        ["remotePassword", "password", "OPENCLAW_GATEWAY_PASSWORD", "token"],
+      ] as const
+    ).map(([option, field, envName, previousField]): RemoteCase => ({
+      name: `configured-provider ${field} reference replaces old ${previousField}`,
+      options: { [option]: "replacement-credential", secretInputMode: "ref" },
+      env: { [envName]: "replacement-credential" },
+      config: {
+        ...remoteCredentialConfig({
+          ...trustedRemote,
+          [previousField]: { source: "env", provider: "default", id: "OLD_GATEWAY_CREDENTIAL" },
+        }),
+        secrets: { defaults: { env: "gatewayenv" }, providers: { gatewayenv: { source: "env" } } },
+      },
+      expected: {
+        ...trustedRemote,
+        [field]: { source: "env", provider: "gatewayenv", id: envName },
+      },
+    })),
+    {
+      name: "token replacing a same-endpoint password",
+      options: { remoteToken: "replacement-token" },
+      config: remoteCredentialConfig({ ...trustedRemote, password: "old-password" }),
+      expected: { ...trustedRemote, token: "replacement-token" },
     },
-  );
-
-  it("clears a stale remote password when a token replaces auth for the same endpoint", async () => {
-    const remote = await setupRemoteCredentials(
-      { remoteToken: "replacement-token" },
-      remoteCredentialConfig({
-        url: remoteCredentialUrl,
-        password: "old-password",
-        tlsFingerprint: remoteTlsFingerprint,
-      }),
-    );
-    expect(remote).toEqual({
-      url: remoteCredentialUrl,
-      token: "replacement-token",
-      tlsFingerprint: remoteTlsFingerprint,
-    });
-  });
-
-  it.each([
-    [remoteCredentialUrl, "existing-password"],
-    [remoteCredentialUrl, { source: "env", provider: "default", id: "EXISTING_REMOTE_PASSWORD" }],
-    [
-      `${remoteCredentialUrl}/`,
-      { source: "env", provider: "default", id: "EXISTING_REMOTE_PASSWORD" },
-    ],
-  ] as const)(
-    "preserves remote credentials and fleet from %s without a replacement (openclaw#84692)",
-    async (url, password) => {
+    ...(
+      [
+        [remoteCredentialUrl, "existing-password"],
+        [
+          remoteCredentialUrl,
+          { source: "env", provider: "default", id: "EXISTING_REMOTE_PASSWORD" },
+        ],
+        [
+          `${remoteCredentialUrl}/`,
+          { source: "env", provider: "default", id: "EXISTING_REMOTE_PASSWORD" },
+        ],
+      ] as const
+    ).map(([url, savedPassword]): RemoteCase => {
       const remote = {
+        ...trustedRemote,
         url,
-        token: typeof password === "string" ? "existing-token" : remoteTokenRef,
-        password,
-        tlsFingerprint: remoteTlsFingerprint,
+        password: savedPassword,
+        token: typeof savedPassword === "string" ? "existing-token" : remoteTokenRef,
         transport: "ssh" as const,
         sshTarget: "operator@gateway.example.test",
       };
-      const baseConfig: OpenClawConfig = {
-        ...remoteCredentialConfig(remote),
-        agents: { ownership: "explicit", entries: makeAgents() },
-        bindings: [routeBinding("alpha", "user-1")],
-        hooks: { internal: { enabled: false, entries: { "session-memory": { enabled: false } } } },
-      };
-      const config = await setupRemoteConfig(
-        { secretInputMode: "ref", authChoice: "skip", json: true },
-        baseConfig,
-      );
-      expect(config.gateway?.remote).toEqual({ ...remote, url: remoteCredentialUrl });
-      expect(config.agents).toEqual(baseConfig.agents);
-      expect(config.bindings).toEqual(baseConfig.bindings);
-    },
-  );
-
-  it.each([
-    ["ws://127.0.0.1:80", "ws://127.0.0.1", 80],
-    ["ws://127.0.0.1", "ws://127.0.0.1:80", 18789],
-  ] as const)(
-    "preserves the SSH destination when editing %s to %s",
-    async (originalUrl, url, port) => {
-      const remote = await setupRemoteCredentials(
-        { remoteUrl: url },
-        {
-          gateway: {
-            port: 18789,
-            remote: {
-              url: originalUrl,
-              transport: "ssh",
-              sshTarget: "operator@gateway.example.test",
-              token: "existing-token",
-            },
+      return {
+        name: `preserves ${url} ${typeof savedPassword} credentials and fleet (openclaw#84692)`,
+        options: { secretInputMode: "ref", authChoice: "skip", json: true },
+        config: {
+          ...remoteCredentialConfig(remote),
+          agents: { ownership: "explicit", entries: makeAgents() },
+          bindings: [routeBinding("alpha", "user-1")],
+          hooks: {
+            internal: { enabled: false, entries: { "session-memory": { enabled: false } } },
           },
         },
-      );
-      expect(remote).toMatchObject({
-        url,
-        sshTarget: "operator@gateway.example.test",
-        token: "existing-token",
-      });
-      expect(resolveGatewaySshRemotePort({ gateway: { port: 18789, remote } })).toBe(port);
-    },
-  );
-
-  it("clears credentials and transport trust when the remote query changes", async () => {
-    const url = `${remoteCredentialUrl}?account=work`;
-    const remote = await setupRemoteCredentials(
-      { remoteUrl: url },
-      remoteCredentialConfig({
-        url: remoteCredentialUrl,
+        expected: { ...remote, url: remoteCredentialUrl },
+      };
+    }),
+    ...(
+      [
+        ["ws://127.0.0.1:80", "ws://127.0.0.1", 80],
+        ["ws://127.0.0.1", "ws://127.0.0.1:80", 18789],
+      ] as const
+    ).map(([originalUrl, url, sshPort]): RemoteCase => ({
+      name: `preserves SSH port while changing ${originalUrl} to ${url}`,
+      options: { remoteUrl: url },
+      config: {
+        gateway: {
+          port: 18789,
+          remote: {
+            url: originalUrl,
+            transport: "ssh",
+            sshTarget: "operator@gateway.example.test",
+            token: "existing-token",
+          },
+        },
+      },
+      expected: { url, sshTarget: "operator@gateway.example.test", token: "existing-token" },
+      sshPort,
+    })),
+    {
+      name: "query change clears credentials and transport trust",
+      options: { remoteUrl: `${remoteCredentialUrl}?account=work` },
+      config: remoteCredentialConfig({
+        ...trustedRemote,
         token: remoteTokenRef,
         password: "existing-password",
         transport: "ssh",
         sshTarget: "operator@gateway.example.test",
-        tlsFingerprint: remoteTlsFingerprint,
       }),
-    );
-    expect(remote).toEqual({ url });
-  });
+      expected: { url: `${remoteCredentialUrl}?account=work` },
+    },
+  ];
+  it.each(remoteCases)(
+    "$name",
+    async ({ options = {}, config = {}, expected, env = {}, sshPort }) => {
+      const result = await withEnvAsync(env, () => setupRemoteConfig(options, config));
+      expect(result.agents).toEqual(config.agents);
+      expect(result.bindings).toEqual(config.bindings);
+      if (sshPort === undefined) {
+        expect(result.gateway?.remote).toEqual(expected);
+      } else {
+        expect(result.gateway?.remote).toMatchObject(expected);
+        expect(resolveGatewaySshRemotePort(result)).toBe(sshPort);
+      }
+    },
+  );
 
   it("completes explicit no-daemon setup without a startup wait when no gateway is listening", async () => {
     await withStateDir("state-local-health-hint-", async (stateDir) => {

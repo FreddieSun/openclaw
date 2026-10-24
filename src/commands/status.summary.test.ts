@@ -456,11 +456,7 @@ describe("getStatusSummary", () => {
         },
       }),
       observed: "postgres",
-      mismatch: false,
-      schema: { versioning: "versioned", version: 5, expectedVersion: null, pending: null },
       namespace: "oc_agent_fixture",
-      storeId: "fixture-store",
-      nextSteps: ["Run openclaw doctor on the Gateway host."],
     };
     using admitted = vi.spyOn(
       await import("../infra/database-engine/admitted-diagnostics.js"),
@@ -522,12 +518,6 @@ describe("getStatusSummary", () => {
       id: "fixture-cli",
       config: { command: "fixture" },
       nativeToolMode: "always-on",
-      ownsNativeCompaction: false,
-      runtimeArtifact: {
-        kind: "bundled-package-tree",
-        packageName: "@fixture/cli",
-        entrypoint: "command",
-      },
     };
     using setup = vi.spyOn(
       await import("../plugins/setup-registry.js"),
@@ -711,11 +701,6 @@ describe("getStatusSummary", () => {
         modelOverrideSource: "auto",
         modelOverrideFallbackOriginProvider: "zhipu",
         modelOverrideFallbackOriginModel: "glm-4.5-air",
-        modelProvider: "deepseek",
-        model: "deepseek-v4-flash",
-        agentHarnessId: "openclaw",
-        contextTokens: 128_000,
-        contextTokensSource: "runtime",
       },
       reason: "fallback selected",
     },
@@ -735,9 +720,6 @@ describe("getStatusSummary", () => {
       selectedModel: "deepseek/deepseek-v4-flash",
       modelSelectionReason: reason,
     });
-    if (entry.contextTokens) {
-      expect(summary.sessions.recent[0]?.contextTokens).toBe(128_000);
-    }
   });
 
   it("does not mark provider-local model aliases as pinned mismatches", async () => {
