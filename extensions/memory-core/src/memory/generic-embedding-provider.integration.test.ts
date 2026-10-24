@@ -21,6 +21,7 @@ type CapturedRequest = {
   url: string | undefined;
   headers: IncomingMessage["headers"];
   body: Record<string, unknown>;
+  rawBody: string;
 };
 
 type TestServer = {
@@ -32,12 +33,13 @@ type TestServer = {
 const servers: TestServer[] = [];
 let registeredEmbeddingProvidersSnapshot: ReturnType<typeof listRegisteredEmbeddingProviders>;
 
-async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJsonBody(req: IncomingMessage) {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+  const rawBody = Buffer.concat(chunks).toString("utf8");
+  return { rawBody, body: JSON.parse(rawBody) as Record<string, unknown> };
 }
 
 async function startEmbeddingServer(options?: {
@@ -48,12 +50,13 @@ async function startEmbeddingServer(options?: {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        const body = await readJsonBody(req);
+        const { body, rawBody } = await readJsonBody(req);
         requests.push({
           method: req.method,
           url: req.url,
           headers: req.headers,
           body,
+          rawBody,
         });
         if (options?.authorization && req.headers.authorization !== options.authorization) {
           res.writeHead(401, { "content-type": "application/json" });
@@ -265,6 +268,9 @@ function createMemoryEmbeddingOwner(generation: MemorySemanticProviderGeneration
     settings: { sync: {} },
     markLocalEmbeddingProviderDegraded: () => {},
   }) as {
+    settings: { sync: object; queryInstruction?: string };
+    embedQueryWithRetry: (text: string) => Promise<number[]>;
+    embedBatchWithRetry: (texts: string[]) => Promise<number[][]>;
     embedChunksInBatches: (
       candidates: Array<MemoryIndexWorkItem & { chunk: IndexedMemoryChunk }>,
       generation: MemorySemanticProviderGeneration,
@@ -331,6 +337,63 @@ function distinctCandidates(
     source: "memory",
   }));
 }
+
+describe("memory query instructions over real transport", () => {
+  it("changes generic query bytes and vectors while preserving document requests", async () => {
+    const server = await startEmbeddingServer();
+    const database = new DatabaseSync(":memory:");
+    try {
+      const { owner } = await createMemoryEmbeddingOwnerForServer(server.baseUrl, database, {
+        model: "generic-embedding-alias",
+      });
+      const documents = await owner.embedBatchWithRetry(["remember this"]);
+      const bare = await owner.embedQueryWithRetry("find this");
+      owner.settings.queryInstruction = "search_query: ";
+      const instructed = await owner.embedQueryWithRetry("find this");
+      expect(instructed).toEqual([23, 0.5, 3]);
+      expect(bare).toEqual([9, 0.5, 3]);
+      expect(await owner.embedBatchWithRetry(["remember this"])).toEqual(documents);
+      owner.settings.queryInstruction = "";
+      expect(await owner.embedQueryWithRetry("find this")).toEqual(bare);
+      expect(server.requests[0]?.rawBody).toBe(server.requests[3]?.rawBody);
+      expect(server.requests[1]?.rawBody).toBe(server.requests[4]?.rawBody);
+      expect(server.requests.map(({ body }) => body)).toEqual([
+        {
+          model: "generic-embedding-alias",
+          input: ["remember this"],
+          dimensions: 3,
+          input_type: "document",
+        },
+        {
+          model: "generic-embedding-alias",
+          input: ["find this"],
+          dimensions: 3,
+          input_type: "query",
+        },
+        {
+          model: "generic-embedding-alias",
+          input: ["search_query: find this"],
+          dimensions: 3,
+          input_type: "query",
+        },
+        {
+          model: "generic-embedding-alias",
+          input: ["remember this"],
+          dimensions: 3,
+          input_type: "document",
+        },
+        {
+          model: "generic-embedding-alias",
+          input: ["find this"],
+          dimensions: 3,
+          input_type: "query",
+        },
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+});
 
 describe("memory-core embedding batch recovery over real transport", () => {
   it.each([
