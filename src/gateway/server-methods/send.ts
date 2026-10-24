@@ -30,10 +30,6 @@ import {
   ensureOutboundSessionEntry,
   resolveOutboundSessionRoute,
 } from "../../infra/outbound/outbound-session.js";
-import {
-  createOutboundPayloadPlan,
-  projectOutboundPayloadPlanForMirror,
-} from "../../infra/outbound/payloads.js";
 import { buildOutboundSessionContext } from "../../infra/outbound/session-context.js";
 import {
   beginTerminalSourceReplyDelivery,
@@ -402,8 +398,6 @@ export const sendHandlers: GatewayRequestHandlers = {
                     gatewayOwnedDelivery: true,
                     ...(request.action === "send"
                       ? {
-                          // This RPC owns source-reply receipts and their transcript mirror.
-                          suppressTranscriptMirror: true,
                           actionOrigin: trustedContext.runtimeAgentId
                             ? ("message-tool" as const)
                             : undefined,
@@ -623,9 +617,6 @@ export const sendHandlers: GatewayRequestHandlers = {
               ...(request.asVoice === true ? { audioAsVoice: true } : {}),
             },
           ];
-          const outboundPayloadPlan = createOutboundPayloadPlan(outboundPayloads);
-          const { text: mirrorText, mediaUrls: mirrorMediaUrls } =
-            projectOutboundPayloadPlanForMirror(outboundPayloadPlan);
           const derivedRoute = await resolveOutboundSessionRoute({
             cfg,
             channel,
@@ -646,8 +637,7 @@ export const sendHandlers: GatewayRequestHandlers = {
             normalizeOptionalLowercaseString(derivedRoute?.baseSessionKey) ===
               normalizeOptionalLowercaseString(providedSessionBaseKey) &&
             normalizeOptionalLowercaseString(derivedRoute?.sessionKey) !== providedSessionKey;
-          // sessionKey selects the transcript mirror, not the saved delivery route.
-          // Message-scoped threads may refine that mirror within the same base session.
+          // Explicit session hints retain routing policy; only an admitted runtime is a producer.
           const outboundSessionKey = shouldUseDerivedThreadSessionKey
             ? derivedRoute?.sessionKey
             : (providedSessionKey ?? derivedRoute?.sessionKey);
@@ -682,8 +672,7 @@ export const sendHandlers: GatewayRequestHandlers = {
           }
           // Durable route/session persistence commits only after platform
           // evidence: a failed send must not rebind the folded main session's
-          // delivery route. Once-only across multi-payload results, and before
-          // the in-delivery transcript mirror so first contacts have a row.
+          // delivery route. First contacts bind before the canonical delivered row.
           let outboundRoutePersisted = false;
           const commitOutboundSessionRoute = async () => {
             if (outboundRoutePersisted || !derivedRoute) {
@@ -695,7 +684,6 @@ export const sendHandlers: GatewayRequestHandlers = {
               channel,
               accountId,
               route: derivedRoute,
-              mirrorSessionKey: outboundSessionKey,
               workerGuard: { assertCurrent: commitAgentRuntimeAuthority },
               creation: resolveSandboxedSessionCreation(client, cfg),
               sourceSessionKey: client?.internal?.agentRuntimeIdentity?.sessionKey,
@@ -704,7 +692,8 @@ export const sendHandlers: GatewayRequestHandlers = {
           const outboundSession = buildOutboundSessionContext({
             cfg,
             agentId: effectiveAgentId,
-            sessionKey: outboundSessionKey,
+            sessionKey: client?.internal?.agentRuntimeIdentity?.sessionKey,
+            policySessionKey: outboundSessionKey,
             conversationType: derivedRoute?.chatType,
           });
           // Target, attachment, route, and session preparation may all yield.
@@ -743,15 +732,7 @@ export const sendHandlers: GatewayRequestHandlers = {
               onPlatformSendDispatch,
               assertDirectAdapterHandoff: commitAgentRuntimeAuthority,
               skipQueue: hasAgentRuntimeAuthority,
-              mirror: outboundSessionKey
-                ? {
-                    sessionKey: outboundSessionKey,
-                    agentId: effectiveAgentId,
-                    text: mirrorText || message,
-                    mediaUrls: mirrorMediaUrls.length > 0 ? mirrorMediaUrls : undefined,
-                    idempotencyKey: idem,
-                  }
-                : undefined,
+              transcriptRoute: derivedRoute ?? undefined,
             },
             undefined,
             undefined,

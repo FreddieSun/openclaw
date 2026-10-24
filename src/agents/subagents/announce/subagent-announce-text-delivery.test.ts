@@ -1,8 +1,8 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { awaitGateBeforeSettlement as beforeSettled } from "../../../../test/helpers/promise.js";
 import { chunkText } from "../../../auto-reply/chunk.js";
-import * as transcript from "../../../infra/outbound/deliver-transcript.js";
 import { setActivePluginRegistry } from "../../../plugins/runtime.js";
+import * as transcript from "../../../sessions/confirmed-visible-message.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import {
   createOutboundTestPlugin,
@@ -68,13 +68,14 @@ it.each(["rejected", "aborted"] as const)("settles after chunk two is %s", async
   expect(fixture.onDeliveryResult).not.toHaveBeenCalled();
 });
 
-it("reports complete delivery before transcript mirroring settles", async () => {
+it("reports complete delivery before destination history settles", async () => {
   const fixture = setup();
   const mirrorEntered = createDeferredCore();
   const releaseMirror = createDeferredCore();
-  vi.spyOn(transcript, "mirrorDeliveredPayloads").mockImplementation(async () => {
+  vi.spyOn(transcript, "commitConfirmedVisibleMessage").mockImplementation(async () => {
     mirrorEntered.resolve();
     await releaseMirror.promise;
+    return { ok: true };
   });
   const delivery = fixture.deliver();
   try {
@@ -91,11 +92,11 @@ it("reports complete delivery before transcript mirroring settles", async () => 
   await expect(delivery).resolves.toMatchObject({ delivered: true, path: "direct" });
 });
 
-it.each(["mirror", "report"] as const)("keeps delivery after %s rejects", async (failure) => {
+it.each(["history", "report"] as const)("keeps delivery after %s rejects", async (failure) => {
   const fixture = setup();
   const error = new Error("post-send bookkeeping failed");
-  if (failure === "mirror") {
-    vi.spyOn(transcript, "mirrorDeliveredPayloads").mockRejectedValue(error);
+  if (failure === "history") {
+    vi.spyOn(transcript, "commitConfirmedVisibleMessage").mockRejectedValue(error);
   } else {
     fixture.onDeliveryResult.mockRejectedValue(error);
   }

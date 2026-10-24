@@ -41,10 +41,9 @@ const mocks = vi.hoisted(() => {
           agentId: params.agentId,
         }),
     })),
-    appendAssistantMessageToSessionTranscript: vi.fn(async () => ({
-      ok: true,
-      target: { sessionId: "x", sessionKey: "x", storePath: "/tmp/sessions.json" },
-    })),
+    commitConfirmedVisibleMessage: vi.fn<
+      typeof import("../../sessions/confirmed-visible-message.js").commitConfirmedVisibleMessage
+    >(async () => ({ ok: true })),
   };
 });
 
@@ -73,9 +72,8 @@ vi.mock("../../media/local-roots.js", async () => {
   };
 });
 
-vi.mock("../../config/sessions/transcript.runtime.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../config/sessions/transcript.runtime.js")>()),
-  appendAssistantMessageToSessionTranscript: mocks.appendAssistantMessageToSessionTranscript,
+vi.mock("../../sessions/confirmed-visible-message.js", () => ({
+  commitConfirmedVisibleMessage: mocks.commitConfirmedVisibleMessage,
 }));
 
 type OutboundSendServiceModule = typeof import("./outbound-send-service.js");
@@ -199,31 +197,8 @@ describe("executeSendAction", () => {
     };
   }
 
-  function expectMirrorWrite(expected: Partial<NonNullable<ExecuteSendContext["mirror"]>>) {
-    expectSingleCallFields(mocks.appendAssistantMessageToSessionTranscript, {
-      ...expected,
-      config: {},
-    });
-  }
-
-  async function executePluginMirroredSend(params: {
-    mirror?: Partial<{
-      sessionKey: string;
-      agentId?: string;
-      idempotencyKey?: string;
-    }>;
-    mediaUrls?: string[];
-  }) {
-    await send(
-      {
-        params: { to: "channel:123", message: "hello" },
-        mirror: {
-          sessionKey: "agent:main:demo-outbound:channel:123",
-          ...params.mirror,
-        },
-      },
-      { mediaUrls: params.mediaUrls },
-    );
+  function expectConfirmedCommit(expected: Record<string, unknown>) {
+    expectSingleCallFields(mocks.commitConfirmedVisibleMessage, { config: {}, ...expected });
   }
 
   function createPluginMediaSendContext(overrides: ContextOverrides): ExecuteSendContext {
@@ -418,13 +393,12 @@ describe("executeSendAction", () => {
         mediaUrl: null,
       });
 
-      const mirror = { sessionKey: "agent:main:discord:channel:123", agentId: "main" };
       const result = await send(
         {
           channelPlugin: plugin,
           channel: "discord",
           params: { to: "channel:123", ...(message ? { message } : {}), presentation },
-          ...(!message ? { mirror, input: { runId: "run-presentation-delivery" } } : {}),
+          ...(!message ? { input: { runId: "run-presentation-delivery" } } : {}),
         },
         { message, payload: { text: message, presentation } },
       );
@@ -433,7 +407,7 @@ describe("executeSendAction", () => {
       expect(mocks.dispatchChannelMessageAction).not.toHaveBeenCalled();
       const sendArgs = expectSingleCallFields(mocks.sendMessage, {
         content: message,
-        ...(!message ? { runId: "run-presentation-delivery", mirror } : {}),
+        ...(!message ? { runId: "run-presentation-delivery" } : {}),
       });
       expect(sendArgs.payloads).toEqual([{ text: message, presentation }]);
     },
@@ -449,11 +423,6 @@ describe("executeSendAction", () => {
         channelPlugin: plugin,
         channel: "discord",
         params: { to: "channel:123", components: nativeComponents, presentation },
-        mirror: {
-          sessionKey: "agent:main:discord:channel:123",
-          agentId: "main",
-          text: "Summary",
-        },
       },
       { message: "Summary", payload: { text: "Summary", presentation } },
     );
@@ -464,10 +433,10 @@ describe("executeSendAction", () => {
     const actionParams = requireRecord(actionCtx.params, "plugin action params");
     expect(actionParams.components).toBe(nativeComponents);
     expectFields(actionParams, { message: "Summary\n\nPortable fallback", presentation });
-    expectMirrorWrite({
-      sessionKey: "agent:main:discord:channel:123",
-      agentId: "main",
-      text: "Summary\n\nPortable fallback",
+    expectConfirmedCommit({
+      channel: "discord",
+      to: "channel:123",
+      payload: expect.objectContaining({ text: "Summary\n\nPortable fallback", presentation }),
     });
   });
 
@@ -688,35 +657,35 @@ describe("executeSendAction", () => {
     });
   });
 
-  it("passes mirror idempotency keys through plugin-handled sends", async () => {
+  it("records plugin-handled sends under their stable delivery identity", async () => {
+    const transcriptRoute = {
+      sessionKey: "agent:main:demo-outbound:channel:123",
+      baseSessionKey: "agent:main:demo-outbound:channel:123",
+      peer: { kind: "channel" as const, id: "123" },
+      chatType: "channel" as const,
+      from: "demo-outbound:channel:123",
+      to: "channel:123",
+    };
     await send({
       params: defaultSendParams,
-      mirror: {
-        sessionKey: "agent:main:demo-outbound:channel:123",
-        idempotencyKey: "idem-plugin-send-1",
-      },
-    });
-    expectMirrorWrite({
-      sessionKey: "agent:main:demo-outbound:channel:123",
-      text: "hello",
       idempotencyKey: "idem-plugin-send-1",
+      transcriptRoute,
+    });
+    expectConfirmedCommit({
+      route: transcriptRoute,
+      payload: expect.objectContaining({ text: "hello" }),
+      deliveryId: "idem-plugin-send-1",
+      payloadIndex: 0,
     });
   });
 
-  it("falls back to message and media params for plugin-handled mirror writes", async () => {
-    await executePluginMirroredSend({
-      mirror: {
-        agentId: "agent-9",
-      },
-      mediaUrls: ["https://example.com/a.png", "https://example.com/b.png"],
+  it("preserves a confirmed native send when transcript publication fails", async () => {
+    mocks.commitConfirmedVisibleMessage.mockRejectedValueOnce(new Error("transcript unavailable"));
+    await expect(send({ params: defaultSendParams })).resolves.toMatchObject({
+      handledBy: "plugin",
     });
-
-    expectMirrorWrite({
-      agentId: "agent-9",
-      sessionKey: "agent:main:demo-outbound:channel:123",
-      text: "hello",
-      mediaUrls: ["https://example.com/a.png", "https://example.com/b.png"],
-    });
+    expect(mocks.dispatchChannelMessageAction).toHaveBeenCalledOnce();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
   });
 
   it("skips plugin dispatch during dry-run sends and forwards gateway + silent to sendMessage", async () => {

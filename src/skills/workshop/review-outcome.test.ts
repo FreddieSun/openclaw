@@ -239,7 +239,11 @@ describe("postWorkshopChangeNotice", () => {
             presentation: { blocks: [{ type: "buttons", buttons: [button] }] },
           },
         ],
-        mirror: expect.objectContaining({ sessionKey }),
+        session: expect.objectContaining({ policyKey: sessionKey }),
+        deliveryIntentId: expect.stringMatching(/^skill-workshop-notice:/),
+        transcriptExpectedGeneration: expect.objectContaining({
+          sessionId: generation(sessionKey).sessionId,
+        }),
       }),
       undefined,
       undefined,
