@@ -18,8 +18,8 @@ import {
   getReplyPayloadMetadata,
   isRenderablePayload,
   shouldSuppressReasoningPayload,
+  selectAutomationReplyPayloads,
 } from "../reply-payload.js";
-import { selectAutomationReplyPayloads } from "./automation-reply-payloads.js";
 import type {
   ScheduledSessionAutomation,
   SessionEventExecution,
