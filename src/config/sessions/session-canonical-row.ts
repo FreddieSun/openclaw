@@ -1,6 +1,7 @@
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { SessionCanonicalKeyMigrationRequiredError } from "./session-canonical-key-error.js";
-import { parseCanonicalSqliteSessionEntry } from "./session-entry-json.js";
+import { parseSqliteSessionEntryRecord } from "./session-entry-json.js";
+import { projectCanonicalSessionEntryShape } from "./store-entry-shape.js";
 import {
   normalizeStoreSessionKey,
   resolveDeliveryProvenCanonicalSessionKey,
@@ -27,17 +28,15 @@ export function canonicalSessionKeyMigrationRequiredError(
 }
 
 /** One validator serves full Doctor scans, pending rows, and canonical writer inputs. */
-export function validateCanonicalSessionRow(
-  row: CanonicalSessionValidationRow,
-): SessionEntry | undefined {
+export function validateCanonicalSessionRow(row: CanonicalSessionValidationRow): void {
   const record =
     row.entry_valid === 1
-      ? parseCanonicalSqliteSessionEntry({
+      ? parseSqliteSessionEntryRecord({
           entry_json: row.entry_json,
           current_session_id: row.current_session_id,
         })
       : null;
-  return validateCanonicalSessionRowEntry(row, record);
+  validateCanonicalSessionRowEntry(row, record ? projectCanonicalSessionEntryShape(record) : null);
 }
 
 /** Exact readers validate the entry decoded from the same selected row. */

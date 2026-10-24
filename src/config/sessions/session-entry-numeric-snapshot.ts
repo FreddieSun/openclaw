@@ -37,9 +37,9 @@ type OptionalNumericField = (typeof SESSION_ENTRY_NUMERIC_FIELDS)[number];
 export type SessionEntryNumericSnapshot = Pick<SessionEntry, OptionalNumericField>;
 
 /** Admit canonical numeric metadata once, before consumers perform arithmetic on it. */
-export function projectSessionEntryNumericSnapshot(
-  value: Record<string, unknown>,
-): SessionEntryNumericSnapshot {
+export function projectSessionEntryNumericSnapshot(value: {
+  [Field in OptionalNumericField]?: unknown;
+}): SessionEntryNumericSnapshot {
   const snapshot: SessionEntryNumericSnapshot = {};
   for (const field of SESSION_ENTRY_NUMERIC_FIELDS) {
     if (!Object.hasOwn(value, field)) {

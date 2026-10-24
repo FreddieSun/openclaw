@@ -8,6 +8,7 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { validateSessionId } from "../../../config/sessions/paths.js";
 import { isMainRestartRecoveryCandidate } from "../../../config/sessions/restart-recovery-state.js";
+import { admitCanonicalSessionEntry } from "../../../config/sessions/session-entry-json.js";
 import { SESSION_ENTRY_NUMERIC_FIELDS } from "../../../config/sessions/session-entry-numeric-snapshot.js";
 import {
   hasLegacySessionProviderState,
@@ -20,7 +21,6 @@ import {
   normalizeMemoryFlush,
   normalizeOptionalTimestamp,
   normalizePendingFinalDelivery,
-  projectCanonicalSessionEntryShape,
 } from "../../../config/sessions/store-entry-shape.js";
 import type { SessionEntry } from "../../../config/sessions/types.js";
 import { isIncognitoSessionKey, parseAgentSessionKey } from "../../../routing/session-key.js";
@@ -230,7 +230,7 @@ export function normalizePersistedSessionEntryShape(
   }
 
   const modelSelectionLocked = value.modelSelectionLocked === true;
-  let next = projectCanonicalSessionEntryShape(
+  let next = admitCanonicalSessionEntry(
     migrateLegacySessionEntryState(value, value.updatedAt, options.sessionKey),
   );
   if (value.sessionId !== undefined) {

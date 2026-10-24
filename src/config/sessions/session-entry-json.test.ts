@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { parseCanonicalSqliteSessionEntry } from "./session-entry-json.js";
-import { projectCanonicalSessionEntryShape } from "./store-entry-shape.js";
+import {
+  admitCanonicalSessionEntry,
+  parseCanonicalSqliteSessionEntry,
+} from "./session-entry-json.js";
 
 describe("canonical session numeric metadata", () => {
   it.each([
@@ -18,10 +20,10 @@ describe("canonical session numeric metadata", () => {
   });
 
   it.each([Number.NaN, Number.POSITIVE_INFINITY])(
-    "rejects non-finite in-memory metadata %s before persistence",
+    "rejects non-finite in-memory metadata %s at unknown admission",
     (estimatedCostUsd) => {
       expect(() =>
-        projectCanonicalSessionEntryShape({ sessionId: "session", updatedAt: 1, estimatedCostUsd }),
+        admitCanonicalSessionEntry({ sessionId: "session", updatedAt: 1, estimatedCostUsd }),
       ).toThrow('Session field "estimatedCostUsd" must be a finite number');
     },
   );
@@ -51,7 +53,7 @@ describe("canonical session numeric metadata", () => {
   });
 
   it("preserves zero, fractional numeric metadata, and optional field presence", () => {
-    const projected = projectCanonicalSessionEntryShape({
+    const projected = admitCanonicalSessionEntry({
       sessionId: "session",
       updatedAt: 1,
       spawnDepth: 0,
@@ -68,7 +70,7 @@ describe("canonical session numeric metadata", () => {
 
   it("preserves extension payloads while normalizing existing retired fields", () => {
     const extension = { custom: { count: "not a canonical numeric field" } };
-    const projected = projectCanonicalSessionEntryShape({
+    const projected = admitCanonicalSessionEntry({
       sessionId: "session",
       updatedAt: 1,
       spawnDepth: 2,

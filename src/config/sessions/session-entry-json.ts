@@ -1,5 +1,6 @@
 import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { projectSessionEntryNumericSnapshot } from "./session-entry-numeric-snapshot.js";
 import { projectCanonicalSessionEntryShape } from "./store-entry-shape.js";
 import type { SessionEntry } from "./types.js";
 
@@ -42,9 +43,15 @@ export function parseSqliteSessionEntryRecord(
   return record;
 }
 
+/** Admit unknown persisted or imported metadata once, before typed consumers use it. */
+export function admitCanonicalSessionEntry(value: Record<string, unknown>): SessionEntry {
+  const entry = projectCanonicalSessionEntryShape(value);
+  return { ...entry, ...projectSessionEntryNumericSnapshot(entry) };
+}
+
 export function parseCanonicalSqliteSessionEntry(row: SessionEntryJsonRow): SessionEntry | null {
   const record = parseSqliteSessionEntryRecord(row);
-  return record ? projectCanonicalSessionEntryShape(record) : null;
+  return record ? admitCanonicalSessionEntry(record) : null;
 }
 
 export function normalizeSessionEntryTimestamp(entry: SessionEntry): SessionEntry {
