@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from "node:crypto";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
-import { createServer, type Server as HttpServer } from "node:http";
+import { createServer } from "node:http";
 import http2 from "node:http2";
 import net from "node:net";
 import path from "node:path";
@@ -10,9 +10,11 @@ import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred, withTestTimeout } from "../../test/helpers/promise.js";
 import { TEST_TLS_CERT_PEM, TEST_TLS_KEY_PEM } from "../../test/helpers/tls-fixture.js";
+import { withLoopbackTestServer } from "../commands/loopback-server.test-support.js";
+import { withEnvAsync } from "../test-utils/env.js";
 import { createTrackedTempDirs } from "../test-utils/tracked-temp-dirs.js";
 import { verifyDeviceSignature } from "./device-identity.js";
-import { startProxy, stopProxy, type ProxyHandle } from "./net/proxy/proxy-lifecycle.js";
+import { startProxy, stopProxy } from "./net/proxy/proxy-lifecycle.js";
 import {
   appendApnsResponseBodyCapture,
   createApnsResponseBodyCapture,
@@ -90,30 +92,6 @@ type CapturedApnsRequest = {
   body: string;
 };
 
-type DestroyableConnection = {
-  destroy: () => void;
-};
-
-function listen(server: HttpServer | http2.Http2SecureServer): Promise<number> {
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.off("error", reject);
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        reject(new Error("server address unavailable"));
-        return;
-      }
-      resolve(address.port);
-    });
-  });
-}
-
-const closeServer = (server: HttpServer | http2.Http2SecureServer) =>
-  new Promise<void>((resolve, reject) => {
-    server.close((error?: Error) => (error ? reject(error) : resolve()));
-  });
-
 const requireRecord = createRequireRecord("object", "label-not-object");
 
 function expectNoProperties(record: unknown, keys: string[]) {
@@ -137,100 +115,51 @@ function expectOpenClaw(payload: Record<string, unknown>, fields: Record<string,
 }
 
 async function withProxiedApns(
-  response: Parameters<typeof startFakeApnsServer>[0],
-  check: (
-    server: Awaited<ReturnType<typeof startFakeApnsServer>>,
-    proxy: Awaited<ReturnType<typeof startConnectProxy>>,
-  ) => Promise<void>,
+  response: { responseBody: string; status: number },
+  check: (requests: CapturedApnsRequest[], connectTargets: string[]) => Promise<void>,
 ) {
-  const server = await startFakeApnsServer(response);
-  const proxy = await startConnectProxy(server.port);
-  let handle: ProxyHandle | null | undefined;
-  const previous = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-  try {
-    handle = await startProxy({ proxyUrl: proxy.proxyUrl });
-    await check(server, proxy);
-  } finally {
-    if (previous === undefined) {
-      delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    } else {
-      process.env.NODE_TLS_REJECT_UNAUTHORIZED = previous;
-    }
-    await stopProxy(handle ?? null);
-    await proxy.stop();
-    await server.stop();
-  }
-}
-
-async function startFakeApnsServer(params?: { responseBody?: string; status?: number }) {
   const requests: CapturedApnsRequest[] = [];
-  const responseBody = params?.responseBody ?? "";
-  const status = params?.status ?? 200;
-  const server = http2.createSecureServer({
-    key: TEST_TLS_KEY_PEM,
-    cert: TEST_TLS_CERT_PEM,
-    allowHTTP1: false,
-  });
+  const connectTargets: string[] = [];
+  const server = http2.createSecureServer({ key: TEST_TLS_KEY_PEM, cert: TEST_TLS_CERT_PEM });
   server.on("stream", (stream: http2.ServerHttp2Stream, headers) => {
     let body = "";
     stream.setEncoding("utf8");
     stream.on("data", (chunk) => {
-      body += typeof chunk === "string" ? chunk : String(chunk);
+      body += String(chunk);
     });
     stream.on("end", () => {
       requests.push({ headers, body });
-      stream.respond({ ":status": status, "apns-id": "proxied-apns-id" });
-      stream.end(responseBody);
+      stream.respond({ ":status": response.status, "apns-id": "proxied-apns-id" });
+      stream.end(response.responseBody);
     });
   });
-  const port = await listen(server);
-  return {
-    port,
-    requests,
-    stop: async () => await closeServer(server),
-  };
-}
-
-async function startConnectProxy(upstreamPort: number) {
-  const connectTargets: string[] = [];
-  const sockets = new Set<DestroyableConnection>();
-  const server = createServer((_req, res) => {
-    res.writeHead(502);
-    res.end("CONNECT required");
-  });
-  server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-  });
-  server.on("connect", (req, clientSocket, head) => {
-    connectTargets.push(req.url ?? "");
-    const upstreamSocket = net.connect(upstreamPort, "127.0.0.1", () => {
-      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head.length > 0) {
-        upstreamSocket.write(head);
-      }
-      clientSocket.pipe(upstreamSocket);
-      upstreamSocket.pipe(clientSocket);
+  await withLoopbackTestServer(server, async (port) => {
+    const proxy = createServer();
+    proxy.on("connect", (request, client, head) => {
+      connectTargets.push(request.url ?? "");
+      const upstream = net.connect(port, "127.0.0.1", () => {
+        client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length) {
+          upstream.write(head);
+        }
+        client.pipe(upstream).pipe(client);
+      });
+      client.on("close", () => upstream.destroy());
+      upstream.on("close", () => client.destroy());
+      client.on("error", () => upstream.destroy());
+      upstream.on("error", () => client.destroy());
     });
-    sockets.add(clientSocket);
-    sockets.add(upstreamSocket);
-    clientSocket.on("close", () => sockets.delete(clientSocket));
-    upstreamSocket.on("close", () => sockets.delete(upstreamSocket));
-    clientSocket.on("error", () => upstreamSocket.destroy());
-    upstreamSocket.on("error", () => clientSocket.destroy());
+    await withLoopbackTestServer(proxy, async (proxyPort) =>
+      withEnvAsync({ NODE_TLS_REJECT_UNAUTHORIZED: "0" }, async () => {
+        const handle = await startProxy({ proxyUrl: `http://127.0.0.1:${proxyPort}` });
+        try {
+          await check(requests, connectTargets);
+        } finally {
+          await stopProxy(handle);
+        }
+      }),
+    );
   });
-  const port = await listen(server);
-  return {
-    proxyUrl: `http://127.0.0.1:${port}`,
-    connectTargets,
-    stop: async () => {
-      for (const socket of sockets) {
-        socket.destroy();
-      }
-      await closeServer(server);
-    },
-  };
 }
 
 describe("push APNs send semantics", () => {
@@ -274,7 +203,7 @@ describe("push APNs send semantics", () => {
   ] as const)(
     "sends through the managed proxy and bounds HTTP %s bodies",
     async (status, responseBody, ok, reason) => {
-      await withProxiedApns({ status, responseBody }, async (apnsServer, proxy) => {
+      await withProxiedApns({ status, responseBody }, async (requests, connectTargets) => {
         const { registration, auth } = createDirectApnsSendFixture("ios-node-proxied-alert");
 
         const result = await sendApnsAlert({
@@ -293,9 +222,9 @@ describe("push APNs send semantics", () => {
           apnsId: "proxied-apns-id",
           transport: "direct",
         });
-        expect(proxy.connectTargets).toEqual(["api.sandbox.push.apple.com:443"]);
-        expect(apnsServer.requests).toHaveLength(1);
-        const request = apnsServer.requests[0];
+        expect(connectTargets).toEqual(["api.sandbox.push.apple.com:443"]);
+        expect(requests).toHaveLength(1);
+        const request = requests[0];
         expect(request?.headers).toMatchObject({
           ":method": "POST",
           ":path": "/3/device/abcd1234abcd1234abcd1234abcd1234",
