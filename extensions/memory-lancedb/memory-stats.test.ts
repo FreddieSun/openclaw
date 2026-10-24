@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import { registerHooks } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { isPidAlive, runUtf8CommandWithTimeout } from "openclaw/plugin-sdk/process-runtime";
 import { afterAll, afterEach, assert, expect, it, vi } from "vitest";
@@ -162,7 +163,20 @@ it("does not claim cancellation succeeded when process cleanup is uncertain", as
 
 it("keeps a child-owned table lease without inheriting the host SDK aliases", async () => {
   transport.tsconfigPath = path.join(getTmpDir(), "tsconfig.json");
-  await fs.writeFile(transport.tsconfigPath, "{}");
+  const configUrl = new URL("../../tsconfig.json", import.meta.url);
+  const config: { compilerOptions: { paths: Record<string, string[]> } } = JSON.parse(
+    await fs.readFile(configUrl, "utf8"),
+  );
+  // Keep workspace dependencies available while removing the host's SDK alias.
+  const paths = Object.fromEntries(
+    Object.entries(config.compilerOptions.paths)
+      .filter(([specifier]) => specifier !== "openclaw/plugin-sdk/*")
+      .map(([specifier, targets]) => [
+        specifier,
+        targets.map((target) => fileURLToPath(new URL(target, configUrl))),
+      ]),
+  );
+  await fs.writeFile(transport.tsconfigPath, JSON.stringify({ compilerOptions: { paths } }));
   const custodyUrl = new URL("./lancedb-custody.ts", import.meta.url).href;
   transport.moduleUrl = `data:text/javascript,${encodeURIComponent(`
 import { readdirSync, readFileSync } from "node:fs";
