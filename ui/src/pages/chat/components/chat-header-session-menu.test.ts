@@ -44,9 +44,13 @@ const settings = (): HeaderMenuElement["settings"] => ({
   chatShowToolCalls: true,
   chatPersistCommentary: true,
 });
-const query = <T extends Element = HTMLButtonElement>(root: ParentNode, selector: string): T =>
-  expectDefined(root.querySelector<T>(selector), selector);
-const panel = (menu: ParentNode) => query<HTMLElement>(menu, ".chat-header-session-menu__panel");
+const query = (root: ParentNode, selector: string): HTMLButtonElement =>
+  expectDefined(root.querySelector<HTMLButtonElement>(selector), selector);
+const panel = (menu: ParentNode) =>
+  expectDefined(
+    menu.querySelector<HTMLElement>(".chat-header-session-menu__panel"),
+    "session menu panel",
+  );
 const itemLabel = (item: Element) =>
   item.querySelector(".session-menu__text")?.textContent?.trim() ??
   item.getAttribute("aria-label") ??
@@ -319,7 +323,10 @@ it("preserves row-discovered groups when the gateway catalog lags", async () => 
     ),
     container,
   );
-  const menu = query<HeaderMenuElement>(container, "openclaw-chat-header-session-menu");
+  const menu = expectDefined(
+    container.querySelector<HeaderMenuElement>("openclaw-chat-header-session-menu"),
+    "session menu",
+  );
   await menu.updateComplete;
   await openMenu(menu);
   await materializeSubmenus(menu);

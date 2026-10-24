@@ -26,10 +26,9 @@ import {
 
 let container: HTMLDivElement;
 
-const query = <T extends Element = HTMLElement>(selector: string): T | null =>
-  container.querySelector<T>(selector);
+const query = (selector: string): HTMLElement | null => container.querySelector(selector);
 const text = (selector: string) => query(selector)?.textContent;
-const click = (selector: string) => query<HTMLButtonElement>(selector)?.click();
+const click = (selector: string) => container.querySelector<HTMLButtonElement>(selector)?.click();
 
 function paint(props: Partial<ChatPullRequestsProps>) {
   paintChatPullRequests(
@@ -135,7 +134,9 @@ describe("ChatPullRequests", () => {
         expect(query("openclaw-chat-ci-automation")).not.toBeNull();
         expect(query(".chat-pr__diff, openclaw-chat-ci-details, .chat-pr__warning")).toBeNull();
         expect(query(".chat-pr__publication-outcome, .chat-pr__create")).toBeNull();
-        expect(query<HTMLButtonElement>(".chat-pr__dismiss")?.disabled).toBe(false);
+        expect(container.querySelector<HTMLButtonElement>(".chat-pr__dismiss")?.disabled).toBe(
+          false,
+        );
       } else if (kind === "older receipt") {
         expect(query(".chat-pr__checks")).not.toBeNull();
       } else {
@@ -176,7 +177,9 @@ describe("ChatPullRequests", () => {
         expect(row.textContent).not.toContain("Check repository read access");
         expect(row.querySelector("[data-publication-account], .chat-pr__create")).toBeNull();
       }
-      const history = query<HTMLDetailsElement>("details.chat-pr__publication-history");
+      const history = container.querySelector<HTMLDetailsElement>(
+        "details.chat-pr__publication-history",
+      );
       expect(history?.closest("article")).toBeNull();
       expect(history?.querySelector("summary")?.textContent?.trim()).toBe(
         "Publication attempt failed",
@@ -210,7 +213,7 @@ describe("ChatPullRequests", () => {
       expect(outcome?.textContent).toContain("The original publication still needs attention.");
       expect(outcome?.closest("details:not([open])")).toBeNull();
       expect(query(".chat-pr__publication-history")).toBeNull();
-      const action = query<HTMLButtonElement>(".chat-pr__create");
+      const action = container.querySelector<HTMLButtonElement>(".chat-pr__create");
       expect(action?.disabled).toBe(false);
       action?.click();
       expect(status === "needs_confirmation" ? onConfirm : onRefresh).toHaveBeenCalledOnce();
@@ -236,7 +239,7 @@ describe("ChatPullRequests", () => {
       try {
         await i18n.setLocale(locale);
         paint({ pullRequests: [], branch });
-        const link = query<HTMLAnchorElement>("a.chat-pr__create");
+        const link = container.querySelector<HTMLAnchorElement>("a.chat-pr__create");
         expect(link?.textContent).toBe(label);
         expect(link?.getAttribute("aria-label")).toContain(label);
         expect(link?.getAttribute("aria-label")).toContain(branch.branch);
@@ -272,7 +275,7 @@ describe("ChatPullRequests", () => {
         publisher: { source: "personal", accountId: 2, login: "alice-tools" },
       },
     });
-    expect(query<HTMLAnchorElement>(".chat-pr__create")?.href).toBe(
+    expect(container.querySelector<HTMLAnchorElement>(".chat-pr__create")?.href).toBe(
       "https://github.com/openclaw/openclaw/pull/125200",
     );
     expect(text(".chat-pr__branch")).toBe(branch.branch);
@@ -295,7 +298,7 @@ describe("ChatPullRequests", () => {
     expect(status?.open).toBe(false);
     expect(status?.querySelector("summary")?.textContent?.trim()).toBe("Publication failed");
     expect(failure?.closest("article")?.getAttribute("data-state")).toBe("branch");
-    expect(query<HTMLButtonElement>(".chat-pr__create")?.textContent).toContain(
+    expect(container.querySelector<HTMLButtonElement>(".chat-pr__create")?.textContent).toContain(
       "Choose a new publication",
     );
     expect(query("a.chat-pr__create")).toBeNull();
@@ -304,7 +307,7 @@ describe("ChatPullRequests", () => {
       error: "Repository write permission is missing.",
       locked: true,
     });
-    const retry = query<HTMLButtonElement>(".chat-pr__create");
+    const retry = container.querySelector<HTMLButtonElement>(".chat-pr__create");
     expect(retry?.textContent).toContain("Retry publication");
     expect(container.textContent).toContain("Repository write permission is missing.");
     expect(container.textContent).toContain("The outcome is unknown");
@@ -442,8 +445,8 @@ describe("CI job details", () => {
       onDismiss() {},
     };
     paintChatPullRequests(props, container);
-    const element = query<ChatCiDetailsElement>("openclaw-chat-ci-details")!;
-    const disclosure = query<HTMLDetailsElement>(".chat-pr__checks")!;
+    const element = container.querySelector<ChatCiDetailsElement>("openclaw-chat-ci-details")!;
+    const disclosure = container.querySelector<HTMLDetailsElement>(".chat-pr__checks")!;
     return {
       request,
       props,
@@ -495,14 +498,16 @@ describe("CI job details", () => {
         job.getAttribute("data-check-id"),
       ),
     ).toEqual(["3", "2", "1"]);
-    const failed = query<HTMLDetailsElement>('.chat-ci__job[data-check-id="3"]')!;
+    const failed = container.querySelector<HTMLDetailsElement>('.chat-ci__job[data-check-id="3"]')!;
     expect(failed.open).toBe(true);
     expect(failed.querySelector(".chat-ci__duration")?.textContent).toBe("1m 12s");
     expect(
       [...failed.querySelectorAll(".chat-ci__step .chat-ci__name")].map((step) => step.textContent),
     ).toEqual(["Set up job", "Install", "Lint sources", "Upload report"]);
-    expect(query<HTMLDetailsElement>('.chat-ci__job[data-check-id="1"]')?.open).toBe(false);
-    expect(query<HTMLDetailsElement>(".chat-ci__skipped")?.open).toBe(false);
+    expect(
+      container.querySelector<HTMLDetailsElement>('.chat-ci__job[data-check-id="1"]')?.open,
+    ).toBe(false);
+    expect(container.querySelector<HTMLDetailsElement>(".chat-ci__skipped")?.open).toBe(false);
     failed.open = false;
     await settle(h.element);
     const requestsBeforeRefresh = h.request.mock.calls.length;
@@ -622,7 +627,7 @@ describe("CI job details", () => {
       details({ checks: [], status: "unavailable", rateLimited: true, retryAfterMs: 30_000 }),
     );
     await openDetails(h);
-    const retry = query<HTMLButtonElement>(".chat-ci__retry")!;
+    const retry = container.querySelector<HTMLButtonElement>(".chat-ci__retry")!;
     expect(container.textContent).toContain("rate limit");
     expect(retry.disabled).toBe(true);
     await refresh(h);
@@ -646,7 +651,7 @@ describe("CI job details", () => {
     expect(query(".chat-ci__job-link")).toBeNull();
     h.request.mockResolvedValue(reply("https://ci.example.test/build/5"));
     await refresh(h);
-    const link = query<HTMLAnchorElement>(".chat-ci__job-link");
+    const link = container.querySelector<HTMLAnchorElement>(".chat-ci__job-link");
     expect(link?.href).toBe("https://ci.example.test/build/5");
     expect(link?.textContent).toContain("Open check details");
   });

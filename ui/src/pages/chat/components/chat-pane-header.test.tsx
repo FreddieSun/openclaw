@@ -53,10 +53,11 @@ const viewer = (id: string, name = id): PresenceEntry => ({
   user: { id, identity: { type: "profile", id }, name },
   watchedSessions: ["agent:main:current"],
 });
-const query = <T extends Element = HTMLElement & { updateComplete?: Promise<unknown> }>(
+const query = (
   root: ParentNode,
   selector: string,
-): T => root.querySelector<T>(selector)!;
+): HTMLElement & { updateComplete?: Promise<unknown> } =>
+  root.querySelector<HTMLElement>(selector)!;
 const text = (root: ParentNode, selector: string) => query(root, selector)?.textContent?.trim();
 const absent = (root: ParentNode, selectors: string) =>
   expect(root.querySelector(selectors)).toBeNull();
@@ -114,7 +115,7 @@ describe("chat pane header", () => {
     const onDrawer = vi.fn<(event: Event) => void>();
     window.addEventListener(SHELL_NAV_DRAWER_TOGGLE_EVENT, onDrawer);
     const { container } = mountHeader({ mergedChrome: true, catalog: true, session: undefined });
-    const drawer = query<HTMLButtonElement>(container, '[aria-label="Expand sidebar"]');
+    const drawer = container.querySelector<HTMLButtonElement>('[aria-label="Expand sidebar"]')!;
     drawer.click();
     expect(onDrawer).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ detail: { trigger: drawer } }),
@@ -171,7 +172,7 @@ describe("chat pane header", () => {
         session: { ...sessionMenuAction.session, target: { key: "agent:main:test" } },
       },
     });
-    const close = query<HTMLButtonElement>(container, ".chat-pane__close");
+    const close = container.querySelector<HTMLButtonElement>(".chat-pane__close")!;
     const menu = container.querySelector("openclaw-chat-header-session-menu")!;
     await menu.updateComplete;
     absent(container, ".chat-pane__layout-menu");
@@ -206,7 +207,7 @@ describe("chat pane header", () => {
       onToggleSidePanel,
       sidebarLayout: { columns: [], open: false },
     });
-    const toggle = query<HTMLButtonElement>(container, ".chat-pane__panels-toggle");
+    const toggle = container.querySelector<HTMLButtonElement>(".chat-pane__panels-toggle")!;
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     toggle.click();
     expect(onToggleSidePanel).toHaveBeenCalledOnce();
@@ -215,7 +216,7 @@ describe("chat pane header", () => {
     update({ mergedChrome: true });
     expect(container.querySelector(".chat-pane__panels-toggle")).toBeNull();
     update({ mergedChrome: false, catalog: true, session: undefined });
-    query<HTMLButtonElement>(container, ".chat-pane__panels-toggle").click();
+    container.querySelector<HTMLButtonElement>(".chat-pane__panels-toggle")!.click();
     expect(onToggleSidePanel).toHaveBeenCalledTimes(2);
   });
 
@@ -226,7 +227,7 @@ describe("chat pane header", () => {
     update({ gatewayStatus: { kind: "offline", onRetry } });
     absent(container, "openclaw-chat-header-session-menu, openclaw-chat-pane-versions-menu");
     expect(text(container, '[role="status"]')).toContain("Disconnected");
-    query<HTMLButtonElement>(container, ".chat-pane__connection-retry").click();
+    container.querySelector<HTMLButtonElement>(".chat-pane__connection-retry")!.click();
     expect(onRetry).toHaveBeenCalledOnce();
     update({ gatewayStatus: { kind: "restoring", onRetry } });
     expect(text(container, '[role="status"]')).toContain("Restoring");
@@ -550,7 +551,7 @@ describe("chat pane header", () => {
         renameValue: "Renaming",
         renameDisabledReason: action === "blocked" ? "Session access was revoked" : undefined,
       });
-      const input = query<HTMLInputElement>(container, ".chat-pane__session-title-input");
+      const input = container.querySelector<HTMLInputElement>(".chat-pane__session-title-input")!;
       const event = keyEvent(key, { isComposing, keyCode });
       input.dispatchEvent(event);
       if (key === "Enter" && action !== null) {
@@ -567,7 +568,7 @@ describe("chat pane header", () => {
     "keeps a Safari composition-confirm Enter from committing a session rename until %s",
     (release) => {
       const { container, props } = mountHeader({ editing: true, renameValue: "日本語" });
-      const input = query<HTMLInputElement>(container, ".chat-pane__session-title-input");
+      const input = container.querySelector<HTMLInputElement>(".chat-pane__session-title-input")!;
       input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
       const end = new CompositionEvent("compositionend", { bubbles: true, data: "日本語" });
       input.dispatchEvent(end);
@@ -633,7 +634,7 @@ describe("chat pane header", () => {
 
   it("names incognito threads and supplies their lifetime to the accessible reveal tooltip", async () => {
     const { container } = mountHeader({ session: row({ incognito: true }) });
-    const indicator = query<HTMLButtonElement>(container, "button.chat-pane__incognito");
+    const indicator = container.querySelector<HTMLButtonElement>("button.chat-pane__incognito")!;
     const tooltip = indicator.closest("openclaw-tooltip")!;
     await tooltip.updateComplete;
     expect(indicator?.textContent).toContain("Incognito");

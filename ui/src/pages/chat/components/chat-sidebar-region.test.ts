@@ -97,8 +97,8 @@ function root(region: Region): HTMLElement {
   return region.parentElement!;
 }
 
-function query<T extends HTMLElement = HTMLElement>(region: Region, selector: string): T | null {
-  return root(region).querySelector<T>(selector);
+function query(region: Region, selector: string): HTMLElement | null {
+  return root(region).querySelector(selector);
 }
 
 async function update(region: Region, changes: Partial<Region>) {
@@ -107,7 +107,7 @@ async function update(region: Region, changes: Partial<Region>) {
 }
 
 async function openTypeMenu(region: Region) {
-  query<HTMLButtonElement>(region, ".side-panel-type-menu__trigger")!.click();
+  root(region).querySelector<HTMLButtonElement>(".side-panel-type-menu__trigger")!.click();
   await waitForSolid(() =>
     expect(query(region, '[role="menu"]')?.matches(":popover-open")).toBe(true),
   );
@@ -457,10 +457,14 @@ describe("chat sidebar region", () => {
     const unavailable = query(region, `[data-panel-slot="${slot}"] openclaw-panel-empty-state`);
     expect(unavailable?.textContent).toContain("The plugin that owns this tab is not active");
     expect(region.layout).toEqual(saved);
-    query<HTMLButtonElement>(region, 'button[aria-label="Close fixture/notes"]')?.click();
+    root(region)
+      .querySelector<HTMLButtonElement>('button[aria-label="Close fixture/notes"]')
+      ?.click();
     expect(region.callbacks?.closeSlot).toHaveBeenCalledWith(slot);
 
-    query<HTMLButtonElement>(region, '.tabstrip-tab[data-tab-value="workspace"]')?.click();
+    root(region)
+      .querySelector<HTMLButtonElement>('.tabstrip-tab[data-tab-value="workspace"]')
+      ?.click();
     expect(region.callbacks?.activatePanel).toHaveBeenCalledWith("workspace");
     await update(region, { layout: activatePanel(region.layout, "workspace") });
     expect(query(region, '[data-panel-slot="workspace"]')?.hasAttribute("hidden")).toBe(false);
@@ -517,14 +521,14 @@ describe("chat sidebar region", () => {
         ".side-panel-empty__title, .side-panel-empty__description, :scope > .side-panel-empty__icon",
       ),
     ).toBeNull();
-    query<HTMLButtonElement>(region, ".side-panel-empty__type")?.click();
+    root(region).querySelector<HTMLButtonElement>(".side-panel-empty__type")?.click();
     expect(region.callbacks?.openSlot).toHaveBeenCalledWith("detail");
   });
 
   it("keeps side tab dismissal separate from task toolbar actions", async () => {
     const region = await createRegion();
     expect(query(region, '[data-region-header="side"] .rail-header__actions')).toBeNull();
-    query<HTMLButtonElement>(region, 'button[aria-label="Close Review"]')!.click();
+    root(region).querySelector<HTMLButtonElement>('button[aria-label="Close Review"]')!.click();
     expect(region.callbacks?.closeSlot).toHaveBeenCalledWith("detail");
     await update(region, {
       layout: setSidebarExpanded(promoteSidebarPanel(region.layout, "detail"), true),
@@ -543,7 +547,9 @@ describe("chat sidebar region", () => {
     );
     const primary = query(region, ".sidebar-region__primary")!;
     const panel = query(region, '[data-region="side"]:not([hidden])')!;
-    const divider = query<HTMLElement & { orientation: string }>(region, "resizable-divider")!;
+    const divider = root(region).querySelector<HTMLElement & { orientation: string }>(
+      "resizable-divider",
+    )!;
     primary.getBoundingClientRect = () => ({ height: 440 }) as DOMRect;
     panel.getBoundingClientRect = () => ({ height: 360 }) as DOMRect;
     root(region).getBoundingClientRect = () => ({ height: 800 }) as DOMRect;
@@ -556,7 +562,9 @@ describe("chat sidebar region", () => {
     await update(region, { layout: setSidebarDock(region.layout, "left") });
     primary.getBoundingClientRect = () => ({ width: 800 }) as DOMRect;
     panel.getBoundingClientRect = () => ({ width: 400 }) as DOMRect;
-    const leftDivider = query<HTMLElement & { orientation: string }>(region, "resizable-divider")!;
+    const leftDivider = root(region).querySelector<HTMLElement & { orientation: string }>(
+      "resizable-divider",
+    )!;
     expect(leftDivider.orientation).toBe("vertical");
     leftDivider.dispatchEvent(
       new CustomEvent("resize", { bubbles: true, detail: { splitRatio: 0.25 } }),
@@ -579,7 +587,7 @@ describe("chat sidebar region", () => {
     await region.updateComplete;
     expect(query(region, '[data-panel-slot="dashboard"]')).toBeNull();
     await update(region, { layout: setSidebarOpen(region.layout, true) });
-    const input = query<HTMLInputElement>(region, "input")!;
+    const input = root(region).querySelector<HTMLInputElement>("input")!;
     input.value = "Unsaved note";
     const terminal = query(region, '[data-panel="terminal"]')!;
 
