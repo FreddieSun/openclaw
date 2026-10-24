@@ -102,6 +102,11 @@ async function createMainSessionStore(
 type GatewayWs = Awaited<ReturnType<typeof harness.openWs>>;
 type StoreEntries = Parameters<typeof writeSessionStore>[0]["entries"];
 
+async function openTestSocket(options?: Parameters<typeof harness.openWs>[0]) {
+  const ws = await harness.openWs(options);
+  return Object.assign(ws, { [Symbol.dispose]: () => ws.close() });
+}
+
 async function createSessionStore(entries: StoreEntries, agentId?: string) {
   const updatedAt = Date.now();
   const storePath = await createSessionStoreFile();
@@ -207,6 +212,13 @@ function waitForSessionMessageEvent(ws: GatewayWs, sessionKey: string, timeoutMs
   return onceMessage(ws, matchingEvent("session.message", { sessionKey }), timeoutMs);
 }
 
+async function subscribeMessages(ws: GatewayWs, key: string) {
+  expect(await rpcReq(ws, "sessions.messages.subscribe", { key })).toMatchObject({
+    ok: true,
+    payload: { key, subscribed: true },
+  });
+}
+
 function waitForSessionObserverEvent(ws: GatewayWs, runId: string, timeoutMs?: number) {
   return onceMessage(ws, matchingEvent("session.observer", { runId }), timeoutMs);
 }
@@ -276,72 +288,65 @@ function currentProfileAvatarUrl(profileId: string): string {
 
 describe("session.message websocket events", () => {
   test("message subscriptions preserve declared viewers and disconnect removes only that connection", async () => {
-    const observerWs = await harness.openWs();
-    const watchedWs = await harness.openWs();
+    using observerWs = await openTestSocket();
+    using watchedWs = await openTestSocket();
     const instanceId = "presence-watched-sessions";
-    try {
-      const observerConnId = getConnId(await connectOk(observerWs, { scopes: ["operator.read"] }));
-      await connectOk(watchedWs, {
-        scopes: ["operator.read"],
-        client: {
-          id: GATEWAY_CLIENT_IDS.TEST,
-          version: "1.0.0",
-          platform: "test",
-          mode: GATEWAY_CLIENT_MODES.TEST,
-          instanceId,
-        },
-      });
-      const keys = ["agent:main:watch-00", "agent:main:watch-01"];
-      await createSessionStore(Object.fromEntries(keys.map((key) => [key, { sessionId: key }])));
-      const findWatched = (message: unknown) => findWatchedPresenceEntry(message, instanceId);
-      const declared = onceMessage(
-        observerWs,
-        (message) => JSON.stringify(findWatched(message)?.watchedSessions) === JSON.stringify(keys),
-      );
-      await rpcReq(watchedWs, "sessions.viewers.set", { sessionKeys: keys });
-      const declaration = await declared;
-      const watched = findWatched(declaration);
-      const readWatched = async () => {
-        const response = await rpcReq<Array<Record<string, unknown>>>(
-          observerWs,
-          "system-presence",
-          {},
-        );
-        return response.payload?.find((entry) => entry.instanceId === instanceId)?.watchedSessions;
-      };
+    const observerConnId = getConnId(await connectOk(observerWs, { scopes: ["operator.read"] }));
+    await connectOk(watchedWs, {
+      scopes: ["operator.read"],
+      client: {
+        id: GATEWAY_CLIENT_IDS.TEST,
+        version: "1.0.0",
+        platform: "test",
+        mode: GATEWAY_CLIENT_MODES.TEST,
+        instanceId,
+      },
+    });
+    const keys = ["agent:main:watch-00", "agent:main:watch-01"];
+    await createSessionStore(Object.fromEntries(keys.map((key) => [key, { sessionId: key }])));
+    const findWatched = (message: unknown) => findWatchedPresenceEntry(message, instanceId);
+    const declared = onceMessage(
+      observerWs,
+      (message) => JSON.stringify(findWatched(message)?.watchedSessions) === JSON.stringify(keys),
+    );
+    await rpcReq(watchedWs, "sessions.viewers.set", { sessionKeys: keys });
+    const declaration = await declared;
+    const watched = findWatched(declaration);
+    const readWatched = async () => {
+      const response = await rpcReq(observerWs, "system-presence", {});
+      const payload: unknown = response.payload;
+      const entries: unknown[] = Array.isArray(payload) ? payload : [];
+      return asOptionalRecord(
+        entries.find((entry) => asOptionalRecord(entry)?.instanceId === instanceId),
+      )?.watchedSessions;
+    };
 
-      for (const key of ["agent:main:narration-0", "agent:main:narration-1"]) {
-        expect((await rpcReq(watchedWs, "sessions.messages.subscribe", { key })).ok).toBe(true);
-      }
-      expect(await readWatched()).toEqual(keys);
-      expect((await rpcReq(watchedWs, "sessions.messages.unsubscribe", { key: "" })).ok).toBe(
-        false,
-      );
-      expect(await readWatched()).toEqual(keys);
-
-      const disconnected = onceMessage(
-        observerWs,
-        (message) =>
-          message.type === "event" &&
-          message.event === "presence" &&
-          findWatched(message) === undefined,
-      );
-      watchedWs.close();
-      const event = await disconnected;
-      expect(requireRecord(event.payload, "presence payload").presence).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            connectionId: observerConnId,
-            deviceId: watched?.deviceId,
-            reason: "connect",
-          }),
-        ]),
-      );
-      expect(event.stateVersion?.presence).toBeGreaterThan(declaration.stateVersion?.presence ?? 0);
-    } finally {
-      observerWs.close();
-      watchedWs.close();
+    for (const key of ["agent:main:narration-0", "agent:main:narration-1"]) {
+      expect((await rpcReq(watchedWs, "sessions.messages.subscribe", { key })).ok).toBe(true);
     }
+    expect(await readWatched()).toEqual(keys);
+    expect((await rpcReq(watchedWs, "sessions.messages.unsubscribe", { key: "" })).ok).toBe(false);
+    expect(await readWatched()).toEqual(keys);
+
+    const disconnected = onceMessage(
+      observerWs,
+      (message) =>
+        message.type === "event" &&
+        message.event === "presence" &&
+        findWatched(message) === undefined,
+    );
+    watchedWs.close();
+    const event = await disconnected;
+    expect(requireRecord(event.payload, "presence payload").presence).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          connectionId: observerConnId,
+          deviceId: watched?.deviceId,
+          reason: "connect",
+        }),
+      ]),
+    );
+    expect(event.stateVersion?.presence).toBeGreaterThan(declaration.stateVersion?.presence ?? 0);
   });
 
   test("enforces session-scoped chat delivery on real gateway connections", async () => {
@@ -350,14 +355,14 @@ describe("session.message websocket events", () => {
       other: { sessionId: "sess-other" },
     });
     const copilotIdentityPath = sessionClientCredentialPath(storePath, "copilot-device");
-    const unpairedWs = await harness.openWs({ origin: copilotOrigin });
-    const pairingWs = await harness.openWs({ origin: copilotOrigin });
-    const wrongOriginWs = await harness.openWs({
+    using unpairedWs = await openTestSocket({ origin: copilotOrigin });
+    using pairingWs = await openTestSocket({ origin: copilotOrigin });
+    using wrongOriginWs = await openTestSocket({
       origin: "chrome-extension://bcdefghijklmnopabcdefghijklmnopa",
     });
-    const mainWs = await harness.openWs({ origin: copilotOrigin });
-    const otherWs = await harness.openWs();
-    const legacyWs = await harness.openWs();
+    using mainWs = await openTestSocket({ origin: copilotOrigin });
+    using otherWs = await openTestSocket();
+    using legacyWs = await openTestSocket();
     let otherReceived = false;
     const observeOtherChat = (data: RawData) => {
       const message = requireRecord(JSON.parse(rawDataToString(data)), "gateway message");
@@ -435,12 +440,6 @@ describe("session.message websocket events", () => {
       expect(otherReceived).toBe(false);
     } finally {
       otherWs.off("message", observeOtherChat);
-      unpairedWs.close();
-      pairingWs.close();
-      wrongOriginWs.close();
-      mainWs.close();
-      otherWs.close();
-      legacyWs.close();
     }
   });
 
@@ -448,103 +447,93 @@ describe("session.message websocket events", () => {
     const storePath = await createSessionStoreFile();
     const identityPath = sessionClientCredentialPath(storePath, "other-client-device");
     const copilotIdentityPath = sessionClientCredentialPath(storePath, "copilot-paired-device");
-    const controlWs = await harness.openWs({ origin: `http://127.0.0.1:${harness.port}` });
-    const copilotWs = await harness.openWs({
+    using controlWs = await openTestSocket({ origin: `http://127.0.0.1:${harness.port}` });
+    using copilotWs = await openTestSocket({
       origin: copilotOrigin,
     });
-    const pairingWs = await harness.openWs({
+    using pairingWs = await openTestSocket({
       origin: copilotOrigin,
     });
-    const downgradeWs = await harness.openWs();
-    const wrongModeWs = await harness.openWs({
+    using downgradeWs = await openTestSocket();
+    using wrongModeWs = await openTestSocket({
       origin: copilotOrigin,
     });
-    const webOriginWs = await harness.openWs({ origin: `http://127.0.0.1:${harness.port}` });
-    const missingCapsWs = await harness.openWs({
+    using webOriginWs = await openTestSocket({ origin: `http://127.0.0.1:${harness.port}` });
+    using missingCapsWs = await openTestSocket({
       origin: copilotOrigin,
     });
-    try {
-      const wrongMode = await connectReq(wrongModeWs, {
-        ...copilotOptions,
-        prePairDevice: false,
-        client: {
-          ...copilotClient,
-          id: GATEWAY_CLIENT_IDS.BROWSER_COPILOT,
-          mode: GATEWAY_CLIENT_MODES.WEBCHAT,
-        },
-        deviceIdentityPath: sessionClientCredentialPath(storePath, "wrong-mode-device"),
-      });
-      expect(wrongMode.ok).toBe(false);
-      expect(wrongMode.error?.message).toContain("requires ui mode");
-      wrongModeWs.close();
+    const wrongMode = await connectReq(wrongModeWs, {
+      ...copilotOptions,
+      prePairDevice: false,
+      client: {
+        ...copilotClient,
+        id: GATEWAY_CLIENT_IDS.BROWSER_COPILOT,
+        mode: GATEWAY_CLIENT_MODES.WEBCHAT,
+      },
+      deviceIdentityPath: sessionClientCredentialPath(storePath, "wrong-mode-device"),
+    });
+    expect(wrongMode.ok).toBe(false);
+    expect(wrongMode.error?.message).toContain("requires ui mode");
+    wrongModeWs.close();
 
-      const missingCaps = await connectReq(missingCapsWs, {
-        ...copilotOptions,
-        caps: [GATEWAY_CLIENT_CAPS.RUN_TOOL_BINDINGS],
-        deviceIdentityPath: sessionClientCredentialPath(storePath, "missing-caps-device"),
-        prePairDevice: false,
-        scopes: ["operator.read", "operator.write"],
-      });
-      expect(missingCaps.ok).toBe(false);
-      expect(missingCaps.error?.message).toContain("session-scoped-events");
-      missingCapsWs.close();
+    const missingCaps = await connectReq(missingCapsWs, {
+      ...copilotOptions,
+      caps: [GATEWAY_CLIENT_CAPS.RUN_TOOL_BINDINGS],
+      deviceIdentityPath: sessionClientCredentialPath(storePath, "missing-caps-device"),
+      prePairDevice: false,
+      scopes: ["operator.read", "operator.write"],
+    });
+    expect(missingCaps.ok).toBe(false);
+    expect(missingCaps.error?.message).toContain("session-scoped-events");
+    missingCapsWs.close();
 
-      const webOrigin = await connectReq(webOriginWs, {
-        ...copilotOptions,
-        prePairDevice: false,
-        deviceIdentityPath: sessionClientCredentialPath(storePath, "web-origin-device"),
-      });
-      expect(webOrigin.ok).toBe(false);
-      expect(webOrigin.error?.message).toContain("canonical Chrome extension origin");
-      webOriginWs.close();
+    const webOrigin = await connectReq(webOriginWs, {
+      ...copilotOptions,
+      prePairDevice: false,
+      deviceIdentityPath: sessionClientCredentialPath(storePath, "web-origin-device"),
+    });
+    expect(webOrigin.ok).toBe(false);
+    expect(webOrigin.error?.message).toContain("canonical Chrome extension origin");
+    webOriginWs.close();
 
-      await connectOk(controlWs, {
-        client: { ...copilotClient, id: GATEWAY_CLIENT_IDS.CONTROL_UI },
-        deviceIdentityPath: identityPath,
-        prePairDevice: true,
-        scopes: ["operator.read", "operator.write"],
-      });
-      controlWs.close();
+    await connectOk(controlWs, {
+      client: { ...copilotClient, id: GATEWAY_CLIENT_IDS.CONTROL_UI },
+      deviceIdentityPath: identityPath,
+      prePairDevice: true,
+      scopes: ["operator.read", "operator.write"],
+    });
+    controlWs.close();
 
-      const response = await connectReq(copilotWs, {
-        ...copilotOptions,
-        prePairDevice: false,
-        deviceIdentityPath: identityPath,
-      });
-      expect(response.ok).toBe(false);
-      expect(response.error?.code).toBe("NOT_PAIRED");
-      expect(response.error?.message).toContain("dedicated paired device identity");
+    const response = await connectReq(copilotWs, {
+      ...copilotOptions,
+      prePairDevice: false,
+      deviceIdentityPath: identityPath,
+    });
+    expect(response.ok).toBe(false);
+    expect(response.error?.code).toBe("NOT_PAIRED");
+    expect(response.error?.message).toContain("dedicated paired device identity");
 
-      await connectOk(pairingWs, {
-        ...copilotOptions,
-        deviceIdentityPath: copilotIdentityPath,
-        prePairDevice: true,
-        browserOrigin: copilotOrigin,
-      });
-      pairingWs.close();
+    await connectOk(pairingWs, {
+      ...copilotOptions,
+      deviceIdentityPath: copilotIdentityPath,
+      prePairDevice: true,
+      browserOrigin: copilotOrigin,
+    });
+    pairingWs.close();
 
-      const downgrade = await connectReq(downgradeWs, {
-        client: {
-          ...copilotClient,
-          id: GATEWAY_CLIENT_IDS.TEST,
-          mode: GATEWAY_CLIENT_MODES.TEST,
-        },
-        deviceIdentityPath: copilotIdentityPath,
-        prePairDevice: false,
-        scopes: ["operator.read", "operator.write"],
-      });
-      expect(downgrade.ok).toBe(false);
-      expect(downgrade.error?.code).toBe("NOT_PAIRED");
-      expect(downgrade.error?.message).toContain("dedicated paired device identity");
-    } finally {
-      controlWs.close();
-      copilotWs.close();
-      pairingWs.close();
-      downgradeWs.close();
-      wrongModeWs.close();
-      webOriginWs.close();
-      missingCapsWs.close();
-    }
+    const downgrade = await connectReq(downgradeWs, {
+      client: {
+        ...copilotClient,
+        id: GATEWAY_CLIENT_IDS.TEST,
+        mode: GATEWAY_CLIENT_MODES.TEST,
+      },
+      deviceIdentityPath: copilotIdentityPath,
+      prePairDevice: false,
+      scopes: ["operator.read", "operator.write"],
+    });
+    expect(downgrade.ok).toBe(false);
+    expect(downgrade.error?.code).toBe("NOT_PAIRED");
+    expect(downgrade.error?.message).toContain("dedicated paired device identity");
   });
 
   registerRecoveredSubagentSessionEventTest({
@@ -557,67 +546,61 @@ describe("session.message websocket events", () => {
   test("only sends transcript events to subscribed operator clients", async () => {
     const storePath = await createMainSessionStore();
 
-    const subscribedWs = await harness.openWs();
-    const unsubscribedWs = await harness.openWs();
-    const nodeWs = await harness.openWs();
-    try {
-      await connectOk(subscribedWs, { scopes: ["operator.read"] });
-      await rpcReq(subscribedWs, "sessions.subscribe");
-      await connectOk(unsubscribedWs, { scopes: ["operator.read"] });
-      await connectOk(nodeWs, { role: "node", scopes: [] });
+    using subscribedWs = await openTestSocket();
+    using unsubscribedWs = await openTestSocket();
+    using nodeWs = await openTestSocket();
+    await connectOk(subscribedWs, { scopes: ["operator.read"] });
+    await rpcReq(subscribedWs, "sessions.subscribe");
+    await connectOk(unsubscribedWs, { scopes: ["operator.read"] });
+    await connectOk(nodeWs, { role: "node", scopes: [] });
 
-      const subscribedEvent = waitForSessionMessageEvent(subscribedWs, "agent:main:main");
-      const appended = await appendAssistantMessageToSessionTranscript({
-        sessionKey: "agent:main:main",
-        text: "subscribed only",
-        storePath,
-      });
-      expect(appended.ok).toBe(true);
-      if (!appended.ok) {
-        throw new Error(`append failed: ${appended.reason}`);
-      }
-      const event = await subscribedEvent;
-      expectRecordFields(event, {
-        type: "event",
-        event: "session.message",
-      });
-      expectRecordFields(event.payload, {
+    const subscribedEvent = waitForSessionMessageEvent(subscribedWs, "agent:main:main");
+    const appended = await appendAssistantMessageToSessionTranscript({
+      sessionKey: "agent:main:main",
+      text: "subscribed only",
+      storePath,
+    });
+    expect(appended.ok).toBe(true);
+    if (!appended.ok) {
+      throw new Error(`append failed: ${appended.reason}`);
+    }
+    const event = await subscribedEvent;
+    expectRecordFields(event, {
+      type: "event",
+      event: "session.message",
+    });
+    expectRecordFields(event.payload, {
+      agentId: "main",
+      sessionId: "sess-main",
+      sessionKey: "agent:main:main",
+      messageId: appended.messageId,
+    });
+    expectRecordFields(requireRecord(event.payload, "payload").message, {
+      role: "assistant",
+      content: [{ type: "text", text: "subscribed only" }],
+    });
+    await expect(
+      loadTranscriptEvents({
         agentId: "main",
         sessionId: "sess-main",
         sessionKey: "agent:main:main",
-        messageId: appended.messageId,
-      });
-      expectRecordFields(requireRecord(event.payload, "payload").message, {
-        role: "assistant",
-        content: [{ type: "text", text: "subscribed only" }],
-      });
-      await expect(
-        loadTranscriptEvents({
-          agentId: "main",
-          sessionId: "sess-main",
-          sessionKey: "agent:main:main",
-          storePath,
+        storePath,
+      }),
+    ).resolves.toContainEqual(
+      expect.objectContaining({
+        type: "message",
+        message: expect.objectContaining({
+          content: [{ type: "text", text: "subscribed only" }],
         }),
-      ).resolves.toContainEqual(
-        expect.objectContaining({
-          type: "message",
-          message: expect.objectContaining({
-            content: [{ type: "text", text: "subscribed only" }],
-          }),
-        }),
-      );
-      await expectNoMessageWithin({
-        watch: (timeoutMs) =>
-          onceMessage(unsubscribedWs, matchingEvent("session.message"), timeoutMs),
-      });
-      await expectNoMessageWithin({
-        watch: (timeoutMs) => onceMessage(nodeWs, matchingEvent("session.message"), timeoutMs),
-      });
-    } finally {
-      subscribedWs.close();
-      unsubscribedWs.close();
-      nodeWs.close();
-    }
+      }),
+    );
+    await expectNoMessageWithin({
+      watch: (timeoutMs) =>
+        onceMessage(unsubscribedWs, matchingEvent("session.message"), timeoutMs),
+    });
+    await expectNoMessageWithin({
+      watch: (timeoutMs) => onceMessage(nodeWs, matchingEvent("session.message"), timeoutMs),
+    });
   });
 
   registerCronSessionCompletionEventTests({
@@ -650,73 +633,67 @@ describe("session.message websocket events", () => {
       }
     })();
     using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog()).release };
-    const ws = await harness.openWs();
-    try {
-      await connectOk(ws, {
-        caps: [GATEWAY_CLIENT_CAPS.SESSION_SCOPED_EVENTS],
-        scopes: ["operator.read"],
+    using ws = await openTestSocket();
+    await connectOk(ws, {
+      caps: [GATEWAY_CLIENT_CAPS.SESSION_SCOPED_EVENTS],
+      scopes: ["operator.read"],
+    });
+    await subscribeMessages(ws, sessionKey);
+    const avatar = (message: unknown) =>
+      requireRecord(requireRecord(message, "message")["__openclaw"], "sender metadata")
+        .senderProfileAvatarUrl;
+    const checkReads = async (messageId: string, expected: string) => {
+      const history = await rpcReq<{ messages?: unknown[] }>(ws, "chat.history", { sessionKey });
+      const direct = await rpcReq<{ ok?: boolean; message?: unknown }>(ws, "chat.message.get", {
+        sessionKey,
+        messageId,
       });
-      expect((await rpcReq(ws, "sessions.messages.subscribe", { key: sessionKey })).ok).toBe(true);
-      const avatar = (message: unknown) =>
-        requireRecord(requireRecord(message, "message")["__openclaw"], "sender metadata")
-          .senderProfileAvatarUrl;
-      const checkReads = async (messageId: string, expected: string) => {
-        const history = await rpcReq<{ messages?: unknown[] }>(ws, "chat.history", { sessionKey });
-        const direct = await rpcReq<{ ok?: boolean; message?: unknown }>(ws, "chat.message.get", {
-          sessionKey,
+      expect(history.ok).toBe(true);
+      expect(direct).toMatchObject({ ok: true, payload: { ok: true } });
+      const row = history.payload?.messages?.find(
+        (message) =>
+          requireRecord(requireRecord(message, "history row")["__openclaw"], "metadata").id ===
           messageId,
-        });
-        expect(history.ok).toBe(true);
-        expect(direct).toMatchObject({ ok: true, payload: { ok: true } });
-        const row = history.payload?.messages?.find(
-          (message) =>
-            requireRecord(requireRecord(message, "history row")["__openclaw"], "metadata").id ===
-            messageId,
-        );
-        expect([avatar(row), avatar(direct.payload?.message)]).toEqual([expected, expected]);
-      };
-      let previousAvatar: string | undefined;
-      let previousMessageId: string | undefined;
-      for (const [index, bytes] of [
-        [1, 2, 3],
-        [4, 5, 6],
-      ].entries()) {
-        withMockedDateNow(1_800_000_000_000, () => {
-          expect(setAvatar(profile.id, new Uint8Array(bytes), "image/png").ok).toBe(true);
-        });
-        const currentAvatar = currentProfileAvatarUrl(profile.id);
-        expect(currentAvatar).not.toBe(previousAvatar);
-        const delivered = waitForSessionMessageEvent(ws, sessionKey);
-        const persisted = await persistUserTurnTranscript({
-          agentId: "main",
-          sessionEntry,
-          sessionId,
-          sessionKey,
-          storePath,
-          input: {
-            idempotencyKey: `current-profile-display:${index}`,
-            sender: {
-              id: profile.id,
-              identity: { type: "profile", id: profile.id },
-              name: "Ada",
-              username: "ada",
-            },
-            text: `attributed turn ${index}`,
+      );
+      expect([avatar(row), avatar(direct.payload?.message)]).toEqual([expected, expected]);
+    };
+    let previousAvatar: string | undefined;
+    let previousMessageId: string | undefined;
+    for (const [index, bytes] of [
+      [1, 2, 3],
+      [4, 5, 6],
+    ].entries()) {
+      withMockedDateNow(1_800_000_000_000, () => {
+        expect(setAvatar(profile.id, new Uint8Array(bytes), "image/png").ok).toBe(true);
+      });
+      const currentAvatar = currentProfileAvatarUrl(profile.id);
+      expect(currentAvatar).not.toBe(previousAvatar);
+      const delivered = waitForSessionMessageEvent(ws, sessionKey);
+      const persisted = await persistUserTurnTranscript({
+        agentId: "main",
+        sessionEntry,
+        sessionId,
+        sessionKey,
+        storePath,
+        input: {
+          idempotencyKey: `current-profile-display:${index}`,
+          sender: {
+            id: profile.id,
+            identity: { type: "profile", id: profile.id },
+            name: "Ada",
+            username: "ada",
           },
-        });
-        expect(persisted).toBeDefined();
-        expect(avatar(requireRecord((await delivered).payload, "event").message)).toBe(
-          currentAvatar,
-        );
-        await checkReads(persisted!.messageId, currentAvatar);
-        if (previousMessageId) {
-          await checkReads(previousMessageId, currentAvatar);
-        }
-        previousAvatar = currentAvatar;
-        previousMessageId = persisted!.messageId;
+          text: `attributed turn ${index}`,
+        },
+      });
+      expect(persisted).toBeDefined();
+      expect(avatar(requireRecord((await delivered).payload, "event").message)).toBe(currentAvatar);
+      await checkReads(persisted!.messageId, currentAvatar);
+      if (previousMessageId) {
+        await checkReads(previousMessageId, currentAvatar);
       }
-    } finally {
-      ws.close();
+      previousAvatar = currentAvatar;
+      previousMessageId = persisted!.messageId;
     }
   });
 
@@ -737,111 +714,94 @@ describe("session.message websocket events", () => {
     );
     expect(seeded.messages.filter((m) => m.appended)).toHaveLength(1);
 
-    const webWs = await harness.openWs({ origin: `http://127.0.0.1:${harness.port}` });
-    const tuiWs = await harness.openWs();
+    using webWs = await openTestSocket({ origin: `http://127.0.0.1:${harness.port}` });
+    using tuiWs = await openTestSocket();
     const committedMessages = [
       { id: "committed-web-turn", text: "The same prompt from either client." },
       { id: "committed-tui-turn", text: "The same prompt from either client." },
       { id: "committed-final-turn", text: "The third message in the same transaction." },
     ];
 
-    try {
-      await connectSessionClient(webWs, storePath, "committed-web-device", "web");
-      await connectSessionClient(tuiWs, storePath, "committed-tui-device", "tui");
-      for (const ws of [webWs, tuiWs]) {
-        const subscription = await rpcReq(ws, "sessions.messages.subscribe", {
-          key: sessionKey,
-        });
-        expect(subscription.ok).toBe(true);
-      }
-
-      using webEvents = collectEventPayloads(webWs, "session.message", { sessionKey });
-      using tuiEvents = collectEventPayloads(tuiWs, "session.message", { sessionKey });
-      const observedByClient = [webEvents.messages, tuiEvents.messages];
-      const position = (payload: Record<string, unknown>) => ({
-        messageId: payload.messageId,
-        messageSeq: payload.messageSeq,
-        sessionKey: payload.sessionKey,
-      });
-
-      // Install every real socket listener before the one SQLite commit can broadcast.
-      const deliveriesByClient = [webWs, tuiWs].map((ws) =>
-        committedMessages.map(({ id }) =>
-          onceMessage(ws, matchingEvent("session.message", { messageId: id })),
-        ),
-      );
-      const committedTurn = {
-        messages: committedMessages.map(({ id, text }, index) =>
-          userTurn(id, text, 1_700_000_000_000 + index),
-        ),
-      };
-      const persisted = await persistSessionTranscriptTurn(
-        { agentId: "main", sessionId, sessionKey, storePath },
-        committedTurn,
-      );
-      expect(persisted.messages.filter((m) => m.appended)).toHaveLength(committedMessages.length);
-
-      for (const [clientIndex, clientDeliveries] of deliveriesByClient.entries()) {
-        const frames = await Promise.all(clientDeliveries);
-        expect(observedByClient[clientIndex]?.map(position)).toEqual(
-          committedMessages.map(({ id }, index) => ({
-            messageId: id,
-            messageSeq: index + 2,
-            sessionKey,
-          })),
-        );
-        expect(
-          frames.map((frame) => position(requireRecord(frame.payload, "committed session event"))),
-        ).toEqual(
-          committedMessages.map(({ id }, index) => ({
-            messageId: id,
-            messageSeq: index + 2,
-            sessionKey,
-          })),
-        );
-        for (const [index, frame] of frames.entries()) {
-          const expected = committedMessages[index];
-          if (!expected) {
-            throw new Error(`unexpected committed-turn delivery at index ${index}`);
-          }
-          expect(requireRecord(frame.payload, "committed session event").message).toMatchObject(
-            expectedUserMessage(expected.id, expected.text, index + 2),
-          );
-        }
-      }
-
-      const reconnectedTuiWs = await harness.openWs();
-      const history = await (async () => {
-        try {
-          await connectOk(reconnectedTuiWs, { scopes: ["operator.read"] });
-          return await rpcReq(reconnectedTuiWs, "chat.history", { sessionKey });
-        } finally {
-          reconnectedTuiWs.close();
-        }
-      })();
-      expect(history.ok).toBe(true);
-      expect((history.payload as { messages?: unknown[] }).messages).toMatchObject(
-        [earlierMessage, ...committedMessages].map(({ id, text }, index) =>
-          expectedUserMessage(id, text, index + 1),
-        ),
-      );
-
-      const duplicateDeliveries = [webWs, tuiWs].map((ws) =>
-        onceMessage(ws, matchingEvent("session.message", { sessionKey }), 300).then(
-          () => true,
-          () => false,
-        ),
-      );
-      const replayed = await persistSessionTranscriptTurn(
-        { agentId: "main", sessionId, sessionKey, storePath },
-        committedTurn,
-      );
-      expect(replayed.messages.filter((m) => m.appended)).toHaveLength(0);
-      await expect(Promise.all(duplicateDeliveries)).resolves.toEqual([false, false]);
-    } finally {
-      webWs.close();
-      tuiWs.close();
+    await connectSessionClient(webWs, storePath, "committed-web-device", "web");
+    await connectSessionClient(tuiWs, storePath, "committed-tui-device", "tui");
+    for (const ws of [webWs, tuiWs]) {
+      await subscribeMessages(ws, sessionKey);
     }
+
+    using webEvents = collectEventPayloads(webWs, "session.message", { sessionKey });
+    using tuiEvents = collectEventPayloads(tuiWs, "session.message", { sessionKey });
+    const observedByClient = [webEvents.messages, tuiEvents.messages];
+    const position = (payload: Record<string, unknown>) => ({
+      messageId: payload.messageId,
+      messageSeq: payload.messageSeq,
+      sessionKey: payload.sessionKey,
+    });
+
+    // Install every real socket listener before the one SQLite commit can broadcast.
+    const deliveriesByClient = [webWs, tuiWs].map((ws) =>
+      committedMessages.map(({ id }) =>
+        onceMessage(ws, matchingEvent("session.message", { messageId: id })),
+      ),
+    );
+    const committedTurn = {
+      messages: committedMessages.map(({ id, text }, index) =>
+        userTurn(id, text, 1_700_000_000_000 + index),
+      ),
+    };
+    const persisted = await persistSessionTranscriptTurn(
+      { agentId: "main", sessionId, sessionKey, storePath },
+      committedTurn,
+    );
+    expect(persisted.messages.filter((m) => m.appended)).toHaveLength(committedMessages.length);
+
+    for (const [clientIndex, clientDeliveries] of deliveriesByClient.entries()) {
+      const frames = await Promise.all(clientDeliveries);
+      expect(observedByClient[clientIndex]?.map(position)).toEqual(
+        committedMessages.map(({ id }, index) => ({
+          messageId: id,
+          messageSeq: index + 2,
+          sessionKey,
+        })),
+      );
+      for (const [index, frame] of frames.entries()) {
+        const expected = committedMessages[index];
+        if (!expected) {
+          throw new Error(`unexpected committed-turn delivery at index ${index}`);
+        }
+        expect(requireRecord(frame.payload, "committed session event").message).toMatchObject(
+          expectedUserMessage(expected.id, expected.text, index + 2),
+        );
+      }
+    }
+
+    using reconnectedTuiWs = await openTestSocket();
+    const history = await (async () => {
+      try {
+        await connectOk(reconnectedTuiWs, { scopes: ["operator.read"] });
+        return await rpcReq(reconnectedTuiWs, "chat.history", { sessionKey });
+      } finally {
+        reconnectedTuiWs.close();
+      }
+    })();
+    expect(history.ok).toBe(true);
+    expect((history.payload as { messages?: unknown[] }).messages).toMatchObject(
+      [earlierMessage, ...committedMessages].map(({ id, text }, index) =>
+        expectedUserMessage(id, text, index + 1),
+      ),
+    );
+
+    const duplicateDeliveries = [webWs, tuiWs].map((ws) =>
+      onceMessage(ws, matchingEvent("session.message", { sessionKey }), 300).then(
+        () => true,
+        () => false,
+      ),
+    );
+    const replayed = await persistSessionTranscriptTurn(
+      { agentId: "main", sessionId, sessionKey, storePath },
+      committedTurn,
+    );
+    expect(replayed.messages.filter((m) => m.appended)).toHaveLength(0);
+    await expect(Promise.all(duplicateDeliveries)).resolves.toEqual([false, false]);
   });
 
   test("forwards blocked placeholders without requiring a transcript file", async () => {
@@ -914,8 +874,8 @@ describe("session.message websocket events", () => {
     testState.agentsConfig = { ownership: "explicit", entries: { main: {}, work: {} } };
     testState.agentConfig = { sessionStore: { agentId: "work" } };
     await createSessionStore({ global: { sessionId: "sess-work-observer" } }, "work");
-    const workWs = await harness.openWs();
-    const mainWs = await harness.openWs();
+    using workWs = await openTestSocket();
+    using mainWs = await openTestSocket();
     const runId = "run-work-global-observer";
     using workEvents = collectEventPayloads(workWs, "session.observer");
     using mainEvents = collectEventPayloads(mainWs, "session.observer");
@@ -964,8 +924,6 @@ describe("session.message websocket events", () => {
       expect(workEvents.messages).toHaveLength(1);
       expect(mainEvents.messages).toHaveLength(0);
     } finally {
-      workWs.close();
-      mainWs.close();
       testState.agentsConfig = undefined;
       testState.agentConfig = undefined;
       testState.sessionStorePath = undefined;
@@ -1009,59 +967,50 @@ describe("session.message websocket events", () => {
       main: { sessionId: "sess-main" },
       worker: { sessionId: "sess-worker" },
     });
-    const ws = await harness.openWs();
-    try {
-      await connectOk(ws, { scopes: ["operator.read"] });
-      const subscribeRes = await rpcReq(ws, "sessions.messages.subscribe", {
-        key: "agent:main:main",
-      });
-      expect(subscribeRes.ok).toBe(true);
-      expect(subscribeRes.payload?.subscribed).toBe(true);
-      expect(subscribeRes.payload?.key).toBe("agent:main:main");
+    using ws = await openTestSocket();
+    await connectOk(ws, { scopes: ["operator.read"] });
+    await subscribeMessages(ws, "agent:main:main");
 
-      const mainEvent = waitForSessionMessageEvent(ws, "agent:main:main");
-      const [mainAppend] = await Promise.all([
-        appendAssistantMessageToSessionTranscript({
-          sessionKey: "agent:main:main",
-          text: "main only",
+    const mainEvent = waitForSessionMessageEvent(ws, "agent:main:main");
+    const [mainAppend] = await Promise.all([
+      appendAssistantMessageToSessionTranscript({
+        sessionKey: "agent:main:main",
+        text: "main only",
+        storePath,
+      }),
+      mainEvent,
+    ]);
+    expect(mainAppend.ok).toBe(true);
+
+    await expectNoMessageWithin({
+      watch: (timeoutMs) => waitForSessionMessageEvent(ws, "agent:main:worker", timeoutMs),
+      action: async () => {
+        const workerAppend = await appendAssistantMessageToSessionTranscript({
+          sessionKey: "agent:main:worker",
+          text: "worker hidden",
           storePath,
-        }),
-        mainEvent,
-      ]);
-      expect(mainAppend.ok).toBe(true);
+        });
+        expect(workerAppend.ok).toBe(true);
+      },
+    });
 
-      await expectNoMessageWithin({
-        watch: (timeoutMs) => waitForSessionMessageEvent(ws, "agent:main:worker", timeoutMs),
-        action: async () => {
-          const workerAppend = await appendAssistantMessageToSessionTranscript({
-            sessionKey: "agent:main:worker",
-            text: "worker hidden",
-            storePath,
-          });
-          expect(workerAppend.ok).toBe(true);
-        },
-      });
+    const unsubscribeRes = await rpcReq(ws, "sessions.messages.unsubscribe", {
+      key: "agent:main:main",
+    });
+    expect(unsubscribeRes.ok).toBe(true);
+    expect(unsubscribeRes.payload?.subscribed).toBe(false);
 
-      const unsubscribeRes = await rpcReq(ws, "sessions.messages.unsubscribe", {
-        key: "agent:main:main",
-      });
-      expect(unsubscribeRes.ok).toBe(true);
-      expect(unsubscribeRes.payload?.subscribed).toBe(false);
-
-      await expectNoMessageWithin({
-        watch: (timeoutMs) => waitForSessionMessageEvent(ws, "agent:main:main", timeoutMs),
-        action: async () => {
-          const hiddenAppend = await appendAssistantMessageToSessionTranscript({
-            sessionKey: "agent:main:main",
-            text: "hidden after unsubscribe",
-            storePath,
-          });
-          expect(hiddenAppend.ok).toBe(true);
-        },
-      });
-    } finally {
-      ws.close();
-    }
+    await expectNoMessageWithin({
+      watch: (timeoutMs) => waitForSessionMessageEvent(ws, "agent:main:main", timeoutMs),
+      action: async () => {
+        const hiddenAppend = await appendAssistantMessageToSessionTranscript({
+          sessionKey: "agent:main:main",
+          text: "hidden after unsubscribe",
+          storePath,
+        });
+        expect(hiddenAppend.ok).toBe(true);
+      },
+    });
   });
 
   test("streams worker commits and local-equivalent live events to the selected session", async () => {
@@ -1074,14 +1023,11 @@ describe("session.message websocket events", () => {
         sessionId,
         sessionKey,
       });
-    const ws = await harness.openWs();
+    using ws = await openTestSocket();
     using workerChats = collectEventPayloads(ws, "chat", { runId: "worker" });
     try {
       await connectOk(ws, { scopes: ["operator.read"] });
-      const subscribeRes = await rpcReq(ws, "sessions.messages.subscribe", { key: sessionKey });
-      expect(subscribeRes.ok).toBe(true);
-      expect(subscribeRes.payload?.subscribed).toBe(true);
-      expect(subscribeRes.payload?.key).toBe(sessionKey);
+      await subscribeMessages(ws, sessionKey);
 
       const eventPromises = [1, 2, 3].map((messageSeq) =>
         onceMessage(ws, matchingEvent("session.message", { sessionKey, messageSeq })),
@@ -1112,20 +1058,13 @@ describe("session.message websocket events", () => {
       const payloads = events.map((event) =>
         requireRecord(event.payload, "session.message payload"),
       );
-      expect(payloads.map((payload) => payload.messageId)).toEqual(outcome.result.entryIds);
-      expect(payloads.map((payload) => payload.messageSeq)).toEqual([1, 2, 3]);
       expect(
         payloads.map((payload) => {
-          const message = requireRecord(payload.message, "session.message payload message");
-          return requireRecord(message["__openclaw"], "session.message metadata").id;
+          const message = requireRecord(payload.message, "message");
+          const metadata = requireRecord(message["__openclaw"], "metadata");
+          return [payload.messageId, payload.messageSeq, metadata.id, metadata.seq];
         }),
-      ).toEqual(outcome.result.entryIds);
-      expect(
-        payloads.map((payload) => {
-          const message = requireRecord(payload.message, "session.message payload message");
-          return requireRecord(message["__openclaw"], "session.message metadata").seq;
-        }),
-      ).toEqual([1, 2, 3]);
+      ).toEqual(outcome.result.entryIds.map((id, index) => [id, index + 1, id, index + 1]));
 
       const waitForChat = (runId: string, timeoutMs?: number) =>
         onceMessage(ws, matchingEvent("chat", { runId }), timeoutMs);
