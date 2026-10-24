@@ -33,11 +33,14 @@ const originalReaddir = fsPromises.readdir;
 let inspectionSpawns = 0;
 installProcfsFixture({
   open: (file, ...args) => originalOpen(mapped.get(file) ?? file, ...args),
-  readdir: (file, ...args) =>
+  readdir: (file, options) =>
     fixtureProcfs && file === "/proc"
       ? Promise.resolve([String(process.pid)])
-      : // oxlint-disable-next-line openclaw-boundaries/no-recursive-readdir -- Transparent procfs fixture adapter; preserve the observer caller options.
-        originalReaddir(file, ...args),
+      : originalReaddir(file, {
+          ...(typeof options === "string" ? { encoding: options } : options),
+          // Procfs observations enumerate one directory, never a recursive inventory.
+          recursive: false,
+        }),
   onSpawn: () => {
     inspectionSpawns += 1;
   },
