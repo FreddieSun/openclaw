@@ -80,6 +80,8 @@ numeric strings; spawn depth requires a nonnegative decimal integer. Unusable
 values remain available for offline repair or restoration. This uses the existing
 backed-up Doctor path and requires no schema-version change. Trusted internal
 projections and writes reuse admitted numeric fields without revalidating them.
+Doctor commits converted archive, activity, and run-timing query columns with the
+repaired JSON in the same transaction, preserving unrelated indexed facts.
 
 The pending table remains derived and stores no authority or copied payloads.
 Migration validates the prior schema, retires its validation triggers, queues all

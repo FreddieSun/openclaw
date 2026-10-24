@@ -37,7 +37,10 @@ import {
   rewriteDoctorSessionEntries,
   scanDoctorSessionEntryRecords,
 } from "./doctor/shared/session-entry-rewrite.js";
-import { migrateLegacySessionEntryState } from "./doctor/shared/session-entry-shape.js";
+import {
+  migrateLegacySessionEntryState,
+  type SessionEntryStateRepair,
+} from "./doctor/shared/session-entry-shape.js";
 
 export type SessionDeliveryStateRepairReport = ReturnType<typeof repairCanonicalSessionEntries>;
 
@@ -83,7 +86,7 @@ type PreparedSessionEntryRepairParams =
         entry: Record<string, unknown>,
         sessionKey: string,
         updatedAt: number,
-      ) => Record<string, unknown>;
+      ) => SessionEntryStateRepair;
       deferSchemaRepair?: boolean;
       deferToMediaPreparation?: boolean;
     });
@@ -246,12 +249,15 @@ export async function repairLegacySessionEntryStates(params: {
       rawNeedsRepair: needsLegacySessionEntryRepair,
       rawTransform: (entry, sessionKey, updatedAt) => {
         if (!needsLegacySessionEntryRepair(entry)) {
-          return entry;
+          return { entry };
         }
         const next = migrateLegacySessionEntryState(entry, updatedAt, sessionKey);
-        return hasLegacySessionProviderState(entry)
-          ? normalizeLegacySessionEntryDelivery(next)
-          : next;
+        return {
+          ...next,
+          entry: hasLegacySessionProviderState(entry)
+            ? normalizeLegacySessionEntryDelivery(next.entry)
+            : next.entry,
+        };
       },
       updateDeliveryProjection: true,
     });

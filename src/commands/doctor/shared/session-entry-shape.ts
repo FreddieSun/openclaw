@@ -9,7 +9,10 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { validateSessionId } from "../../../config/sessions/paths.js";
 import { isMainRestartRecoveryCandidate } from "../../../config/sessions/restart-recovery-state.js";
 import { admitCanonicalSessionEntry } from "../../../config/sessions/session-entry-json.js";
-import { SESSION_ENTRY_NUMERIC_FIELDS } from "../../../config/sessions/session-entry-numeric-snapshot.js";
+import {
+  SESSION_ENTRY_NUMERIC_FIELDS,
+  type SessionEntryNumericSnapshot,
+} from "../../../config/sessions/session-entry-numeric-snapshot.js";
 import {
   hasLegacySessionProviderState,
   LEGACY_SESSION_ENTRY_STATE_FIELDS,
@@ -24,6 +27,11 @@ import {
 } from "../../../config/sessions/store-entry-shape.js";
 import type { SessionEntry } from "../../../config/sessions/types.js";
 import { isIncognitoSessionKey, parseAgentSessionKey } from "../../../routing/session-key.js";
+
+export type SessionEntryStateRepair = {
+  entry: Record<string, unknown>;
+  numericChanges?: SessionEntryNumericSnapshot;
+};
 
 /** Doctor retires legacy activity while preserving the previous writer's completed yield. */
 export function migrateLegacySessionRunOutcome(
@@ -126,8 +134,9 @@ export function migrateLegacySessionEntryState(
   value: Record<string, unknown>,
   updatedAt: unknown = value.updatedAt,
   sessionKey?: string,
-): Record<string, unknown> {
+): SessionEntryStateRepair {
   const next = { ...value };
+  const numericChanges: SessionEntryNumericSnapshot = {};
   if (hasLegacySessionProviderState(value)) {
     for (const [legacy, current] of LEGACY_SESSION_PROVIDER_FIELDS) {
       if (typeof value[current] !== "string" && typeof value[legacy] === "string") {
@@ -195,9 +204,13 @@ export function migrateLegacySessionEntryState(
         : parseStrictFiniteNumber(candidate);
     if (number !== undefined) {
       next[field] = number;
+      numericChanges[field] = number;
     }
   }
-  return migrateLegacySessionRunOutcome(next, sessionKey, updatedAt);
+  return {
+    entry: migrateLegacySessionRunOutcome(next, sessionKey, updatedAt),
+    numericChanges,
+  };
 }
 
 // Persisted stores may contain old or malformed ids; reject path-like ids before use.
@@ -231,7 +244,7 @@ export function normalizePersistedSessionEntryShape(
 
   const modelSelectionLocked = value.modelSelectionLocked === true;
   let next = admitCanonicalSessionEntry(
-    migrateLegacySessionEntryState(value, value.updatedAt, options.sessionKey),
+    migrateLegacySessionEntryState(value, value.updatedAt, options.sessionKey).entry,
   );
   if (value.sessionId !== undefined) {
     if (!isSafeSessionId(value.sessionId)) {

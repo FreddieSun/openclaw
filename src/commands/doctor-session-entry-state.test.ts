@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { readSessionEntryCount } from "../config/sessions/session-accessor.sqlite-entry-inventory.js";
 import { loadExactSessionEntryReadOnly } from "../config/sessions/session-accessor.sqlite-exact-read.js";
 import * as nodeSqlite from "../infra/node-sqlite.js";
 import { createSessionSqliteMigrationRun } from "../infra/session-sqlite-migration-manifest.js";
@@ -98,6 +99,14 @@ it("backs up and repairs numeric-only legacy rows before canonical reads", async
     inputTokens: "32",
     runtimeMs: "0",
     estimatedCostUsd: "0.25",
+    createdAt: "10",
+    pinnedAt: "20",
+    archivedAt: "30",
+    lastReadAt: "40",
+    lastInteractionAt: "50",
+    lastActivityAt: "60",
+    startedAt: "70",
+    endedAt: "80",
     pluginExtensions: { example: { draft: { text: "retained draft" } } },
   });
   expect(await repair(false)).toEqual({ found: 1, repaired: 0, scannedStores: 1 });
@@ -117,6 +126,27 @@ it("backs up and repairs numeric-only legacy rows before canonical reads", async
     pluginExtensions: { example: { draft: { text: "retained draft" } } },
   });
   expect((entry?.spawnDepth ?? 0) + 1).toBe(3);
+  const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
+  expect(readSessionEntryCount(database, { includeArchived: false })).toBe(0);
+  expect(
+    database.db
+      .prepare(
+        "SELECT created_at, pinned_at, archived_at, last_read_at, last_interaction_at, last_activity_at FROM session_nodes WHERE session_key = ?",
+      )
+      .get(legacy.sessionKey),
+  ).toEqual({
+    created_at: 10,
+    pinned_at: 20,
+    archived_at: 30,
+    last_read_at: 40,
+    last_interaction_at: 50,
+    last_activity_at: 60,
+  });
+  expect(
+    database.db
+      .prepare("SELECT started_at, ended_at FROM session_windows WHERE session_key = ?")
+      .get(legacy.sessionKey),
+  ).toEqual({ started_at: 70, ended_at: 80 });
 
   const backups = fs
     .readdirSync(path.dirname(legacy.databasePath))
@@ -620,8 +650,10 @@ it.each(["preparation", "native open"] as const)(
         sessionKeys: [legacy.sessionKey],
         expectedIdentity,
         rawTransform: (entry) => ({
-          ...entry,
-          pendingFinalDelivery: { kind: "transport-only", createdAt: 42 },
+          entry: {
+            ...entry,
+            pendingFinalDelivery: { kind: "transport-only", createdAt: 42 },
+          },
         }),
       }),
     ).toThrow(
@@ -669,8 +701,10 @@ it("stops cold admission when the repair owner retires before native open return
         }
       },
       rawTransform: (entry) => ({
-        ...entry,
-        pendingFinalDelivery: { kind: "transport-only", createdAt: 42 },
+        entry: {
+          ...entry,
+          pendingFinalDelivery: { kind: "transport-only", createdAt: 42 },
+        },
       }),
     }),
   ).toThrow("repair owner retired during admission");
