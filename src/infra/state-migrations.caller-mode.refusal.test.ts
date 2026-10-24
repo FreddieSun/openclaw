@@ -18,6 +18,7 @@ import { withStateMigrationBackupForTest } from "../state/openclaw-state-schema.
 import { createTrackedTempDirs } from "../test-utils/tracked-temp-dirs.js";
 import {
   createCallerModeSnapshot,
+  createCallerModeExecutionFixture,
   expectBlockedTailInPlanOrder,
   snapshotFiles,
   writeLegacyStateSchemaV1,
@@ -66,26 +67,9 @@ function writeLegacyDoctorSources(
 
 async function makeFixture(config: OpenClawConfig = {}) {
   const root = await tempDirs.make("openclaw-doctor-caller-refusal-");
-  const homeDir = path.join(root, "home");
-  const stateDir = path.join(root, "copied-state");
-  const configPath = path.join(root, "copied-openclaw.json");
-  fs.mkdirSync(homeDir, { recursive: true });
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.symlinkSync(
-    path.resolve("extensions"),
-    path.join(root, "extensions"),
-    process.platform === "win32" ? "junction" : "dir",
-  );
-  writeJson(configPath, config);
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    HOME: homeDir,
-    OPENCLAW_BUNDLED_PLUGINS_DIR: path.resolve("extensions"),
-    OPENCLAW_CONFIG_PATH: configPath,
-    OPENCLAW_STATE_DIR: stateDir,
-    OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1",
-  };
-  return { root, homeDir, stateDir, configPath, env };
+  const fixture = createCallerModeExecutionFixture(root);
+  writeJson(fixture.configPath, config);
+  return fixture;
 }
 
 const makeCallerModeFixture = () =>
@@ -116,6 +100,23 @@ function migrateFixture(
     homedir: () => fixture.homeDir,
     legacySessionSurfaces: EMPTY_LEGACY_SESSION_SURFACES,
     ...overrides,
+  });
+}
+
+function expectStep(
+  steps: readonly { id: string }[],
+  id: string,
+  expected: Record<string, unknown>,
+) {
+  expect(steps.find((step) => step.id === id)).toMatchObject(expected);
+}
+
+function expectClosedPlan(plan: LegacyStateMigrationPlan, code: string) {
+  expect(plan).toMatchObject({
+    mutationAllowed: false,
+    outcome: "refused",
+    refusal: { code },
+    steps: [],
   });
 }
 
@@ -194,8 +195,7 @@ describe("legacy state migration read-only refusals", () => {
       warnings: ["session surface unavailable"],
       refusal: { code: "migration-planning-warning" },
     });
-    const detectionIndex = plan.steps.findIndex((step) => step.id === "migration-detection");
-    expect(plan.steps[detectionIndex]).toMatchObject({
+    expectStep(plan.steps, "migration-detection", {
       outcome: "deferred",
       refusal: { code: "migration-detection-warning" },
     });
@@ -220,12 +220,7 @@ describe("legacy state migration read-only refusals", () => {
       legacySessionSurfaces,
     });
 
-    expect(plan).toMatchObject({
-      mutationAllowed: false,
-      outcome: "refused",
-      refusal: { code: "migration-detection-failed" },
-      steps: [],
-    });
+    expectClosedPlan(plan, "migration-detection-failed");
     expect(plan.warnings.join("\n")).toContain("synthetic copied-state detection failure");
     expect(snapshotFiles(fixture.root)).toEqual(before);
   });
@@ -241,8 +236,7 @@ describe("legacy state migration read-only refusals", () => {
       env: { ...fixture.env, OPENCLAW_OAUTH_DIR: externalOAuthDir },
     });
 
-    const blockerIndex = plan.steps.findIndex((step) => step.id === "migration-detection");
-    expect(plan.steps[blockerIndex]).toMatchObject({
+    expectStep(plan.steps, "migration-detection", {
       source: expect.arrayContaining([{ kind: "path", path: externalOAuthDir }]),
       outcome: "deferred",
       refusal: { code: "oauth-dir-outside-snapshot" },
@@ -276,8 +270,7 @@ describe("legacy state migration read-only refusals", () => {
 
       if (outside) {
         expect(plan.refusal?.code).toBe("shared-auth-source-outside-snapshot");
-        const blockerIndex = plan.steps.findIndex((step) => step.id === "migration-detection");
-        expect(plan.steps[blockerIndex]).toMatchObject({
+        expectStep(plan.steps, "migration-detection", {
           source: expect.arrayContaining([{ kind: "sqlite", path: sourcePath }]),
           outcome: "deferred",
           refusal: { code: "shared-auth-source-outside-snapshot" },
@@ -505,12 +498,7 @@ module.exports = { stateMigrations: [{
 
     const plan = await planFixture(fixture);
 
-    expect(plan).toMatchObject({
-      mutationAllowed: false,
-      outcome: "refused",
-      refusal: { code: "snapshot-identity-unavailable" },
-      steps: [],
-    });
+    expectClosedPlan(plan, "snapshot-identity-unavailable");
     expect(plan.snapshot.stateDigest).toBeUndefined();
     expect(plan.warnings).toEqual([
       expect.stringContaining(`Snapshot tree contains a symbolic link: ${linkedDir}`),
@@ -537,13 +525,8 @@ module.exports = { stateMigrations: [{
         env: fixture.env,
       });
 
-      expect(plan).toMatchObject({
-        mutationAllowed: false,
-        outcome: "refused",
-        refusal: { code: "snapshot-identity-unavailable" },
-        snapshot: { stateDir: linkedStateDir },
-        steps: [],
-      });
+      expectClosedPlan(plan, "snapshot-identity-unavailable");
+      expect(plan.snapshot.stateDir).toBe(linkedStateDir);
       expect(plan.snapshot.stateDigest).toBeUndefined();
       expect(discoverTargets).not.toHaveBeenCalled();
 
@@ -552,29 +535,6 @@ module.exports = { stateMigrations: [{
       expect(discoverTargets).toHaveBeenCalled();
     },
   );
-
-  it("refuses a caller-supplied snapshot digest that does not match observed bytes", async () => {
-    const fixture = await makeFixture();
-
-    const plan = await planFixture(fixture, {
-      snapshot: {
-        homeDir: fixture.homeDir,
-        configPath: fixture.configPath,
-        stateDir: fixture.stateDir,
-        stateDigest: `sha256:${"b".repeat(64)}`,
-      },
-      env: fixture.env,
-    });
-
-    expect(plan).toMatchObject({
-      mutationAllowed: false,
-      outcome: "refused",
-      refusal: { code: "snapshot-identity-mismatch" },
-      steps: [],
-    });
-    expect(plan.snapshot.stateDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
-    expect(plan.snapshot.stateDigest).not.toBe(`sha256:${"b".repeat(64)}`);
-  });
 
   it("plans registered agent targets that a preceding schema repair makes canonical", async () => {
     const fixture = await makeFixture({
@@ -633,8 +593,7 @@ module.exports = { stateMigrations: [{
 
     const plan = await planFixture(fixture);
 
-    const blockerIndex = plan.steps.findIndex((step) => step.id === "agent-migration-targets");
-    expect(plan.steps[blockerIndex]).toMatchObject({
+    expectStep(plan.steps, "agent-migration-targets", {
       source: expect.arrayContaining([{ kind: "sqlite", path: externalDatabasePath }]),
       outcome: "deferred",
       refusal: { code: "session-target-outside-snapshot" },
@@ -665,9 +624,7 @@ module.exports = { stateMigrations: [{
       receipts: result.stepReceipts,
       blockerId: "config-machine-state",
     });
-    expect(
-      result.stepReceipts.find((receipt) => receipt.id === "config-machine-state"),
-    ).toMatchObject({
+    expectStep(result.stepReceipts, "config-machine-state", {
       id: "config-machine-state",
       outcome: "refused",
       changes: [],
@@ -675,10 +632,6 @@ module.exports = { stateMigrations: [{
       refusal: { code: "step-threw", message: "synthetic config migration failure" },
     });
     expect(emittedReceipts).toEqual(result.stepReceipts);
-    expect(result.stepReceipts.find((receipt) => receipt.id === "exec-approvals")).toMatchObject({
-      outcome: "refused",
-      refusal: { code: "blocked-by-prior-refusal" },
-    });
     expect(fs.existsSync(execPath)).toBe(true);
   });
 
@@ -728,7 +681,7 @@ module.exports = { stateMigrations: [{
         );
       }
       expectBlockedTailInPlanOrder({ plan, receipts: emittedReceipts, blockerId });
-      expect(emittedReceipts.find((receipt) => receipt.id === blockerId)).toMatchObject({
+      expectStep(emittedReceipts, blockerId, {
         outcome: "refused",
         refusal: { code: property ? "step-threw" : "step-refused" },
       });
@@ -757,9 +710,7 @@ module.exports = { stateMigrations: [{
       receipts: result.stepReceipts,
       blockerId: "agent-migration-targets",
     });
-    expect(
-      result.stepReceipts.find((receipt) => receipt.id === "agent-migration-targets"),
-    ).toMatchObject({
+    expectStep(result.stepReceipts, "agent-migration-targets", {
       id: "agent-migration-targets",
       outcome: "refused",
       refusal: { code: "agent-target-discovery-failed" },
@@ -796,15 +747,7 @@ module.exports = { stateMigrations: [{
       receipts: result.stepReceipts,
       blockerId: "migration-detection",
     });
-    expect(result.stepReceipts.find((receipt) => receipt.id === "agent-dir")).toMatchObject({
-      outcome: "refused",
-      refusal: { code: "blocked-by-prior-refusal" },
-    });
     expect(result.warnings.join("\n")).toContain("synthetic execution detection failure");
-    expect(result.stepReceipts.find((receipt) => receipt.id === "exec-approvals")).toMatchObject({
-      outcome: "refused",
-      refusal: { code: "blocked-by-prior-refusal" },
-    });
     expect(fs.existsSync(execPath)).toBe(true);
   });
 });

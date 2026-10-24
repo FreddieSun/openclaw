@@ -17,6 +17,8 @@ import {
   expectRuntime,
   runFixtureGit as git,
   expectCancelledGitCandidateCleanup,
+  expectStep,
+  writeFixtureTree,
   type GitUpdateFixture,
 } from "./update-runner-git-candidate.test-support.js";
 import { selectChannelTag } from "./update-runner-git-target.js";
@@ -196,12 +198,8 @@ describe("Git checkout execution", () => {
         await git(root, "checkout", "--detach", beforeSha);
         await git(root, "branch", "-D", "main");
       }
-      const other = path.join(directory, "other");
-      if (trackingRef !== "team/fork/main") {
-        await git(directory, "clone", "--quiet", remote, other);
-        await git(other, "reset", "--hard", beforeSha);
-      }
-      await git(root, "remote", "add", "origin", other);
+      // An unusable origin must not override the explicitly selected source.
+      await git(root, "remote", "add", "origin", path.join(directory, "unavailable"));
       const savedConfig = await config();
       const result = await update({
         devTarget: { mode: "tracked", upstreamRef: trackingRef, upstreamSha: target },
@@ -450,13 +448,11 @@ describe("Git checkout execution", () => {
       const result = await update();
 
       expect(result).toMatchObject({ status: "error", reason: "checkout-failed" });
-      expect(result.steps).toContainEqual(
-        expect.objectContaining({
-          name: "git-activation-branch-check",
-          stdoutTail: null,
-          stderrTail: expect.stringContaining("a Git worktree uses or reserves branch main"),
-        }),
-      );
+      expectStep(result.steps, {
+        name: "git-activation-branch-check",
+        stdoutTail: null,
+        stderrTail: expect.stringContaining("a Git worktree uses or reserves branch main"),
+      });
       expect(fixture.stopped).toBe(false);
       await expectInstalled();
     },
@@ -545,13 +541,9 @@ describe("Git checkout execution", () => {
           );
         }
         if (repair && argv[0] === "pnpm" && argv[1] === "ui:build") {
-          await fs.mkdir(path.join(options.cwd!, "dist", "control-ui", "assets"), {
-            recursive: true,
+          await writeFixtureTree(options.cwd!, {
+            "dist/control-ui/assets/missing.js": "export {};\n",
           });
-          await fs.writeFile(
-            path.join(options.cwd!, "dist", "control-ui", "assets", "missing.js"),
-            "export {};\n",
-          );
         }
         return result;
       };
@@ -560,9 +552,7 @@ describe("Git checkout execution", () => {
       expect(fixture.stopped).toBe(repair);
       expect(result.steps.some((step) => step.name === "preflight-ui-build")).toBe(true);
       if (!repair) {
-        expect(result.steps).toContainEqual(
-          expect.objectContaining({ name: "preflight-ui-assets-verify", exitCode: 1 }),
-        );
+        expectStep(result.steps, { name: "preflight-ui-assets-verify", exitCode: 1 });
       }
       await expectRuntime(root, repair ? target : beforeSha);
     },

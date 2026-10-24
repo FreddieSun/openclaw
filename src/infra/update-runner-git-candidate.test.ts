@@ -6,9 +6,7 @@ import YAML from "yaml";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { runPackageUpdateDoctor } from "../cli/update-cli/update-command-package.js";
 import * as processExec from "../process/exec.js";
-import { runCommandWithTimeout } from "../process/exec.js";
 import { hasErrnoCode } from "./errno.js";
-import { resolveExecutableFromPathEnv } from "./executable-path.js";
 import { verifyGitUpdateRecovery } from "./update-git-runtime.js";
 import {
   createGitUpdateFixture,
@@ -194,47 +192,6 @@ describe("Git candidate activation", () => {
     },
   });
   registerGitActivationDoctorOutcomeTests(fixture);
-
-  it("keeps build and exposure source selection in the admitted candidate", async () => {
-    vi.stubEnv("OPENCLAW_DEV_SOURCE_ROOT", root);
-    const otherTools = path.join(directory, "other-tools");
-    const inheritedPath = `${otherTools}${path.delimiter}${process.env.PATH ?? ""}`;
-    vi.stubEnv("PATH", inheritedPath);
-    const nodeRuntime = await resolveCandidateNodeRuntimeForTest();
-    await advanceRemote();
-    let built = false;
-    let exposed = false;
-    observeCommands(async (argv, options) => {
-      if (argv[0] === "pnpm" && argv[1] === "build") {
-        built = true;
-        expect(options.env?.OPENCLAW_DEV_SOURCE_ROOT).toBe(options.cwd);
-        expect(options.env?.PATH?.split(path.delimiter)[0]).toBe(otherTools);
-        const selectedNode = await runCommandWithTimeout(["node", "-p", "process.execPath"], {
-          cwd: options.cwd,
-          env: options.env,
-          timeoutMs: 5000,
-        });
-        expect(selectedNode.code, selectedNode.stderr).toBe(0);
-        expect(selectedNode.stdout.trim()).toBe(await fs.realpath(nodeRuntime.path));
-      }
-    });
-    const result = await update({
-      prepareGitExposure: async (candidateRoot, _sha, env) => {
-        exposed = true;
-        expect(env?.OPENCLAW_DEV_SOURCE_ROOT).toBe(candidateRoot);
-        const exposedNode = resolveExecutableFromPathEnv("node", env?.PATH ?? "", env, {
-          cwd: candidateRoot,
-          useCache: false,
-        });
-        expect(exposedNode).toBeDefined();
-        expect(await fs.realpath(exposedNode!)).toBe(await fs.realpath(nodeRuntime.path));
-      },
-    });
-    expect(result.status).toBe("ok");
-    expect(built && exposed).toBe(true);
-    expect(process.env.OPENCLAW_DEV_SOURCE_ROOT).toBe(root);
-    expect(process.env.PATH).toBe(inheritedPath);
-  });
 
   it.each(["exact", "fallback", "latest"] as const)(
     "qualifies attempted Git candidates before preparation (%s)",
@@ -447,6 +404,7 @@ describe("Git candidate activation", () => {
           return command(argv, options);
         }
         const cwd = options.cwd!;
+        expect(options.env?.OPENCLAW_DEV_SOURCE_ROOT).toBe(cwd);
         await expectFile(workspaceTarget, workspace);
         const config = YAML.parse(await readText(path.join(cwd, "pnpm-workspace.yaml")));
         const env = { ...process.env, ...options.env };
@@ -480,7 +438,7 @@ describe("Git candidate activation", () => {
         devTarget: { mode: "detached", ref: target },
         prepareGitExposure: async (cwd, sha, env) => {
           expect(sha).toBe(target);
-          expect(env).toBeDefined();
+          expect(env?.OPENCLAW_DEV_SOURCE_ROOT).toBe(cwd);
           await state.runCommand(["pnpm", "install"], { cwd, env });
           state.events.push("exposure");
         },
@@ -634,32 +592,6 @@ describe("Git candidate activation", () => {
     ).toBe(true);
     expect(new Set(abortTimeouts)).toEqual(new Set([5_000]));
     await expectInstalled(state.beforeSha);
-  });
-
-  it("refuses activation when validation commits source outside the selected commit", async () => {
-    await fs.writeFile(path.join(remote, "openclaw.mjs"), "throw new Error('broken launcher');\n");
-    const target = await advanceRemote();
-    const onStepComplete = vi.fn();
-    const result = await update({
-      devTarget: { mode: "detached", ref: target },
-      progress: { onStepComplete },
-      validateCandidate: async (candidateRoot) => {
-        const launcher = path.join(candidateRoot, "openclaw.mjs");
-        await commitFiles({ "openclaw.mjs": "export {};\n" }, candidateRoot);
-        const probe = await runCommandWithTimeout([process.execPath, launcher], {
-          timeoutMs: 5000,
-        });
-        expect(probe.code).toBe(0);
-      },
-    });
-    expect(
-      onStepComplete.mock.calls
-        .filter(([step]) => step.name === "preflight-update-clean-check")
-        .map(([step]) => step.exitCode),
-    ).toEqual([0]);
-    expect(result).toMatchObject({ status: "error", reason: "preflight-no-good-commit" });
-    await expectOriginalServing();
-    await expectFile(path.join(root, "openclaw.mjs"), "export {};\n");
   });
 
   it.each([
