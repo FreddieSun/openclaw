@@ -1,7 +1,6 @@
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { SessionCanonicalKeyMigrationRequiredError } from "./session-canonical-key-error.js";
-import { parseSqliteSessionEntryRecord } from "./session-entry-json.js";
-import { projectCanonicalSessionEntryShape } from "./store-entry-shape.js";
+import { parseCanonicalSqliteSessionEntry } from "./session-entry-json.js";
 import {
   normalizeStoreSessionKey,
   resolveDeliveryProvenCanonicalSessionKey,
@@ -33,15 +32,12 @@ export function validateCanonicalSessionRow(
 ): SessionEntry | undefined {
   const record =
     row.entry_valid === 1
-      ? parseSqliteSessionEntryRecord({
+      ? parseCanonicalSqliteSessionEntry({
           entry_json: row.entry_json,
           current_session_id: row.current_session_id,
         })
       : null;
-  return validateCanonicalSessionRowEntry(
-    row,
-    record ? projectCanonicalSessionEntryShape(record) : null,
-  );
+  return validateCanonicalSessionRowEntry(row, record);
 }
 
 /** Exact readers validate the entry decoded from the same selected row. */

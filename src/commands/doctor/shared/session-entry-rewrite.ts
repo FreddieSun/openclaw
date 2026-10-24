@@ -13,6 +13,7 @@ import {
 import { normalizeStatus } from "../../../config/sessions/session-accessor.sqlite-status.js";
 import { markCanonicalSessionValidationPending } from "../../../config/sessions/session-canonical-key.js";
 import { parseSqliteSessionEntryRecord } from "../../../config/sessions/session-entry-json.js";
+import { SESSION_ENTRY_NUMERIC_FIELDS } from "../../../config/sessions/session-entry-numeric-snapshot.js";
 import { attachSessionEntrySnapshots } from "../../../config/sessions/session-entry-snapshot-values.js";
 import {
   sessionEntrySnapshotColumns,
@@ -94,6 +95,7 @@ export function scanDoctorSessionEntryRecords(
                   OR key IN ('provider', 'lastProvider', 'room')
                   OR (key = 'pendingFinalDelivery' AND json_typeof(value) = 'boolean')
                   OR (key = 'status' AND value #>> '{}' IN ('running', 'queued'))
+                  OR (key IN (${sql.join(SESSION_ENTRY_NUMERIC_FIELDS)}) AND json_typeof(value) = 'string')
               ) WHEN entry_json IS JSON THEN FALSE ELSE TRUE END`
               : /* kysely-allow-raw: native JSON filtering bounds parsing; JSON.parse owns duplicate-key precedence. */ sql<boolean>`CASE WHEN json_valid(entry_json) THEN EXISTS (
             SELECT 1 FROM json_each(entry_json)
@@ -101,6 +103,7 @@ export function scanDoctorSessionEntryRecords(
               OR key IN ('provider', 'lastProvider', 'room')
               OR (key = 'pendingFinalDelivery' AND type IN ('true', 'false'))
               OR (key = 'status' AND value IN ('running', 'queued'))
+              OR (key IN (${sql.join(SESSION_ENTRY_NUMERIC_FIELDS)}) AND type = 'text')
           ) ELSE 1 END`,
           ),
       )) {
@@ -307,7 +310,10 @@ export function rewriteDoctorSessionEntries(
               runOutcome = transformed;
             }
             // Invalid identities remain for canonical-key repair; scalar migration cannot certify them.
-            const parsedEntry = parseSqliteSessionEntryRecord({ ...row, entry_json: entryJson });
+            const parsedEntry = parseSqliteSessionEntryRecord({
+              ...row,
+              entry_json: entryJson,
+            });
             if (!parsedEntry) {
               entryValid = 0;
             } else if (

@@ -92,6 +92,45 @@ function seedEntry(key: string, fields: Record<string, unknown>) {
   };
 }
 
+it("backs up and repairs numeric-only legacy rows before canonical reads", async () => {
+  const legacy = seedEntry("numeric-only", {
+    spawnDepth: "2",
+    inputTokens: "32",
+    runtimeMs: "0",
+    estimatedCostUsd: "0.25",
+    pluginExtensions: { example: { draft: { text: "retained draft" } } },
+  });
+  expect(await repair(false)).toEqual({ found: 1, repaired: 0, scannedStores: 1 });
+  expect(legacy.readRaw()).toBe(legacy.raw);
+
+  expect(await withMaintenance((authority) => repair(true, authority))).toMatchObject({
+    found: 1,
+    repaired: 1,
+  });
+  closeOpenClawAgentDatabasesForTest();
+  const entry = loadExactSessionEntryReadOnly(legacy.scope)?.entry;
+  expect(entry).toMatchObject({
+    spawnDepth: 2,
+    inputTokens: 32,
+    runtimeMs: 0,
+    estimatedCostUsd: 0.25,
+    pluginExtensions: { example: { draft: { text: "retained draft" } } },
+  });
+  expect((entry?.spawnDepth ?? 0) + 1).toBe(3);
+
+  const backups = fs
+    .readdirSync(path.dirname(legacy.databasePath))
+    .filter((name) =>
+      name.startsWith(`${path.basename(legacy.databasePath)}.pre-startup-migration-`),
+    );
+  expect(backups).toHaveLength(1);
+  using backup = new DatabaseSync(path.join(path.dirname(legacy.databasePath), backups[0]!), {
+    readOnly: true,
+  });
+  expect(legacy.readStored(backup)).toBe(legacy.raw);
+  expect(await repair()).toEqual({ found: 0, repaired: 0, scannedStores: 1 });
+});
+
 it("backs up original rows and migrates pending delivery state before canonical reads", async () => {
   const legacy = seedEntry("legacy", {
     pendingFinalDelivery: true,

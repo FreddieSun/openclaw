@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { asNonNegativeFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import {
+  asNonNegativeFiniteNumber,
+  parseStrictFiniteNumber,
+  parseStrictNonNegativeInteger,
+} from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { validateSessionId } from "../../../config/sessions/paths.js";
 import { isMainRestartRecoveryCandidate } from "../../../config/sessions/restart-recovery-state.js";
+import { SESSION_ENTRY_NUMERIC_FIELDS } from "../../../config/sessions/session-entry-numeric-snapshot.js";
 import {
   hasLegacySessionProviderState,
   LEGACY_SESSION_ENTRY_STATE_FIELDS,
@@ -177,6 +182,19 @@ export function migrateLegacySessionEntryState(
       };
     } else if (compactionCount !== undefined) {
       next.memoryFlush = { kind: "succeeded", compactionCount };
+    }
+  }
+  for (const field of SESSION_ENTRY_NUMERIC_FIELDS) {
+    const candidate = next[field];
+    if (typeof candidate !== "string") {
+      continue;
+    }
+    const number =
+      field === "spawnDepth"
+        ? parseStrictNonNegativeInteger(candidate)
+        : parseStrictFiniteNumber(candidate);
+    if (number !== undefined) {
+      next[field] = number;
     }
   }
   return migrateLegacySessionRunOutcome(next, sessionKey, updatedAt);

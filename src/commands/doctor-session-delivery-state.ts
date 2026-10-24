@@ -1,5 +1,6 @@
 import { note } from "../../packages/terminal-core/src/note.js";
 import { scanDoctorSessionEntriesTolerant } from "../config/sessions/session-accessor.js";
+import { SESSION_ENTRY_NUMERIC_FIELDS } from "../config/sessions/session-entry-numeric-snapshot.js";
 import {
   hasLegacySessionEntryState,
   hasLegacySessionProviderState,
@@ -215,6 +216,13 @@ export function repairCanonicalSessionEntries(
   };
 }
 
+function needsLegacySessionEntryRepair(entry: Record<string, unknown>): boolean {
+  return (
+    hasLegacySessionEntryState(entry) ||
+    SESSION_ENTRY_NUMERIC_FIELDS.some((field) => typeof entry[field] === "string")
+  );
+}
+
 /** Raw repair and its backup precede all canonical session readers. */
 export async function repairLegacySessionEntryStates(params: {
   apply: boolean;
@@ -235,9 +243,9 @@ export async function repairLegacySessionEntryStates(params: {
     const plan = prepareSessionEntryRepairs({
       ...params,
       source: "raw",
-      rawNeedsRepair: hasLegacySessionEntryState,
+      rawNeedsRepair: needsLegacySessionEntryRepair,
       rawTransform: (entry, sessionKey, updatedAt) => {
-        if (!hasLegacySessionEntryState(entry)) {
+        if (!needsLegacySessionEntryRepair(entry)) {
           return entry;
         }
         const next = migrateLegacySessionEntryState(entry, updatedAt, sessionKey);

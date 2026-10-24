@@ -6,6 +6,7 @@ import {
   normalizeSessionIconValue,
 } from "../../../packages/gateway-protocol/src/session-agent-status.js";
 import { SessionStoreMigrationRequiredError } from "./migration-required.js";
+import { projectSessionEntryNumericSnapshot } from "./session-entry-numeric-snapshot.js";
 import { hasLegacySessionEntryState } from "./session-entry-state-format.js";
 import { assertSupportedSessionStoreEntry } from "./supported-session-store.js";
 import type { PendingTranscriptRepairState, SessionEntry } from "./types.js";
@@ -103,7 +104,9 @@ export function projectCanonicalSessionEntryShape(value: Record<string, unknown>
     delete canonicalValue.snoozedUntil;
     delete canonicalValue.snoozedAt;
   }
-  return canonicalValue as unknown as SessionEntry;
+  const numericSnapshot = projectSessionEntryNumericSnapshot(canonicalValue);
+  // Nested payloads retain their existing contracts; this admits only the numeric facet.
+  return { ...canonicalValue, ...numericSnapshot } as unknown as SessionEntry;
 }
 
 /** Removes the runtime-only skill catalog without mutating the live session snapshot. */
