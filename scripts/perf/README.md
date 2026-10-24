@@ -2255,7 +2255,8 @@ For paired unprofiled memory soaks without mixed RPCs or fingerprint retention, 
 `--worker-heap-done-file` and `--worker-heap-peer-done-file` paths to each side,
 reversing the paths on its peer. Each side publishes completion after its worker
 and whole-workload timing windows, then waits for its peer before collecting or
-snapshotting. Never reuse marker files from an earlier pair.
+snapshotting. The wait allows at least two minutes or one full elapsed capture,
+whichever is longer. Never reuse marker files from an earlier pair.
 For source-runtime comparisons in one checkout, `--worker-baseline-dir` selects
 mirrored TypeScript files while retaining their original module URLs; the worker
 replies record which replacements were loaded. Pass this flag on both sides with
