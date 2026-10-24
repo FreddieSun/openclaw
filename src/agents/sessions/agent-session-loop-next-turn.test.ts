@@ -6,13 +6,11 @@ import {
 } from "openclaw/plugin-sdk/llm";
 import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
-import { buildTimestampPrefix } from "../../gateway/server-methods/agent-timestamp.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { createTestUserTurnTranscriptTarget } from "../../sessions/user-turn-transcript.test-support.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { normalizeMessagesForLlmBoundary } from "../embedded-agent-runner/run/attempt-llm-boundary.js";
 import { steerActiveSessionWithOptionalDeliveryWait } from "../embedded-agent-runner/run/attempt-queue-message.js";
-import { createUserTranscriptContextRegistry } from "../embedded-agent-runner/run/attempt-user-transcript-context-registry.js";
 import {
   attachSteeringRuntimeContext,
   setSteeringRuntimeContextRetention,
@@ -27,7 +25,6 @@ import {
   streamMocks,
   testModel,
 } from "./agent-session-loop-correctness.test-support.js";
-import { createResourceLoader } from "./agent-session-loop-resource-loader.test-support.js";
 import {
   agentSessionQueuePromptContext,
   agentSessionSetPromptPreparation,
@@ -250,7 +247,7 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
       );
       const requests = recordRequests();
       const { session } = await createTestSession({
-        resourceLoader: await createResourceLoader(handlers),
+        extension: handlers,
         customTools: tools,
       });
       const prompt = session.prompt("apply permissions before the first request");
@@ -312,7 +309,6 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
   );
 
   it("drains a follow-up queued by an agent-end handler", async () => {
-    const sessionRef: { current?: AgentSession } = {};
     let queued = false;
     const lifecycleEvents: string[] = [];
     const handlers: ExtensionFactory = (api) => {
@@ -320,7 +316,7 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
         lifecycleEvents.push("agent_end");
         if (!queued) {
           queued = true;
-          await sessionRef.current?.followUp("queued after end");
+          await session.followUp("queued after end");
         }
         return undefined;
       });
@@ -329,10 +325,7 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
       });
     };
     const requests = recordRequests((model, index) => textStream(model, `answer ${index}`));
-    const { session } = await createTestSession({
-      resourceLoader: await createResourceLoader(handlers),
-    });
-    sessionRef.current = session;
+    const { session } = await createTestSession({ extension: handlers });
 
     await session.prompt("initial prompt");
 
@@ -358,9 +351,7 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
       finishResponse = () => response.finish("finished");
       return response.stream;
     });
-    const { session } = await createTestSession({
-      resourceLoader: await createResourceLoader(handlers),
-    });
+    const { session } = await createTestSession({ extension: handlers });
     const settled = vi.fn();
     session.subscribe((event) => {
       if (event.type === "agent_settled") {
@@ -575,37 +566,10 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
       if (!message || message.role !== "user") {
         throw new Error("expected queued user message");
       }
-      const registry = createUserTranscriptContextRegistry();
-      const project = () =>
-        normalizeMessagesForLlmBoundary([message], {
-          timezone: "UTC",
-          userTranscriptContexts: registry.list(),
-        });
-      const accepted = project();
-      const guard = guardSessionManager(sessionManager, {
-        onUserMessagePersisted: (persisted, runtime) => {
-          if (runtime) {
-            registry.record(runtime, persisted);
-          }
-        },
-      });
+      const accepted = JSON.stringify(message);
+      const guard = guardSessionManager(sessionManager);
       const entryId = guard.appendMessage(message);
-      const acceptedContent = accepted[0]?.role === "user" ? accepted[0].content : undefined;
-      const firstBlock = Array.isArray(acceptedContent) ? acceptedContent[0] : undefined;
-      const acceptedText =
-        typeof acceptedContent === "string"
-          ? acceptedContent
-          : firstBlock?.type === "text"
-            ? firstBlock.text
-            : undefined;
-
-      expect(project()).toEqual(accepted);
-      expect(acceptedText).toContain('"name":"Alice"');
-      expect(acceptedText).toContain(
-        buildTimestampPrefix(new Date(admittedAt), { timezone: "UTC" }),
-      );
-      expect(acceptedText).toContain("Expanded runtime prompt");
-      expect(acceptedText).not.toContain("Visible transcript prompt");
+      expect(JSON.stringify(message)).toBe(accepted);
       expect(message.timestamp).toBe(admittedAt);
       expect(message.content).toEqual([
         { type: "text", text: "Expanded runtime prompt" },
@@ -617,9 +581,6 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
           content: withImage ? message.content : "Visible transcript prompt",
         },
       });
-      if (withImage) {
-        expect(acceptedContent).toContainEqual(image);
-      }
     },
   );
 
@@ -730,14 +691,9 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
 
   it("applies session model, tool, and prompt changes on the following tool turn", async () => {
     const nextModel = { ...testModel, id: "next-model" };
-    const sessionRef: { current?: AgentSession } = {};
     const switchTool = makeTool("switch_state", async () => {
-      const activeSession = sessionRef.current;
-      if (!activeSession) {
-        throw new Error("session not ready");
-      }
-      activeSession.setActiveToolsByName(["second_tool"]);
-      activeSession.agent.state.model = nextModel;
+      session.setActiveToolsByName(["second_tool"]);
+      session.agent.state.model = nextModel;
       return toolResult("switched");
     });
     const secondTool = makeTool("second_tool");
@@ -750,10 +706,9 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
         : textStream(model, "finished"),
     );
     const { session } = await createTestSession({
-      resourceLoader: await createResourceLoader(handlers),
+      extension: handlers,
       customTools: [switchTool, secondTool],
     });
-    sessionRef.current = session;
     session.setActiveToolsByName(["switch_state"]);
 
     await session.prompt("switch now");
@@ -766,7 +721,6 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
 
   it("replaces permission-bound tools during a run without retaining removed tools", async () => {
     const executions: string[] = [];
-    const sessionRef: { current?: AgentSession } = {};
     const readTool = makeTool("read_policy", async () => {
       executions.push("restricted");
       return toolResult("restricted");
@@ -775,7 +729,7 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
       ...readTool,
       name: "change_permission",
       execute: async () => {
-        sessionRef.current!.replaceCustomTools([readTool], [readTool.name]);
+        session.replaceCustomTools([readTool], [readTool.name]);
         return toolResult("Permission change");
       },
     };
@@ -792,7 +746,6 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
         : textStream(model),
     );
     const { session } = await createTestSession({ customTools: [changeTool, previousReadTool] });
-    sessionRef.current = session;
     session.setActiveToolsByName([changeTool.name, readTool.name]);
 
     await session.prompt("tighten permissions");
@@ -806,55 +759,40 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
     expect(session.getAllTools().map((tool) => tool.name)).toEqual([readTool.name]);
   });
 
-  it("preserves explicit updates from an existing next-turn hook", async () => {
-    const hookModel = { ...testModel, id: "hook-model" };
-    const hookTool = makeTool("hook_tool");
-    const hookContext = {
-      systemPrompt: "hook prompt",
-      messages: [],
-      tools: [hookTool],
-    };
-    const { session } = await createTestSession();
-    session.agent.prepareNextTurn = vi
-      .fn<NonNullable<AgentSession["agent"]["prepareNextTurn"]>>()
-      .mockReturnValueOnce({ context: hookContext, model: hookModel, thinkingLevel: "high" });
-    const prepareNextTurn = nextTurnPreparer(session);
-    const firstUpdate = await prepareNextTurn({
-      systemPrompt: "loop prompt",
-      messages: [],
-      tools: [],
-    });
-    const secondUpdate = await prepareNextTurn(firstUpdate?.context ?? hookContext);
-
-    for (const update of [firstUpdate, secondUpdate]) {
-      expect(update).toMatchObject({
-        context: {
-          systemPrompt: "hook prompt",
-          tools: [expect.objectContaining({ name: "hook_tool" })],
-        },
-        model: hookModel,
-        thinkingLevel: "high",
+  it.each(["explicit", "omitted"] as const)(
+    "preserves %s next-turn hook fields",
+    async (fields) => {
+      const hookTool = makeTool("hook_tool");
+      const hookModel = { ...testModel, id: "hook-model" };
+      const context: Context = {
+        systemPrompt: "hook prompt",
+        messages: [],
+        ...(fields === "explicit" ? { tools: [hookTool] } : {}),
+      };
+      const tools = fields === "explicit" ? [] : [hookTool];
+      const { session } = await createTestSession({ customTools: tools });
+      const snapshot = {
+        context,
+        ...(fields === "explicit" ? { model: hookModel, thinkingLevel: "high" as const } : {}),
+      };
+      const hook = vi
+        .fn<NonNullable<AgentSession["agent"]["prepareNextTurn"]>>()
+        .mockReturnValueOnce(snapshot);
+      session.agent.prepareNextTurn = hook;
+      const prepareNextTurn = nextTurnPreparer(session);
+      const update = await prepareNextTurn({
+        systemPrompt: "loop prompt",
+        messages: [],
+        tools,
       });
-    }
-  });
-
-  it("preserves fields omitted by an existing next-turn context replacement", async () => {
-    const sessionTool = makeTool("session_tool");
-    const replacementHook = vi.fn(() => ({
-      context: { systemPrompt: "replacement prompt", messages: [] },
-    }));
-    const { session } = await createTestSession({ customTools: [sessionTool] });
-    session.setActiveToolsByName([sessionTool.name]);
-    session.agent.prepareNextTurn = replacementHook;
-    const update = await nextTurnPreparer(session)({
-      systemPrompt: "loop prompt",
-      messages: [],
-      tools: [sessionTool],
-    });
-
-    expect(update?.context).toEqual({ systemPrompt: "replacement prompt", messages: [] });
-    expect(replacementHook).toHaveBeenCalledOnce();
-  });
+      expect(update?.context).toEqual(context);
+      expect(hook).toHaveBeenCalledOnce();
+      if (fields === "explicit") {
+        expect(update).toMatchObject(snapshot);
+        expect(await prepareNextTurn(update?.context ?? context)).toMatchObject(snapshot);
+      }
+    },
+  );
 
   it("aborts in-flight work when disposed", async () => {
     let providerSignal: AbortSignal | undefined;

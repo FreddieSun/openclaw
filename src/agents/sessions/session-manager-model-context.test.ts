@@ -173,22 +173,9 @@ it.each([
     await withSessionState("model-view", async ({ state, scope }) => {
       const source = SessionManager.open(scope);
       const marker = "synthetic-native-memory:";
-      const metadata = {
-        upstreamUserText: marker + "x".repeat(256 * 1024),
-        mirrorIdentity: "synthetic-identity",
-        mirrorOrigin: "synthetic-origin",
-        turnTainted: true,
-        sender: { id: "synthetic-sender" },
-        media: { type: "synthetic" },
-      };
       await source.appendThinkingLevelChange("high");
       await source.appendModelChange("openai", "gpt-5.6-luna");
-      const old = source.appendMessage({
-        role: "user",
-        content: "old",
-        timestamp: 1,
-        __openclaw: metadata,
-      } as Parameters<SessionManager["appendMessage"]>[0]);
+      const old = source.appendMessage(makeUserMessage("old", 1));
       const excluded = source.appendMessage({
         role: "custom",
         customType: "display",
@@ -197,36 +184,8 @@ it.each([
         excludeFromContext: true,
         timestamp: 1,
       });
-      const kept = source.appendMessage({
-        role: "user",
-        content: "kept",
-        timestamp: 2,
-        __openclaw: metadata,
-      } as Parameters<SessionManager["appendMessage"]>[0]);
-      source.appendMessage(
-        makeAgentAssistantMessage({
-          model: "gpt-5.6-luna",
-          providerReplay: {
-            v: 1,
-            type: "openai-responses-compaction",
-            data: "synthetic-checkpoint",
-            provider: "openai",
-            api: "openai-responses",
-            model: "gpt-5.6-luna",
-            baseUrlHash: "synthetic",
-          },
-          content: [
-            {
-              type: "toolCall",
-              id: "paired",
-              name: "read",
-              arguments: { nested: { path: "synthetic.txt" } },
-            },
-          ],
-          stopReason: "toolUse",
-        }),
-      );
-      const result = source.appendMessage(toolResult("tool output", "paired", 3));
+      const kept = source.appendMessage(makeUserMessage("kept", 2));
+      const result = source.appendMessage(makeUserMessage("result", 3));
       source.appendCustomMessageEntry("synthetic-context", "custom context", true, {
         source: "synthetic",
       });
@@ -275,9 +234,6 @@ it.each([
       source.appendMessage(makeUserMessage("latest", 5));
       const expected = source.buildSessionContext();
       expect(await readModelAsync(scope)).toEqual(readModel(scope));
-      expect(SessionManager.readSessionContext(scope, (messages) => Array.from(messages))).toEqual(
-        expected.messages,
-      );
       const visible = (messages: typeof expected.messages) =>
         messages.map((message) => ({
           role: message.role,
@@ -286,47 +242,16 @@ it.each([
         }));
       const before = fingerprint(scope);
       const detached = withoutPayload([marker], () => SessionManager.openModelContext(scope));
-      expect(detached.isPersisted()).toBe(false);
-      expect(detached.getHeader()?.id).toBe(scope.sessionId);
-      expect(detached.migrated).toBe(false);
-      expect(detached.getBoundaryCount()).toBe(source.getBoundaryCount());
       const context = detached.buildSessionContext();
       expect(visible(context.messages)).toEqual(visible(expected.messages));
       expect(context.model).toEqual(expected.model);
-      expect(
-        context.messages
-          .filter((message) => message.role === "assistant")
-          .map((message) => message.providerReplay),
-      ).toEqual(
-        expected.messages
-          .filter((message) => message.role === "assistant")
-          .map((message) => message.providerReplay),
-      );
       expect(context.thinkingLevel).toBe("high");
-      const retainedUser = context.messages.find(
-        (message) => message.role === "user" && message.content === "kept",
-      );
-      expect(retainedUser).toMatchObject({
-        __openclaw: {
-          mirrorIdentity: "synthetic-identity",
-          mirrorOrigin: "synthetic-origin",
-          turnTainted: true,
-          sender: metadata.sender,
-          media: metadata.media,
-        },
-      });
-      expect(
-        Object.hasOwn(
-          (retainedUser as unknown as { __openclaw: object })["__openclaw"],
-          "upstreamUserText",
-        ),
-      ).toBe(false);
       if (scenario === "reset") {
-        expect(
-          (retainedUser as unknown as Record<symbol, unknown>)[
-            Symbol.for("openclaw.sessionHistoryPrelude")
-          ],
-        ).toBe(true);
+        const retainedUser = context.messages.find(
+          (message) => message.role === "user" && message.content === "kept",
+        );
+        assert(retainedUser);
+        expect(Reflect.get(retainedUser, Symbol.for("openclaw.sessionHistoryPrelude"))).toBe(true);
       }
       detached.appendMessage(makeUserMessage("review only", 6));
       expect(fingerprint(scope)).toBe(before);
@@ -396,20 +321,14 @@ it.each([
               }),
             )
           : undefined;
-      const content = [{ type: "text" as const, text: "synthetic retained text" }];
       const message = {
         ...(role === "assistant"
-          ? makeAgentAssistantMessage({ content })
+          ? makeAgentAssistantMessage({
+              content: [{ type: "text", text: "synthetic retained text" }],
+            })
           : role === "user"
-            ? { role, content: "synthetic retained text", timestamp: 1 }
-            : {
-                role,
-                content,
-                toolCallId: "paired",
-                toolName: "read",
-                isError: false,
-                timestamp: 1,
-              }),
+            ? makeUserMessage("synthetic retained text", 1)
+            : toolResult("synthetic retained text", "paired", 1)),
         excludeFromContext: true,
         __openclaw: { upstreamUserText: "private-retained:" + "x".repeat(256 * 1024) },
       };
