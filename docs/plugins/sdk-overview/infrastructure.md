@@ -57,13 +57,17 @@ connection-bound providers.
 
 ### Bounded directory inventories
 
-`walkDirectory(root, options?)` and `walkDirectorySync(root, options?)` from
+`listDirectoryTreeStrict(root, options?)` and `listDirectoryTreeStrictSync(root, options?)` from
 `openclaw/plugin-sdk/file-access-runtime` return `{ relativePath, dirent }` entries
 in lexical relative-path order. They report symlinks without following them and
-reject a symlink root. Missing roots throw `ENOENT`; callers may explicitly treat
+reject a symlink root with `ERR_DIRECTORY_WALK_ROOT_SYMLINK`. Missing roots throw `ENOENT`; callers may explicitly treat
 that as an empty inventory. `maxDepth` defaults to 64 (immediate children have
 depth 1), and `maxEntries` defaults to 100,000, counting directories and symlinks.
-Exceeding either throws `DirectoryWalkLimitError`, never a truncated result.
+Exceeding either throws `DirectoryWalkLimitError` (`ERR_DIRECTORY_WALK_LIMIT`), never a truncated result.
+This strict inventory is distinct from the best-effort `walkDirectory` in
+`@openclaw/fs-safe/walk`, which can return partial results and stop at a requested
+depth. The strict API detects nonempty directories beyond its depth budget instead
+of treating them as a complete inventory.
 These inventories do not authorize later reads or writes against concurrent path
 replacement; use the root-bound file APIs for that boundary.
 

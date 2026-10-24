@@ -22,11 +22,11 @@ const outputFiles = {
 
 async function listInputs() {
   // Published packages skip source generation before loading this source-only helper.
-  const { walkDirectorySync } = await import("../src/infra/directory-walk.ts");
+  const { listDirectoryTreeStrictSync } = await import("../src/infra/directory-walk.ts");
   const { directories, files } = JSON.parse(fs.readFileSync(inputManifest, "utf8"));
   const inputs = new Set(files);
   for (const directory of directories) {
-    for (const { relativePath: entry } of walkDirectorySync(path.join(root, directory))) {
+    for (const { relativePath: entry } of listDirectoryTreeStrictSync(path.join(root, directory))) {
       if (/\.(?:ts|mts|mjs|json)$/.test(entry) && !/\.(?:test|spec)\./.test(entry)) {
         inputs.add(path.posix.join(directory, entry.split(path.sep).join("/")));
       }

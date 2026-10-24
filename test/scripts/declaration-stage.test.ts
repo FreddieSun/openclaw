@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { publishStagedDeclarations } from "../../scripts/lib/declaration-stage.mts";
+import { listDirectoryTreeStrictSync } from "../../src/infra/directory-walk.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const roots = useAutoCleanupTempDirTracker(afterEach);
@@ -215,11 +216,19 @@ describe("canonical declaration stage", () => {
       invocation({ "plugin-sdk/public.d.ts": 'export type { Shared } from "../shared.js";' }),
       invocation({ "shared.d.ts": "export type Shared = string;" }),
     ];
-    const before = fs.readdirSync(dist, { recursive: true }).map(String).toSorted();
+    const before = listDirectoryTreeStrictSync(dist)
+      .map((walkEntry) => walkEntry.relativePath)
+      .map(String)
+      .toSorted();
     await expect(
       publish(invocations, ["plugin-sdk/public.d.ts", "plugin-sdk/private.d.ts"]),
     ).rejects.toThrow();
-    expect(fs.readdirSync(dist, { recursive: true }).map(String).toSorted()).toEqual(before);
+    expect(
+      listDirectoryTreeStrictSync(dist)
+        .map((walkEntry) => walkEntry.relativePath)
+        .map(String)
+        .toSorted(),
+    ).toEqual(before);
     expect(read("plugin-sdk/obsolete.d.ts")).toBe("old");
   });
 

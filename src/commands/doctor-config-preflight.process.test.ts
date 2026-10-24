@@ -11,6 +11,7 @@ import { resolveGatewayLockDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { cronOwnerHardeningEntrypoints } from "../cron/owner-hardening-runtime.test-support.js";
 import { loadCronJobsStoreWithConfigJobsReadOnly, loadCronQuarantinedJobs } from "../cron/store.js";
+import { listDirectoryTreeStrictSync } from "../infra/directory-walk.js";
 import { readGatewayLockProcessNamespace } from "../infra/gateway-lock-payload.js";
 import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { hasActiveStartupMigrationLease } from "../infra/startup-migration-checkpoint.js";
@@ -21,6 +22,7 @@ import {
   createBuiltRuntime,
   createSourceRuntime,
   ISOLATED_RUNTIME_NODE_ARGS,
+  readDatabase,
   runBuiltRuntime,
   runIsolatedModuleScript,
   runSourceRuntime,
@@ -86,15 +88,6 @@ function createDoctorFixture(name: string, configInState = false) {
 function writeJson(file: string, value: unknown) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(value));
-}
-
-function readDatabase<T>(file: string, read: (db: DatabaseSync) => T): T {
-  const db = new DatabaseSync(file, { readOnly: true });
-  try {
-    return read(db);
-  } finally {
-    db.close();
-  }
 }
 
 function runtimeUrl(key: keyof typeof doctorConfigRuntimeEntrypoints) {
@@ -362,11 +355,15 @@ describe("doctor invalid config process exit", () => {
       }
       expect(output).not.toContain("Building Control UI assets");
       expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
-      const createdFiles = fs.readdirSync(stateDir, { recursive: true, encoding: "utf8" });
+      const createdFiles = listDirectoryTreeStrictSync(stateDir);
       expect(
-        createdFiles.filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
+        createdFiles.filter(({ relativePath }) =>
+          /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(relativePath),
+        ),
       ).toEqual([]);
-      expect(createdFiles.filter((file) => file.includes(".clobbered."))).toEqual([]);
+      expect(
+        createdFiles.filter(({ relativePath }) => relativePath.includes(".clobbered.")),
+      ).toEqual([]);
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
   );
@@ -402,9 +399,9 @@ describe("doctor invalid config process exit", () => {
       );
       expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
       expect(
-        fs
-          .readdirSync(stateDir, { recursive: true, encoding: "utf8" })
-          .filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
+        listDirectoryTreeStrictSync(stateDir).filter(({ relativePath }) =>
+          /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(relativePath),
+        ),
       ).toEqual([]);
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
@@ -431,9 +428,9 @@ describe("doctor invalid config process exit", () => {
       expect(result.stderr).not.toContain('Run "openclaw doctor --fix" now?');
       expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
       expect(
-        fs
-          .readdirSync(stateDir, { recursive: true, encoding: "utf8" })
-          .filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
+        listDirectoryTreeStrictSync(stateDir).filter(({ relativePath }) =>
+          /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(relativePath),
+        ),
       ).toEqual([]);
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
@@ -458,9 +455,9 @@ describe("doctor invalid config process exit", () => {
       expect(output).not.toContain('Run "openclaw doctor --fix"');
       expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
       expect(
-        fs
-          .readdirSync(stateDir, { recursive: true, encoding: "utf8" })
-          .filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
+        listDirectoryTreeStrictSync(stateDir).filter(({ relativePath }) =>
+          /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(relativePath),
+        ),
       ).toEqual([]);
     },
     getCliProcessTestTimeout(DOCTOR_CHILD_TIMEOUT_MS),
@@ -513,10 +510,14 @@ describe("doctor invalid config process exit", () => {
         expect(output).toContain("exclusive offline");
         expect(output).toContain("unknown: config could not be parsed");
         expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
-        const files = fs.readdirSync(stateDir, { recursive: true, encoding: "utf8" });
-        expect(files.filter((file) => file.includes(".clobbered."))).toEqual([]);
+        const files = listDirectoryTreeStrictSync(stateDir);
+        expect(files.filter(({ relativePath }) => relativePath.includes(".clobbered."))).toEqual(
+          [],
+        );
         expect(
-          files.filter((file) => /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(file)),
+          files.filter(({ relativePath }) =>
+            /\.(?:sqlite|db)(?:$|-(?:wal|shm|journal)$)/u.test(relativePath),
+          ),
         ).toEqual([]);
       } finally {
         await tempDirs.verifyCleanup(() => stopChildProcess(ownerChild, 5_000));

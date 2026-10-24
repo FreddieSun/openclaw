@@ -36,7 +36,8 @@ installProcfsFixture({
   readdir: (file, ...args) =>
     fixtureProcfs && file === "/proc"
       ? Promise.resolve([String(process.pid)])
-      : originalReaddir(file, ...args),
+      : // oxlint-disable-next-line openclaw-boundaries/no-recursive-readdir -- Transparent procfs fixture adapter; preserve the observer caller options.
+        originalReaddir(file, ...args),
   onSpawn: () => {
     inspectionSpawns += 1;
   },

@@ -19,6 +19,7 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { sha256HexPrefixCore } from "../../infra/crypto-digest.js";
+import { listDirectoryTreeStrict } from "../../infra/directory-walk.js";
 import {
   NODE_WORKER_ENVIRONMENT_STOP_COMMAND,
   NODE_WORKER_WORKSPACE_EXEC_COMMAND,
@@ -549,8 +550,10 @@ process.stdin.pipe(child.stdin);
                   target: { kind: "gateway" },
                 });
                 const cloneFilesBefore = (
-                  await fs.readdir(state.statePath("projects"), { recursive: true })
-                ).toSorted();
+                  await listDirectoryTreeStrict(state.statePath("projects"))
+                )
+                  .map((walkEntry) => walkEntry.relativePath)
+                  .toSorted();
                 expect(cloneFilesBefore).not.toContain(sha256HexPrefixCore(url, 16));
                 const latePolicy = mode.startsWith("accepted-policy-");
                 if (mode.startsWith("accepted-")) {
@@ -707,7 +710,9 @@ process.stdin.pipe(child.stdin);
                 }
                 if (mode !== "allowed" && !latePolicy && mode !== "accepted-allowed") {
                   expect(
-                    (await fs.readdir(state.statePath("projects"), { recursive: true })).toSorted(),
+                    (await listDirectoryTreeStrict(state.statePath("projects")))
+                      .map((walkEntry) => walkEntry.relativePath)
+                      .toSorted(),
                   ).toEqual(cloneFilesBefore);
                   expect(readEntry()?.repositoryWorkspaceId).toBe(repository.workspaceId);
                   expect(await readWorktree()).toBeUndefined();

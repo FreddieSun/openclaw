@@ -184,6 +184,8 @@ it.each([
     fs.chmodSync(outside, 0o755);
     fs.chmodSync(path.join(outside, "keep.txt"), 0o644);
     const source = path.join(f.root, "worker/lib/node_modules/corepack");
+    fs.mkdirSync(path.join(source, "readonly"), { mode: 0o555 });
+    fs.chmodSync(path.join(source, "readonly"), 0o555);
     fs.symlinkSync(outside, path.join(source, "external-directory"), "dir");
     fs.symlinkSync(path.join(outside, "keep.txt"), path.join(source, "external-file"), "file");
     f.env.PATH = corepackBin + path.delimiter + f.env.PATH;
@@ -193,6 +195,12 @@ it.each([
     await prepare();
     // A commit refresh prepares the same HOME again; detected installs then re-enable Corepack.
     const setupPath = await prepare();
+    if (runner === "worker") {
+      expect(
+        fs.statSync(path.join(home, ".local/lib/openclaw-corepack/readonly")).mode & 0o777,
+      ).toBe(0o700);
+    }
+    expect(fs.statSync(path.join(source, "readonly")).mode & 0o777).toBe(0o555);
     expect(fs.statSync(outside).mode & 0o777).toBe(0o755);
     expect(fs.statSync(path.join(outside, "keep.txt")).mode & 0o777).toBe(0o644);
     const shell = (command: string) => run("sh", ["-c", command], { PATH: setupPath, HOME: home });

@@ -563,9 +563,12 @@ describe("test-install-sh-docker", () => {
       const { root, bin } = fixturePaths("install-same-version");
       const ready = join(root, "server-ready");
       const receipts = join(root, "served.jsonl");
+      const containerReceipts = join(root, "containers.jsonl");
+      const timeoutReceipts = join(root, "timeouts.txt");
       symlinkSync(testNodeExecPath, join(bin, "node"));
       expect(spawnSync("mkfifo", [ready]).status).toBe(0);
       writeCommands(bin, {
+        timeout: '#!/bin/bash\nprintf "%s\\n" "$*" >> "$TIMEOUT_RECEIPTS"\nshift 2\nexec "$@"\n',
         npm: `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
@@ -608,9 +611,10 @@ for (let index = 0; index < args.length; index++) {
   if (args[index] === "-e") {
     const entry = args[++index];
     const equals = entry.indexOf("=");
-    env.set(entry.slice(0, equals), entry.slice(equals + 1));
+    env.set(equals < 0 ? entry : entry.slice(0, equals), equals < 0 ? process.env[entry] : entry.slice(equals + 1));
   }
 }
+fs.appendFileSync(process.env.CONTAINER_RECEIPTS, JSON.stringify({ args, env: Object.fromEntries(env) }) + "\\n");
 (async () => {
   for (const [key, kind] of [
     ["OPENCLAW_INSTALL_FRESH_TAG_URL", "fresh"],
@@ -636,20 +640,29 @@ for (let index = 0; index < args.length; index++) {
           TMPDIR: root,
           SERVER_READY: ready,
           SERVED_RECEIPTS: receipts,
+          CONTAINER_RECEIPTS: containerReceipts,
+          TIMEOUT_RECEIPTS: timeoutReceipts,
+          OPENCLAW_INSTALL_SMOKE_DOCKER_RUN_TIMEOUT: "17s",
+          OPENCLAW_INSTALL_ALLOW_LEGACY_SAME_VERSION_APPLY: "1",
+          OPENCLAW_INSTALL_SMOKE_COMMAND_TIMEOUT: "19",
+          OPENCLAW_INSTALL_SMOKE_HEARTBEAT_INTERVAL: "0",
+          OPENCLAW_INSTALL_SMOKE_PREVIOUS: "2026.8.2",
+          OPENCLAW_INSTALL_SMOKE_SKIP_PREVIOUS: "1",
           npm_config_userconfig: "/dev/null",
           npm_config_globalconfig: "/dev/null",
           OPENCLAW_DOCKER_E2E_DISABLE_RESOURCE_LIMITS: "1",
-          OPENCLAW_INSTALL_SMOKE_GROUP: "update",
+          OPENCLAW_INSTALL_SMOKE_GROUP: "all",
           OPENCLAW_INSTALL_SMOKE_SKIP_IMAGE_BUILD: "1",
-          OPENCLAW_INSTALL_SMOKE_SKIP_NPM_GLOBAL: "1",
-          OPENCLAW_INSTALL_SMOKE_SKIP_FRESHNESS: "1",
+          OPENCLAW_INSTALL_NONROOT_SKIP_IMAGE_BUILD: "1",
+          OPENCLAW_INSTALL_SMOKE_SKIP_NPM_GLOBAL: "0",
+          OPENCLAW_INSTALL_SMOKE_SKIP_FRESHNESS: "0",
           OPENCLAW_INSTALL_SMOKE_UPDATE_BASELINE: "2026.9.6",
           OPENCLAW_INSTALL_SMOKE_UPDATE_PACKAGE_SPEC: "candidate-fixture",
           OPENCLAW_INSTALL_SMOKE_UPDATE_HOST: "127.0.0.1",
         },
       });
       expect(result.error, result.stderr).toBeUndefined();
-      expect(result.status, result.stderr).toBe(0);
+      expect(result.status, result.stdout + result.stderr).toBe(0);
       const served = readFileSync(receipts, "utf8")
         .trim()
         .split("\n")
@@ -658,23 +671,68 @@ for (let index = 0; index < args.length; index++) {
         { kind: "fresh", bytes: "candidate build" },
         { kind: "baseline", bytes: "published baseline" },
         { kind: "update", bytes: "candidate build" },
+        { kind: "baseline", bytes: "published baseline" },
+        { kind: "update", bytes: "candidate build" },
       ]);
       expect(served[0]?.url).toBe(served[2]?.url);
       expect(served[1]?.url).not.toBe(served[2]?.url);
+      const containers = readFileSync(containerReceipts, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { args: string[]; env: Record<string, string> });
+      expect(containers).toHaveLength(6);
+      expect(
+        containers.slice(0, 4).map((entry) => entry.env.OPENCLAW_INSTALL_SMOKE_MODE ?? "fresh"),
+      ).toEqual(["fresh", "update", "npm-global", "freshness"]);
+      for (const container of containers.slice(0, 4)) {
+        expect(container.env).toMatchObject({
+          OPENCLAW_INSTALL_ALLOW_LEGACY_SAME_VERSION_APPLY: "1",
+          OPENCLAW_INSTALL_SMOKE_COMMAND_TIMEOUT: "19",
+          OPENCLAW_INSTALL_SMOKE_HEARTBEAT_INTERVAL: "0",
+          OPENCLAW_INSTALL_SMOKE_PREVIOUS: "2026.8.2",
+          OPENCLAW_INSTALL_SMOKE_SKIP_PREVIOUS: "1",
+        });
+      }
+      const timeouts = readFileSync(timeoutReceipts, "utf8")
+        .trim()
+        .split("\n")
+        .filter((line) => line.includes("docker run "));
+      expect(timeouts).toHaveLength(6);
+      expect(timeouts.every((line) => line.startsWith("--kill-after=30s 17s "))).toBe(true);
     },
   );
 
-  it("downloads the non-root NodeSource installer completely before execution", () => {
-    const dockerfile = readFileSync(NONROOT_DOCKERFILE_PATH, "utf8");
-    expectIncludes(
-      dockerfile,
-      'installer="$(mktemp)"',
-      'curl -fsSL --connect-timeout 10 --max-time 120 -o "$installer" https://deb.nodesource.com/setup_24.x',
-      'bash "$installer"',
-      'rm -f "$installer"',
-    );
-    expect(dockerfile).not.toMatch(/curl[^\n]+\|\s*bash/u);
+  it.each([0, 28])("executes NodeSource only after a complete download (curl=%s)", (curlExit) => {
+    const { root, bin } = fixturePaths("nodesource-download");
+    const marker = join(root, "executed");
+    const downloaded = join(root, "downloaded");
+    const layer = readFileSync(NONROOT_DOCKERFILE_PATH, "utf8")
+      .replace(/\\\n/gu, " ")
+      .split(/^RUN /mu)
+      .find((command) => command.includes("https://deb.nodesource.com/setup_24.x"))!
+      .split("\n")[0]!
+      .replace(/--mount=\S+\s*/gu, "");
+    writeCommands(bin, {
+      curl: '#!/bin/sh\nwhile [ "$1" != -o ]; do shift; done\nshift\nprintf %s "$1" > "$DOWNLOADED"\nprintf \'touch "$MARKER"\\n\' > "$1"\nexit "$CURL_EXIT"\n',
+      "apt-get": '#!/bin/sh\nprintf installed > "$APT_MARKER"\n',
+    });
+    const result = runBash(layer, {
+      ...process.env,
+      PATH: bin + path.delimiter + process.env.PATH,
+      TMPDIR: root,
+      MARKER: marker,
+      DOWNLOADED: downloaded,
+      CURL_EXIT: String(curlExit),
+      APT_MARKER: join(root, "apt"),
+    });
+    expect(result.status, result.stderr).toBe(curlExit);
+    expect(existsSync(marker)).toBe(curlExit === 0);
+    expect(existsSync(join(root, "apt"))).toBe(curlExit === 0);
+    if (curlExit === 0) {
+      expect(existsSync(readFileSync(downloaded, "utf8"))).toBe(false);
+    }
   });
+
   it("keeps release-harness npm lookups outside caller freshness policy", () => {
     const { root, bin } = fixturePaths("install-npm-policy");
     writeExecutable(
@@ -929,19 +987,6 @@ printf 'status=%s\\n' "$status"
     expect(result.stderr).toContain("exact-image mode forbids a local rebuild");
   });
 
-  it("bounds installer smoke container runs", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf8");
-
-    expectIncludes(
-      script,
-      'INSTALL_SMOKE_DOCKER_RUN_TIMEOUT="${OPENCLAW_INSTALL_SMOKE_DOCKER_RUN_TIMEOUT:-2700s}"',
-      "run_install_smoke_container()",
-      'DOCKER_COMMAND_TIMEOUT="$INSTALL_SMOKE_DOCKER_RUN_TIMEOUT" docker_e2e_docker_run_cmd run "$@"',
-    );
-    expect(script.match(/run_install_smoke_container --rm -t/g)?.length).toBe(6);
-    expect(script).not.toContain("docker run --rm -t \\");
-  });
-
   it.each([
     {
       version: "24.22.1",
@@ -987,17 +1032,6 @@ printf 'status=%s\\n' "$status"
     ],
   ] as const)("root Dockerfile preserves %s", (_contract, fragments) => {
     expectIncludes(readFileSync("Dockerfile", "utf8"), ...fragments);
-  });
-
-  it("passes the baked browser build arg through Docker setup", () => {
-    const script = readFileSync(DOCKER_SETUP_PATH, "utf8");
-
-    expectIncludes(
-      script,
-      'export OPENCLAW_INSTALL_BROWSER="${OPENCLAW_INSTALL_BROWSER:-}"',
-      "OPENCLAW_INSTALL_BROWSER \\",
-      '--build-arg "OPENCLAW_INSTALL_BROWSER=${OPENCLAW_INSTALL_BROWSER}"',
-    );
   });
 
   it.each([
@@ -1411,6 +1445,7 @@ printf 'command-status=%s\\n' "$command_result"
     { scenario: "candidate refusal", exitCode: 21, updateCount: 2 },
     { scenario: "live process", exitCode: 1, updateCount: 0 },
     { scenario: "service definition", exitCode: 1, updateCount: 0 },
+    { scenario: "linked service definition", exitCode: 0, updateCount: 2 },
     { scenario: "service manager", exitCode: 1, updateCount: 0 },
     { scenario: "inspection failure", exitCode: 1, updateCount: 0 },
   ])(
@@ -1423,6 +1458,13 @@ printf 'command-status=%s\\n' "$command_result"
       const preload = join(root, "native-inspection.cjs");
       const systemd = join(root, "systemd");
       mkdirSync(systemd);
+      if (scenario === "linked service definition") {
+        const outside = join(root, "outside-systemd");
+        mkdirSync(outside);
+        writeFileSync(join(outside, "openclaw-gateway.service"), "outside service");
+        symlinkSync(outside, join(systemd, "linked"), "dir");
+        symlinkSync(systemd, join(systemd, "loop"), "dir");
+      }
       if (scenario === "service definition") {
         writeFileSync(join(systemd, "openclaw-gateway.service"), "fixture service");
       }
@@ -1646,33 +1688,6 @@ fs.readFileSync = (file, ...args) => {
     } else {
       expect(result.status, result.stderr).toBe(0);
     }
-  });
-
-  it("forwards smoke-runner control knobs into Docker containers", () => {
-    const script = readFileSync(SCRIPT_PATH, "utf8");
-
-    expect(script).toContain("SMOKE_RUNNER_ENV_ARGS=()");
-    for (const envName of [
-      "OPENCLAW_INSTALL_ALLOW_LEGACY_SAME_VERSION_APPLY",
-      "OPENCLAW_INSTALL_SMOKE_COMMAND_TIMEOUT",
-      "OPENCLAW_INSTALL_SMOKE_HEARTBEAT_INTERVAL",
-      "OPENCLAW_INSTALL_SMOKE_PREVIOUS",
-      "OPENCLAW_INSTALL_SMOKE_SKIP_PREVIOUS",
-    ]) {
-      expect(script).toContain(envName);
-    }
-    expect(script).toMatch(
-      /Run installer smoke test[\s\S]*\$\{SMOKE_RUNNER_ENV_ARGS\[@\]\+"\$\{SMOKE_RUNNER_ENV_ARGS\[@\]\}"\}/u,
-    );
-    expect(script).toMatch(
-      /Run update smoke[\s\S]*\$\{SMOKE_RUNNER_ENV_ARGS\[@\]\+"\$\{SMOKE_RUNNER_ENV_ARGS\[@\]\}"\}/u,
-    );
-    expect(script).toMatch(
-      /Run direct npm global smoke[\s\S]*\$\{SMOKE_RUNNER_ENV_ARGS\[@\]\+"\$\{SMOKE_RUNNER_ENV_ARGS\[@\]\}"\}/u,
-    );
-    expect(script).toMatch(
-      /Run installer npm freshness smoke[\s\S]*\$\{SMOKE_RUNNER_ENV_ARGS\[@\]\+"\$\{SMOKE_RUNNER_ENV_ARGS\[@\]\}"\}/u,
-    );
   });
 });
 

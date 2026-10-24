@@ -9,6 +9,7 @@ import { createDeferred } from "../../test/helpers/promise.js";
 import { withPluginLifecycleLease } from "../plugins/plugin-lifecycle-lease.js";
 import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db.js";
 import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
+import { listDirectoryTreeStrict } from "./directory-walk.js";
 import {
   installPackageDir,
   requestDeferredPackageDirInstall,
@@ -344,7 +345,9 @@ describe("installPackageDir rollback", () => {
     let revoked = false;
     let treeAtRevocation: Record<string, string> | undefined;
     const readTargetTree = async () => {
-      const entries = await fs.readdir(targetDir, { recursive: true, withFileTypes: true });
+      const entries = (await listDirectoryTreeStrict(targetDir)).map(
+        (walkEntry) => walkEntry.dirent,
+      );
       return Object.fromEntries(
         await Promise.all(
           entries

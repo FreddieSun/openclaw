@@ -265,3 +265,12 @@ export function seedV17AdditiveRepairDatabase(
   }
   return databasePath;
 }
+
+export function readDatabase<T>(file: string, read: (db: DatabaseSync) => T): T {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    return read(db);
+  } finally {
+    db.close();
+  }
+}

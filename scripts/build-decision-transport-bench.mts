@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { build } from "tsdown";
-import { walkDirectorySync } from "../src/infra/directory-walk.ts";
+import { listDirectoryTreeStrictSync } from "../src/infra/directory-walk.ts";
 import { runBenchmarkEntrypoint } from "./lib/benchmark-harness.mts";
 import { createSqliteSchemaAssetsPlugin } from "./lib/sqlite-schema-assets.mts";
 import { createStateSchemaInlinePlugin } from "./lib/state-schema-inline-plugin.mts";
@@ -70,9 +70,9 @@ await runBenchmarkEntrypoint("build-decision-transport-bench", async () => {
   }
   process.stderr.write(smoke.stdout);
   const sha256 = (file: string) => createHash("sha256").update(readFileSync(file)).digest("hex");
-  const outputs = walkDirectorySync(outDir)
+  const outputs = listDirectoryTreeStrictSync(outDir)
     .filter(({ dirent }) => dirent.isFile())
-    .map(({ relativePath }) => relativePath)
+    .map((walkEntry) => walkEntry.relativePath)
     .toSorted()
     .map((file) => ({ file, sha256: sha256(path.join(outDir, file)) }));
   const manifest = path.join(outDir, "manifest.json");

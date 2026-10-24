@@ -5,7 +5,6 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -14,6 +13,7 @@ import {
 import { dirname, join, posix, relative } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { collectRuntimeImportClosure } from "../../scripts/lib/runtime-import-closure.mts";
+import { listDirectoryTreeStrictSync } from "../../src/infra/directory-walk.js";
 import { createRuntimeProcessEntrypoints } from "../../src/infra/runtime-process-manifest.js";
 import { resolveTestNodeExecPath } from "../../src/test-utils/node-process.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
@@ -99,7 +99,8 @@ it("keeps the PR wrapper inventory closed over runtime imports", () => {
   const stale = components.filter((file) => !existsSync(file)).toSorted();
   // scripts/pr archives all of pr-lib implicitly. Other inventory entries also
   // seed the graph: shell-launched helpers and workers are not ordinary imports.
-  const wrapperFiles = readdirSync("scripts/pr-lib", { recursive: true, withFileTypes: true })
+  const wrapperFiles = listDirectoryTreeStrictSync("scripts/pr-lib")
+    .map((walkEntry) => walkEntry.dirent)
     .filter((entry) => entry.isFile())
     .map((entry) => join(entry.parentPath, entry.name));
   const closure = collectRuntimeImportClosure(process.cwd(), [
@@ -227,7 +228,8 @@ it("resolves wrapper package exports and workspace aliases from the extracted de
   expect(components.filter((component, index) => components.indexOf(component) !== index)).toEqual(
     [],
   );
-  const files = readdirSync(root, { recursive: true, withFileTypes: true })
+  const files = listDirectoryTreeStrictSync(root)
+    .map((walkEntry) => walkEntry.dirent)
     .filter((entry) => entry.isFile())
     .map((entry) => relative(root, join(entry.parentPath, entry.name)));
   for (const entrypoint of [

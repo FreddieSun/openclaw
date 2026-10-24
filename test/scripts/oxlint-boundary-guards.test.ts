@@ -1,8 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { posix } from "node:path";
-import { beforeAll, expect, it } from "vitest";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join, posix } from "node:path";
+import { afterAll, beforeAll, expect, it } from "vitest";
 import noForcedProcessExit from "../../scripts/lib/no-forced-process-exit.mjs";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
+const resourceRoots = useAutoCleanupTempDirTracker(afterAll);
 const FIXTURES = "test/fixtures/oxlint-boundary-guards";
 const forcedExit = "no-forced-process-exit";
 function fixture(rule: string, file: string, violations: number, lines?: number[]) {
@@ -14,7 +17,12 @@ function fixture(rule: string, file: string, violations: number, lines?: number[
   };
 }
 const cases = [
-  fixture("no-recursive-readdir", "recursive-readdir-violation.ts", 6, [3, 4, 5, 6, 7, 8]),
+  fixture(
+    "no-recursive-readdir",
+    "recursive-readdir-violation.ts",
+    18,
+    [3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 19, 21, 23, 25, 27],
+  ),
   fixture(
     forcedExit,
     "forced-process-exit-violation.ts",
@@ -131,4 +139,52 @@ it.each(cases)("reports expected violations for $rule", (testCase) => {
       expect(diagnostic.message).toContain("Await owned cleanup, set process.exitCode, and return");
     }
   }
+});
+
+it("enforces resource safety in tests, support, e2e, UI, packages and root scripts", () => {
+  const root = resourceRoots.make("recursive-readdir-scope-");
+  const paths = [
+    "src/runtime.ts",
+    "src/example.test.ts",
+    "src/example.test-support.ts",
+    "test/e2e/example.ts",
+    "scripts/build.mjs",
+    "ui/example.tsx",
+    "packages/example/index.ts",
+    "entry.mjs",
+  ];
+  const files = paths.map((relative) => {
+    const file = join(root, relative);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      'import fs from "node:fs"; const options = { recursive: true }; fs.readdirSync("root", options);',
+    );
+    return file;
+  });
+  const result = spawnSync(
+    process.execPath,
+    [
+      "scripts/run-oxlint.mjs",
+      "--openclaw-focused-config",
+      "--config",
+      "config/oxlint/boundary-guards.json",
+      "--format",
+      "json",
+      ...files,
+    ],
+    { encoding: "utf8" },
+  );
+  expect(result.status, result.stderr).toBe(1);
+  const report = JSON.parse(result.stdout) as {
+    diagnostics: typeof diagnostics;
+    number_of_files: number;
+  };
+  expect(report.number_of_files).toBe(paths.length);
+  const violations = report.diagnostics.filter(
+    (entry) => entry.code === "openclaw-boundaries(no-recursive-readdir)",
+  );
+  expect(violations.map((entry) => entry.filename.replaceAll("\\", "/")).toSorted()).toEqual(
+    files.map((file) => file.replaceAll("\\", "/")).toSorted(),
+  );
 });

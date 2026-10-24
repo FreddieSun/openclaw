@@ -2,7 +2,7 @@ import fs from "node:fs";
 import nodePath from "node:path";
 import { readRegularFile } from "@openclaw/fs-safe/advanced";
 import { unavailableDiffRevision, type DiffReadTiming } from "../infra/diff-read-timing.js";
-import { walkDirectorySync } from "../infra/directory-walk.js";
+import { listDirectoryTreeStrictSync } from "../infra/directory-walk.js";
 import { GitCommandTimeoutError, requireGitCommandOutput } from "../infra/git-exec.js";
 import type { GitReadOperations } from "../infra/git-read-operations.js";
 import { readGitHead, readGitMetadataPrefix, readGitRefs } from "../infra/git-root.js";
@@ -67,7 +67,7 @@ export async function readCheckoutGitRevision(
       );
       if (fs.existsSync(replacements)) {
         paths.push(
-          ...walkDirectorySync(replacements).map(({ relativePath }) =>
+          ...listDirectoryTreeStrictSync(replacements).map(({ relativePath }) =>
             nodePath.join(replacements, relativePath),
           ),
         );

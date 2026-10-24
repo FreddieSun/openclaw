@@ -78,8 +78,8 @@ export {
 } from "../media/remote-workspace-file.js";
 
 export {
-  walkDirectory,
-  walkDirectorySync,
+  listDirectoryTreeStrict,
+  listDirectoryTreeStrictSync,
   DirectoryWalkLimitError,
   type DirectoryWalkEntry,
   type DirectoryWalkOptions,

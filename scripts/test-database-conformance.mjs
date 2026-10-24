@@ -4,7 +4,7 @@ import { readFileSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { walkDirectorySync } from "../src/infra/directory-walk.ts";
+import { listDirectoryTreeStrictSync } from "../src/infra/directory-walk.ts";
 import {
   assignPostgresConformanceShards,
   createPostgresConformanceEstimator,
@@ -61,8 +61,10 @@ let targets = explicitTargets
       "extensions/matrix/src/matrix/account-state.postgres.test.ts",
       "extensions/team-reports/src/postgres-store.test.ts",
       "src/infra/postgres-sync",
-      ...walkDirectorySync(fileURLToPath(new URL("../src/infra/database-engine/", import.meta.url)))
-        .map(({ relativePath }) => relativePath)
+      ...listDirectoryTreeStrictSync(
+        fileURLToPath(new URL("../src/infra/database-engine/", import.meta.url)),
+      )
+        .map((walkEntry) => walkEntry.relativePath)
         .filter((file) => file.endsWith(".test.ts"))
         .map((file) => `src/infra/database-engine/${file.replaceAll("\\", "/")}`)
         .toSorted(),

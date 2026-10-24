@@ -4,7 +4,6 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
   writeFileSync,
 } from "node:fs";
@@ -15,6 +14,7 @@ import {
   formatIosSimulatorSelectionSummary,
   resolveIosSimulatorTestSelection,
 } from "../../scripts/lib/ci-ios-smoke-plan.mjs";
+import { listDirectoryTreeStrictSync } from "../../src/infra/directory-walk.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { runCiManifestFixture } from "./ci-workflow-manifest.test-support.js";
 import { evaluateWorkflowExpression } from "./ci-workflow.test-support.js";
@@ -467,7 +467,8 @@ it.skipIf(process.platform === "win32").each([
   );
   expectArgs(build.args, ["-collect-test-diagnostics", "never"]);
   if (phase === "smoke") {
-    const sources = readdirSync("apps/ios/Tests", { recursive: true })
+    const sources = listDirectoryTreeStrictSync("apps/ios/Tests")
+      .map((walkEntry) => walkEntry.relativePath)
       .filter((file): file is string => typeof file === "string" && file.endsWith(".swift"))
       .map((file) => ({
         file: `apps/ios/Tests/${file}`,

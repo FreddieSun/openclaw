@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { list as listTar } from "tar";
-import { walkDirectory } from "../../src/infra/directory-walk.ts";
+import { listDirectoryTreeStrict } from "../../src/infra/directory-walk.ts";
 import { collectNpmPackInventory } from "./npm-pack-inventory.mts";
 import { listBundleDependencies } from "./package-bundled-dependencies.mts";
 import { isRecord } from "./record-shared.mjs";
@@ -122,7 +122,9 @@ export async function materializeMissingBundledDependencies(
           retained.add(parent);
         }
       }
-      const copied = (await walkDirectory(destination)).map(({ relativePath }) => relativePath);
+      const copied = (await listDirectoryTreeStrict(destination)).map(
+        (walkEntry) => walkEntry.relativePath,
+      );
       for (const entry of copied.toSorted((left, right) => right.length - left.length)) {
         if (!retained.has(entry.split(path.sep).join("/"))) {
           await fs.rm(path.join(destination, entry), { recursive: true });

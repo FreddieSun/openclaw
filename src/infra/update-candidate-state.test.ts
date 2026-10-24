@@ -18,6 +18,7 @@ import {
   insertStoredDeviceIdentityIfAbsent,
   readStoredDeviceIdentityReadOnly,
 } from "./device-identity-store.js";
+import { listDirectoryTreeStrict } from "./directory-walk.js";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import { hasNodeErrorCode } from "./path-guards.js";
 import {
@@ -809,9 +810,9 @@ it.each([
       const copiedDependency = await fs.realpath(fileURLToPath(result.dependency));
       expect(copiedDependency.startsWith(rehearsal.stateDir + path.sep)).toBe(true);
       expect(
-        (await fs.readdir(rehearsal.stateDir, { recursive: true })).some(
-          (entry) => path.basename(entry) === "unrelated.txt",
-        ),
+        (await listDirectoryTreeStrict(rehearsal.stateDir))
+          .map((walkEntry) => walkEntry.relativePath)
+          .some((entry) => path.basename(entry) === "unrelated.txt"),
       ).toBe(false);
       await fs.writeFile(copiedDependency, 'export default "private";');
       expect((await readPlugin(copied)).value).toBe("private");
@@ -876,9 +877,9 @@ it("keeps an optional-only linked node_modules copy bounded to its module owner"
     const copied = rehearsal.copied.plugins!.load!.paths![0]!;
     expect(await readEntry(copied)).toBe("optional plugin ready");
     expect(
-      (await fs.readdir(rehearsal.stateDir, { recursive: true })).some(
-        (entry) => path.basename(entry) === "unrelated.txt",
-      ),
+      (await listDirectoryTreeStrict(rehearsal.stateDir))
+        .map((walkEntry) => walkEntry.relativePath)
+        .some((entry) => path.basename(entry) === "unrelated.txt"),
     ).toBe(false);
     const marker = path.join(copied, "node_modules", "marker.txt");
     expect((await fs.realpath(marker)).startsWith(rehearsal.stateDir + path.sep)).toBe(true);

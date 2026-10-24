@@ -1,6 +1,8 @@
 import fs, { type Dirent } from "node:fs";
 import path from "node:path";
 
+// package.json ships this source: packaged lifecycle/generator scripts import it without a build.
+
 export type DirectoryWalkOptions = {
   /** Maximum entry depth; immediate children have depth 1. Default: 64. */
   maxDepth?: number;
@@ -66,13 +68,15 @@ function compareEntries(a: DirectoryWalkEntry, b: DirectoryWalkEntry): number {
  * directory cannot allocate an unbounded readdir result before the entry limit.
  * This is an inventory, not an authorization boundary against concurrent renames.
  */
-export async function walkDirectory(
+export async function listDirectoryTreeStrict(
   root: string,
   options: DirectoryWalkOptions = {},
 ): Promise<DirectoryWalkEntry[]> {
   const walk = createWalk(root, options);
   if ((await fs.promises.lstat(path.resolve(root))).isSymbolicLink()) {
-    throw new Error("Directory scan root must not be a symlink: " + root);
+    throw Object.assign(new Error("Directory scan root must not be a symlink: " + root), {
+      code: "ERR_DIRECTORY_WALK_ROOT_SYMLINK",
+    });
   }
   for (let parent = walk.pending.pop(); parent; parent = walk.pending.pop()) {
     const directory = await fs.promises.opendir(path.join(root, parent.relativePath));
@@ -83,14 +87,16 @@ export async function walkDirectory(
   return walk.entries.toSorted(compareEntries);
 }
 
-/** Synchronous counterpart of walkDirectory, for bootstrap and script callers. */
-export function walkDirectorySync(
+/** Synchronous counterpart of listDirectoryTreeStrict, for bootstrap and script callers. */
+export function listDirectoryTreeStrictSync(
   root: string,
   options: DirectoryWalkOptions = {},
 ): DirectoryWalkEntry[] {
   const walk = createWalk(root, options);
   if (fs.lstatSync(path.resolve(root)).isSymbolicLink()) {
-    throw new Error("Directory scan root must not be a symlink: " + root);
+    throw Object.assign(new Error("Directory scan root must not be a symlink: " + root), {
+      code: "ERR_DIRECTORY_WALK_ROOT_SYMLINK",
+    });
   }
   for (let parent = walk.pending.pop(); parent; parent = walk.pending.pop()) {
     const directory = fs.opendirSync(path.join(root, parent.relativePath));

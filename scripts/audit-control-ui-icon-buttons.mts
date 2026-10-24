@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { walkDirectorySync } from "../src/infra/directory-walk.ts";
+import { listDirectoryTreeStrictSync } from "../src/infra/directory-walk.ts";
 import { loadIconFixtures } from "./lib/control-ui-icon-fixtures.mts";
 import {
   createIconStyleContext,
@@ -15,8 +15,8 @@ export function auditIconButtons(rootDir: string, files?: string[]) {
   const context = createIconStyleContext(rootDir);
   const targets = files?.length
     ? files.map((file) => path.resolve(rootDir, file))
-    : walkDirectorySync(path.join(rootDir, "ui/src"))
-        .map(({ relativePath }) => relativePath)
+    : listDirectoryTreeStrictSync(path.join(rootDir, "ui/src"))
+        .map((walkEntry) => walkEntry.relativePath)
         .filter((file) => file.endsWith(".css"))
         .map((file) => path.join(rootDir, "ui/src", file))
         .toSorted();

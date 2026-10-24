@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveAgentWorkspaceDir } from "../../agents/agent-scope-config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { walkDirectory } from "../../infra/directory-walk.js";
+import { listDirectoryTreeStrict } from "../../infra/directory-walk.js";
 import { ignoreMissingPath } from "../../infra/errno.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { removePathWithinRoot } from "../../infra/fs-safe-remove.js";
@@ -118,7 +118,7 @@ async function readSkillFile(skillDir: string, filePath: string): Promise<string
 async function listSkillFiles(
   skillDir: string,
 ): Promise<{ files: string[]; sizeBytes: number; updatedAtMs: number }> {
-  const entries = await walkDirectory(skillDir);
+  const entries = await listDirectoryTreeStrict(skillDir);
   const files: string[] = [];
   let sizeBytes = 0;
   let updatedAtMs = 0;
@@ -228,7 +228,7 @@ async function readRestorableVersion(
   }
   const versionRoot = await root(versionDir);
   const files: Array<[string, Buffer]> = [];
-  for (const { relativePath, dirent: entry } of await walkDirectory(versionDir)) {
+  for (const { relativePath, dirent: entry } of await listDirectoryTreeStrict(versionDir)) {
     const filePath = relativePath.split(path.sep).join("/");
     // Dot entries (e.g. .DS_Store) are not part of a skill and are never restored.
     if (entry.isDirectory() || filePath.split("/").some((segment) => segment.startsWith("."))) {

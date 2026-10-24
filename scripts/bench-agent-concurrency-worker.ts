@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
 import type { SubagentRunRecord } from "../src/agents/subagents/registry/subagent-registry.types.js";
-import { walkDirectorySync } from "../src/infra/directory-walk.js";
+import { listDirectoryTreeStrictSync } from "../src/infra/directory-walk.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../src/state/openclaw-state-db.generated.js";
 import {
   WORKER_RESULT_SENTINEL,
@@ -204,8 +204,8 @@ async function readDurableRows() {
 }
 
 function listSqliteFiles(root: string): string[] {
-  return walkDirectorySync(root)
-    .map(({ relativePath }) => relativePath)
+  return listDirectoryTreeStrictSync(root)
+    .map((walkEntry) => walkEntry.relativePath)
     .filter((entry) => entry.includes(".sqlite"))
     .toSorted();
 }

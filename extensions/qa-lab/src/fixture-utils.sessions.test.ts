@@ -28,6 +28,18 @@ it("counts only regular session logs, never linked files or directories", async 
   await fs.symlink(path.join(outside, "private.jsonl"), path.join(logs, "linked.jsonl"), "file");
   await fs.symlink(logs, path.join(logs, "nested/up"), "dir");
   await expect(
+    countSessionLogMentions({
+      sessionsDir: path.join(logs, "nested/actual.jsonl"),
+      needles: { target: "target" },
+    }),
+  ).rejects.toMatchObject({ code: "ENOTDIR" });
+  await expect(
+    countSessionLogMentions({
+      sessionsDir: path.join(logs, "nested/up"),
+      needles: { target: "target" },
+    }),
+  ).rejects.toMatchObject({ code: "ERR_DIRECTORY_WALK_ROOT_SYMLINK" });
+  await expect(
     countSessionLogMentions({ sessionsDir: logs, needles: { target: "target" } }),
   ).resolves.toEqual({ target: 1 });
   await expect(

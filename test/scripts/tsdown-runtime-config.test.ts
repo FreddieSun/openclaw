@@ -1,5 +1,5 @@
 // Covers bundling rules encoded in the root tsdown config.
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expectDefined } from "@openclaw/normalization-core/expect";
@@ -7,6 +7,7 @@ import { bundledPluginRoot } from "openclaw/plugin-sdk/test-fixtures";
 import type { TsdownPluginOption } from "tsdown";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildPluginSdkPackageExports } from "../../scripts/lib/plugin-sdk-entries.mts";
+import { listDirectoryTreeStrictSync } from "../../src/infra/directory-walk.js";
 import { importFreshModule } from "../../src/plugin-sdk/test-helpers/import-fresh.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../../src/state/openclaw-state-schema.js";
 import tsdownConfig, {
@@ -371,7 +372,8 @@ describe("tsdown config", () => {
     );
     const clients = ["test/e2e", "scripts/e2e"].flatMap((root) => {
       const clientRoot = new URL(`../../${root}/`, import.meta.url);
-      return readdirSync(clientRoot, { recursive: true, encoding: "utf8" })
+      return listDirectoryTreeStrictSync(fileURLToPath(clientRoot))
+        .map((walkEntry) => walkEntry.relativePath)
         .filter((file) => file.endsWith("-docker-client.ts"))
         .map((file) => new URL(file, clientRoot));
     });

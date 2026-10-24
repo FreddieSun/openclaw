@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { walkDirectory } from "openclaw/plugin-sdk/file-access-runtime";
+import { listDirectoryTreeStrict } from "openclaw/plugin-sdk/file-access-runtime";
 import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import { hasNodeErrorCode } from "openclaw/plugin-sdk/path-existence-runtime";
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
@@ -202,7 +202,7 @@ async function visitSessionLogEvents(
   sessionsDir: string,
   visit: (eventJson: string) => void,
 ): Promise<void> {
-  const files = await walkDirectory(sessionsDir).catch((error: unknown) => {
+  const files = await listDirectoryTreeStrict(sessionsDir).catch((error: unknown) => {
     if (hasNodeErrorCode(error, "ENOENT")) {
       return [];
     }

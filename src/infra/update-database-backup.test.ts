@@ -7,12 +7,12 @@ import { DatabaseSync } from "node:sqlite";
 import { configureFsSafeNative, getFsSafeNativeConfig } from "@openclaw/fs-safe/config";
 import { afterEach, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { parseUpdateRecoveryBackupManifest } from "../commands/backup-verify-manifest.js";
 import { createOpenClawDatabaseMaintenanceScope } from "../state/openclaw-state-db-async-lifecycle.js";
 import { admitOpenClawMaintenanceLiveAuthorityReads } from "../state/openclaw-state-maintenance-context.js";
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 import * as durability from "./directory-durability.js";
+import { listDirectoryTreeStrict } from "./directory-walk.js";
 import * as diskSpace from "./disk-space.js";
 import * as fileDescriptor from "./file-descriptor.js";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
@@ -28,63 +28,14 @@ import {
   createUpdateDatabaseBackup,
   createUpdateDatabaseBackupInProcess,
 } from "./update-database-backup.js";
+import { fixture } from "./update-database-backup.test-support.js";
 import * as databaseGenerations from "./update-physical-database-generations.js";
 import type { UpdateRecoveryBaselineRef } from "./update-recovery-baseline-capture.js";
 import type { UpdateRecoveryCaptureAcquisition } from "./update-recovery-capture-acquisition.js";
 
-const dirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => {
   vi.restoreAllMocks();
 });
-
-async function fixture(externalAgents = false) {
-  const root = await fs.realpath(dirs.make("update-database-backup-preflight-"));
-  const stateDir = path.join(root, "state");
-  const shared = path.join(stateDir, "state/openclaw.sqlite");
-  const backupRoot = path.join(root, "retained-package");
-  const directory = `${backupRoot}.databases`;
-  const stagingRoot = path.join(root, "scratch");
-  const external = externalAgents
-    ? [path.join(root, "external-a/agent.sqlite"), path.join(root, "external-b/agent.sqlite")]
-    : [];
-  for (const parent of [
-    path.dirname(shared),
-    directory,
-    stagingRoot,
-    ...external.map((file) => path.dirname(file)),
-  ]) {
-    await fs.mkdir(parent, { recursive: true, mode: 0o700 });
-  }
-  for (const file of [shared, ...external]) {
-    using db = new DatabaseSync(file);
-    db.exec(
-      "PRAGMA user_version=17; CREATE TABLE payload(value TEXT); INSERT INTO payload(rowid,value) VALUES(42,'retained');",
-    );
-    if (file === shared) {
-      db.exec("CREATE TABLE agent_databases(path TEXT)");
-      for (const agent of external) {
-        db.prepare("INSERT INTO agent_databases VALUES (?)").run(agent);
-      }
-    } else {
-      db.exec(
-        "CREATE TABLE schema_meta(meta_key TEXT, role TEXT, agent_id TEXT); INSERT INTO schema_meta VALUES ('primary','agent','main');",
-      );
-      db.prepare("UPDATE payload SET value = ?").run(path.basename(path.dirname(file)));
-    }
-  }
-  const input = { backupRoot, stateDir, config: {}, env: {}, stagingRoot };
-  const inspectionPlan = await discoverUpdateStateSchemaInspectionInProcess(input);
-  return {
-    root,
-    stateDir,
-    shared,
-    directory,
-    external,
-    input,
-    inspectionPlan,
-    capture: () => createUpdateDatabaseBackupInProcess({ ...input, inspectionPlan }),
-  };
-}
 
 it.each(["legacy", "current"] as const)(
   "captures the %s parent's database inventory including retained custom state",
@@ -1011,9 +962,9 @@ it.each(["insufficient", "unknown"] as const)(
       expect(backup.warnings).toContain(
         `Available disk space could not be measured near ${externalDirectories[0]}; database backup will be attempted.`,
       );
-      const retainedAgentFiles = (await fs.readdir(backup.directory, { recursive: true }))
-        .filter((file) => file.endsWith("agent.sqlite"))
-        .toSorted();
+      const retainedAgentFiles = (await listDirectoryTreeStrict(backup.directory))
+        .map((entry) => entry.relativePath)
+        .filter((file) => file.endsWith("agent.sqlite"));
       expect(retainedAgentFiles).toEqual([
         expect.stringMatching(/[\\/]external-a[\\/]agent\.sqlite$/u),
         expect.stringMatching(/[\\/]external-b[\\/]agent\.sqlite$/u),
