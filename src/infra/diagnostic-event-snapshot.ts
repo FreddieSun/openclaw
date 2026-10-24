@@ -135,6 +135,7 @@ export function captureQueuedDiagnosticEvent(
     event: DiagnosticEventPayload;
     metadata: DiagnosticEventMetadata;
     privateData?: DiagnosticEventPrivateData;
+    trustedListenersOnly?: boolean;
   },
   interests: Iterable<
     | (InternalDiagnosticEventInterest<DiagnosticEventPayload["type"]> & {
@@ -144,20 +145,28 @@ export function captureQueuedDiagnosticEvent(
   >,
 ): boolean {
   try {
-    entry.event = cloneDiagnosticValueForListener(entry.event, true);
-    if (entry.privateData) {
-      let interested = false;
+    let interested = false;
+    let includePrivateData = false;
+    if (entry.privateData || entry.trustedListenersOnly) {
       for (const interest of interests) {
         if (
-          interest?.includePrivateData !== false &&
           isInternalDiagnosticEventInterested(interest, entry.event.type, entry.metadata.trusted)
         ) {
           interested = true;
-          break;
+          if (interest?.includePrivateData !== false) {
+            includePrivateData = true;
+            break;
+          }
         }
       }
+    }
+    if (entry.trustedListenersOnly && !interested) {
+      return false;
+    }
+    entry.event = cloneDiagnosticValueForListener(entry.event, true);
+    if (entry.privateData) {
       try {
-        entry.privateData = interested
+        entry.privateData = includePrivateData
           ? cloneDiagnosticValueForListener(entry.privateData)
           : undefined;
       } catch (error) {

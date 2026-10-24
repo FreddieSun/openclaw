@@ -337,6 +337,22 @@ describe("diagnostic-events", () => {
     expect(clone).toHaveBeenCalledTimes(1);
   });
 
+  it("does not snapshot disabled-diagnostics skill events without an interested trusted consumer", () => {
+    setEnabled(false);
+    const clone = vi.spyOn(globalThis, "structuredClone");
+    onInternal(() => {});
+    onTrusted(() => {}, { include: ["model.usage"] });
+    emitSkill({
+      type: "skill.used",
+      skillName: "synthetic",
+      skillSource: "bundled",
+      activation: "read",
+      trace: { ...diagnosticTraceInput },
+    });
+    expect(clone).not.toHaveBeenCalled();
+    expect(hasPending(() => true)).toBe(false);
+  });
+
   it.each(["mutable leaf", "frozen getter"])(
     "snapshots a frozen %s instead of trusting its envelope",
     async (kind) => {
