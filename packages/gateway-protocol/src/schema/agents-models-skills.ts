@@ -247,6 +247,15 @@ export const ModelsListParamsSchema = Type.Object(
   { additionalProperties: false },
 );
 
+/** Reads the default agent's effective model without a session override. */
+export const ModelsDefaultParamsSchema = Type.Object({}, { additionalProperties: false });
+
+/** Canonical provider-qualified model reference for a new ordinary session. */
+export const ModelsDefaultResultSchema = Type.Object(
+  { id: NonEmptyString },
+  { additionalProperties: false },
+);
+
 /** Model catalog result. */
 export const ModelsListResultSchema = Type.Object(
   {

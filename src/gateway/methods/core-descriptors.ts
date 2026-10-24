@@ -91,6 +91,7 @@ export const CORE_GATEWAY_METHOD_SPECS: readonly CoreGatewayMethodSpec[] = [
   { name: "talk.speak", scope: "operator.write" },
   { name: "talk.mode", scope: "operator.write" },
   { name: "commands.list", scope: "operator.read" },
+  { name: "models.default", scope: "operator.read", startup: true },
   { name: "models.list", scope: "operator.read", startup: true },
   { name: "models.authStatus", scope: "operator.read" },
   { name: "models.authLogout", scope: "operator.admin", controlPlaneWrite: true },

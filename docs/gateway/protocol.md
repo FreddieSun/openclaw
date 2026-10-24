@@ -343,6 +343,7 @@ methods. Treat this as feature discovery, not a full enumeration of
   </Accordion>
 
   <Accordion title="Models and usage">
+    - `models.default` resolves the default agent's effective model for a new session without a model override. Requires `operator.read`. See "`models.default`" below.
     - `models.list` returns the runtime-allowed model catalog. See "`models.list` views" below.
     - `usage.status` returns provider usage windows/remaining quota summaries.
     - `usage.cost` returns aggregated cost usage summaries for a date range. Pass `agentId` for one agent, or `agentScope: "all"` to aggregate configured agents.
@@ -671,6 +672,19 @@ context.
     the default agent workspace.
   - Config mode patches `skills.entries.<skillKey>` values such as `enabled`,
     `apiKey`, and `env`.
+
+### `models.default`
+
+Send `models.default` with empty parameters (`{}`). The response is
+`{ "id": "provider/model" }`, resolved from the current runtime configuration
+using the default agent and the same provider, alias, and inheritance rules as
+a new ordinary session. The query does not create a session or invoke a model.
+Existing session overrides and failure fallback do not affect the result.
+
+The method requires `operator.read`. Additional parameters, including
+`sessionKey` and `model`, are rejected with `INVALID_REQUEST`. A resolution
+failure returns `UNAVAILABLE`; the response does not include configuration or
+internal paths.
 
 ### `models.list` views
 

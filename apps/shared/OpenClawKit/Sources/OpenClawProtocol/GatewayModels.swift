@@ -5767,6 +5767,22 @@ public struct ModelChoice: Codable, Sendable {
     }
 }
 
+public struct ModelsDefaultParams: Codable, Sendable {}
+
+public struct ModelsDefaultResult: Codable, Sendable {
+    public let id: String
+
+    public init(
+        id: String)
+    {
+        self.id = id
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+    }
+}
+
 public struct ModelsListParams: Codable, Sendable {
     public let view: AnyCodable?
 

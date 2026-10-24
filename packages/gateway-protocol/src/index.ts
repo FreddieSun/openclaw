@@ -307,6 +307,10 @@ import {
   TerminalTextParamsSchema,
   type TerminalTextResult,
   TerminalTextResultSchema,
+  type ModelsDefaultParams,
+  type ModelsDefaultResult,
+  ModelsDefaultParamsSchema,
+  ModelsDefaultResultSchema,
   type ModelsListParams,
   ModelsListParamsSchema,
   type NodeDescribeParams,
@@ -916,6 +920,8 @@ export const validateChannelsStopParams = lazyCompile<ChannelsStopParams>(Channe
 export const validateChannelsLogoutParams = lazyCompile<ChannelsLogoutParams>(
   ChannelsLogoutParamsSchema,
 );
+export const validateModelsDefaultParams =
+  lazyCompile<ModelsDefaultParams>(ModelsDefaultParamsSchema);
 export const validateModelsListParams = lazyCompile<ModelsListParams>(ModelsListParamsSchema);
 export const validateSkillsStatusParams = lazyCompile<SkillsStatusParams>(SkillsStatusParamsSchema);
 export const validateToolsCatalogParams = lazyCompile<ToolsCatalogParams>(ToolsCatalogParamsSchema);
@@ -1307,6 +1313,8 @@ export {
   PluginsSessionActionResultSchema,
   PluginsUiDescriptorsParamsSchema,
   PluginsUiDescriptorsResultSchema,
+  ModelsDefaultParamsSchema,
+  ModelsDefaultResultSchema,
   ModelsListParamsSchema,
   SkillsStatusParamsSchema,
   ToolsCatalogParamsSchema,
