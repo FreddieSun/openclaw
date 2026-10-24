@@ -1,5 +1,5 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { assert, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionsPatchManyParams } from "../../../packages/gateway-protocol/src/index.js";
 import {
   attachActiveEmbeddedRun,
@@ -662,9 +662,7 @@ describe("sessions.patch", () => {
         createdActor: { type: "human", source: "profile", id: profileId },
         createdAt: expect.any(Number),
       });
-      if (!entry) {
-        throw new Error("expected patch-created session entry");
-      }
+      assert(entry, "expected patch-created session entry");
       expect(
         createSessionListEntryFilter({ client: requestClient, cfg })?.(sessionKey, entry),
       ).toBe(true);
@@ -691,9 +689,7 @@ describe("sessions.assignOwner", () => {
           agents: { ownership: "explicit", entries: { main: {}, research: {} } },
         } as OpenClawConfig;
         const target = await resolveSessionSharingTargetAsync({ cfg, sessionKey, agentId: "main" });
-        if (!target) {
-          throw new Error("expected lifecycle assignment target");
-        }
+        assert(target, "expected lifecycle assignment target");
         const entered = createDeferredCore();
         const release = createDeferredCore();
         const lifecycle = runSessionMutation({

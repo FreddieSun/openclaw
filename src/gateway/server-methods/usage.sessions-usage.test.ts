@@ -625,6 +625,16 @@ it("rolls up known session family ids when historical usage is requested", async
     uniqueTools: rows.length,
     tools: rows.map(([name, count]) => ({ name, count })),
   });
+  const daily = (date: string, tokens: number, cost: number, missingCostEntries: number) => ({
+    ...usageTotals(tokens, cost),
+    date,
+    tokens,
+    cost,
+    missingCostEntries,
+    missingCostByModel: { "fixture/unpriced": missingCostEntries },
+  });
+  const readFamily = () =>
+    readSessionsUsage({ key: storeKey, groupBy: "family", includeHistorical: true });
 
   const oldSessionFile = "/tmp/old.jsonl.reset.2026-02-01T00-00-00.000Z";
   const oldestSessionFile = "/tmp/oldest.jsonl.reset.2026-01-31T00-00-00.000Z";
@@ -663,18 +673,10 @@ it("rolls up known session family ids when historical usage is requested", async
           ? { count: 2, avgMs: 25, p95Ms: 30, minMs: 20, maxMs: 30 }
           : { count: 1, avgMs: 10, p95Ms: 10, minMs: 10, maxMs: 10 };
       const totals = usageTotals(totalTokens, totalCost);
-      const daily = {
-        ...totals,
-        date,
-        tokens: totalTokens,
-        cost: totalCost,
-        missingCostEntries: 1,
-        missingCostByModel: { "fixture/unpriced": 1 },
-      };
       const summary: SessionCostSummary = {
         ...totals,
         activityDates: [date],
-        dailyBreakdown: [daily],
+        dailyBreakdown: [daily(date, totalTokens, totalCost, 1)],
         messageCounts,
         dailyMessageCounts: [{ date, ...messageCounts }],
         utcQuarterHourMessageCounts: [{ date, quarterIndex: 2, ...messageCounts }],
@@ -705,11 +707,7 @@ it("rolls up known session family ids when historical usage is requested", async
     return freshUsageBatch(summaries);
   });
 
-  const result = await readSessionsUsage({
-    key: storeKey,
-    groupBy: "family",
-    includeHistorical: true,
-  });
+  const result = await readFamily();
 
   const models = [
     { provider: "fixture", model: "bedrock::arn" },
@@ -728,25 +726,7 @@ it("rolls up known session family ids when historical usage is requested", async
         usage: {
           totalTokens: 60,
           totalCost: expect.closeTo(0.06),
-          dailyBreakdown: [
-            {
-              date: "2026-02-01",
-              tokens: 30,
-              cost: 0.03,
-              totalTokens: 30,
-              totalCost: 0.03,
-              input: 30,
-              inputCost: 0.03,
-              missingCostEntries: 2,
-              missingCostByModel: { "fixture/unpriced": 2 },
-            },
-            {
-              date: "2026-02-02",
-              totalTokens: 30,
-              totalCost: 0.03,
-              missingCostByModel: { "fixture/unpriced": 1 },
-            },
-          ],
+          dailyBreakdown: [daily("2026-02-01", 30, 0.03, 2), daily("2026-02-02", 30, 0.03, 1)],
           activityDates: ["2026-02-01", "2026-02-02"],
           messageCounts: { total: 3 },
           dailyMessageCounts: [
@@ -767,12 +747,7 @@ it("rolls up known session family ids when historical usage is requested", async
           ],
           latency: { count: 6, avgMs: 13.5, p95Ms: 30, minMs: 5, maxMs: 30 },
           // a-second overtakes z-first before their counts tie again.
-          toolUsage: {
-            tools: [
-              { name: "a-second", count: 3 },
-              { name: "z-first", count: 3 },
-            ],
-          },
+          toolUsage: tools(["a-second", 3], ["z-first", 3]),
           modelUsage: models,
           dailyModelUsage: [dailyModels[0], dailyModels[1], dailyModels[0]],
         },
@@ -795,11 +770,7 @@ it("rolls up known session family ids when historical usage is requested", async
     ),
     cacheStatus: { status: "partial", cachedFiles: 1, pendingFiles: 1, staleFiles: 0 },
   }));
-  const partial = await readSessionsUsage({
-    key: storeKey,
-    groupBy: "family",
-    includeHistorical: true,
-  });
+  const partial = await readFamily();
   expect(partial.sessions).toMatchObject([
     { key: storeKey, computing: true, usage: { totalTokens: 20 } },
   ]);

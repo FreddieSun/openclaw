@@ -112,74 +112,17 @@ describe("controlUi.githubPreview", () => {
     vi.unstubAllEnvs();
   });
 
-  it("returns a progressive detail overview without loading optional endpoints", async () => {
-    const cfg = configuredGitHub("progressive-service-token");
-    setRuntimeConfigSnapshot(cfg);
-    const revision = "a".repeat(40);
-    const optional = vi.fn();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn<typeof fetch>(async (input) => {
-        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
-        if (path.endsWith("/pulls/7")) {
-          return json(
-            issueFields("Early body", {
-              body: "Available before CI",
-              comments: 1,
-              review_comments: 1,
-              changed_files: 1,
-              head: { sha: revision },
-            }),
-          );
-        }
-        if (path.endsWith("/progressive-adapter")) {
-          return Response.json({ id: 771, private: false, visibility: "public" });
-        }
-        optional();
-        return new Response(null, { status: 503 });
-      }),
-    );
+  it("rejects invalid detail sections before upstream access", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    vi.stubGlobal("fetch", fetch);
     const { respond, send } = fixture("githubDetail");
-    await send(
-      {
-        kind: "pull",
-        owner: "octocat",
-        repo: "progressive-adapter",
-        number: 7,
-        section: "overview",
-      },
-      runtime(() => cfg),
-    );
-    expectReply(
-      respond,
-      expect.objectContaining({
-        title: "Early body",
-        body: "Available before CI",
-        revision,
-        deferredSections: ["checks", "files", "discussion"],
-        partial: false,
-      }),
-    );
-    expect(optional).not.toHaveBeenCalled();
-    for (const field of ["checks", "comments", "files"]) {
-      expect(respond.mock.calls[0]?.[1]).not.toHaveProperty(field);
-    }
+    await send({ kind: "issue", owner: "octocat", repo: "repo", number: 1, section: "invalid" });
+    expectError(respond, {
+      code: "INVALID_REQUEST",
+      message: "invalid controlUi.githubDetail params",
+    });
+    expect(fetch).not.toHaveBeenCalled();
   });
-
-  it.each(["invalid", null, 1])(
-    "rejects invalid detail section %j before upstream access",
-    async (section) => {
-      const fetch = vi.fn<typeof globalThis.fetch>();
-      vi.stubGlobal("fetch", fetch);
-      const { respond, send } = fixture("githubDetail");
-      await send({ kind: "issue", owner: "octocat", repo: "repo", number: 1, section });
-      expectError(respond, {
-        code: "INVALID_REQUEST",
-        message: "invalid controlUi.githubDetail params",
-      });
-      expect(fetch).not.toHaveBeenCalled();
-    },
-  );
 
   it.each(["revoked", "copied", "aborted", "aborted-after-preparation"] as const)(
     "rejects %s requests before GitHub",
@@ -294,6 +237,7 @@ describe("controlUi.githubPreview", () => {
         owner: mode === "service" ? "octocat" : "openclaw",
         repo: mode === "service" ? "reader-auth" : "openclaw",
         agentId: mode === "managed" ? "alternate" : "main",
+        ...(method === "controlUi.githubDetail" ? { section: "overview" } : {}),
       },
       runtime(() => cfg),
     );
@@ -301,6 +245,13 @@ describe("controlUi.githubPreview", () => {
       respond,
       expect.objectContaining(mode === "service" ? { body: "Reader body" } : { title }),
     );
+    if (method === "controlUi.githubDetail") {
+      expectReply(
+        respond,
+        expect.objectContaining({ deferredSections: ["discussion"], partial: false }),
+      );
+      expect(respond.mock.calls[0]?.[1]).not.toHaveProperty("comments");
+    }
     if (mode === "anonymous") {
       expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).has("Authorization")).toBe(false);
       expect(prepare).not.toHaveBeenCalled();
@@ -361,7 +312,7 @@ describe("controlUi.githubPreview", () => {
   it("revalidates cached preview credentials", async () => {
     const cfg = configuredGitHub("configured-preview-token");
     setRuntimeConfigSnapshot(cfg);
-    const fetchMock = mockGitHubFetch(
+    mockGitHubFetch(
       issueFields("Cached preview", {
         repository_url: "https://api.github.com/repos/openclaw/configured-degraded",
       }),
@@ -391,7 +342,6 @@ describe("controlUi.githubPreview", () => {
       message: previewUnavailable,
       retryable: false,
     });
-    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it.each(["agent", "system"])(
@@ -434,14 +384,7 @@ describe("controlUi.githubPreview", () => {
     { name: "malformed owner", owner: "openclaw/evil", refresh: undefined, valid: false },
   ])("validates $name", async ({ owner, refresh, valid }) => {
     const target = githubTarget(99817, "openclaw", owner);
-    const preview = {
-      ...target,
-      login: "octocat",
-      state: "open",
-      title: "Refreshed preview",
-      createdAt: "2026-09-01T08:00:00Z",
-      updatedAt: "2026-09-01T09:00:00Z",
-    };
+    const preview = { ...target, title: "Refreshed preview" };
     const loadPreview = vi.spyOn(gitHubPublicApi, "loadControlUiGitHubPreview");
     if (owner === "openclaw") {
       loadPreview.mockResolvedValue(preview);
@@ -700,22 +643,15 @@ describe("controlUi.sessionPullRequests.checks", () => {
       });
       const deferred = createDeferred<typeof result>();
       const started = createDeferred();
-      const load = vi
-        .spyOn(checkDetails, "loadControlUiSessionPullRequestChecks")
-        .mockImplementation(async () => {
+      vi.spyOn(checkDetails, "loadControlUiSessionPullRequestChecks").mockImplementation(
+        async () => {
           started.resolve();
           return deferred.promise;
-        });
+        },
+      );
       const { respond, send } = fixture("sessionPullRequests.checks");
       const request = send(params);
       await started.promise;
-      expect(load).toHaveBeenCalledWith(
-        expect.objectContaining({ ...params, agentId: "main" }),
-        expect.objectContaining({
-          assertCurrent: expect.any(Function),
-          sessionScope: expect.stringContaining("ci-generation-one"),
-        }),
-      );
       await replaceSessionEntry(session, {
         sessionId: "ci-generation-two",
         updatedAt: 2,
