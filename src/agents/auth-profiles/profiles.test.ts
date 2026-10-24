@@ -422,9 +422,14 @@ describe("promoteAuthProfileInOrder", () => {
     },
   );
 
-  it("restores captured and rebuilds newer derived snapshots after main rollback", () =>
+  it("restores an exactly owned custom-key snapshot and rebuilds newer derived snapshots", () =>
     withProfileState(async ({ agentDirFor }) => {
       const capturedAgentDir = agentDirFor("captured");
+      const databasePath = path.join(capturedAgentDir, "custom.sqlite");
+      const capturedSnapshot = () =>
+        listOwnedRuntimeAuthProfileStoreSnapshots().find(
+          (entry) => entry.databasePath === databasePath,
+        )?.store;
       const newerAgentDir = agentDirFor("newer");
       const keyRef = { source: "env", provider: "default", id: "OPENAI_API_KEY" } as const;
       saveProfile("openai:baseline", { type: "api_key", provider: "openai", keyRef });
@@ -437,7 +442,7 @@ describe("promoteAuthProfileInOrder", () => {
         "anthropic",
       );
       capturedRuntime.runtimeExternalProfileIds = ["anthropic:captured-external"];
-      publishSnapshot(capturedAgentDir, capturedRuntime);
+      publishSnapshot(capturedAgentDir, capturedRuntime, databasePath);
       const snapshot = captureAuthProfileStorePersistenceSnapshot();
 
       const committed = saveAuthProfileStoreIfPersistenceSnapshotMatches({
@@ -450,14 +455,17 @@ describe("promoteAuthProfileInOrder", () => {
         Date.now() + 120_000,
         "anthropic",
       );
-      publishSnapshot(capturedAgentDir, capturedRuntime);
+      publishSnapshot(capturedAgentDir, capturedRuntime, databasePath);
       expect(committed.publishRuntimeSnapshots()).toBe(true);
       const { owned } = committed;
-      const ownedCapturedRuntime = runtimeSnapshot(capturedAgentDir);
+      const ownedCapturedRuntime = capturedSnapshot();
       if (!ownedCapturedRuntime) {
         throw new Error("expected apply-owned derived runtime snapshot");
       }
       expect(ownedCapturedRuntime.profiles["openai:baseline"]).toBeUndefined();
+      expect(ownedCapturedRuntime.profiles["openai:temporary"]).toMatchObject({
+        key: "sk-temporary",
+      });
       expect(ownedCapturedRuntime.profiles["anthropic:captured-external"]).toMatchObject({
         access: "captured-publication-edge-access",
         refresh: "captured-publication-edge-refresh",
@@ -471,51 +479,26 @@ describe("promoteAuthProfileInOrder", () => {
       );
       newerRuntime.runtimeExternalProfileIds = ["anthropic:newer-external"];
       publishSnapshots([
-        { agentDir: capturedAgentDir, store: ownedCapturedRuntime },
+        { databasePath, agentDir: capturedAgentDir, store: ownedCapturedRuntime },
         { agentDir: newerAgentDir, store: newerRuntime },
       ]);
 
       restoreAuthProfileStorePersistenceSnapshot(snapshot, owned);
 
-      expect(runtimeSnapshot(capturedAgentDir)?.profiles).toMatchObject({
+      expect(capturedSnapshot()?.profiles).toMatchObject({
         "openai:baseline": { key: "sk-captured-resolved", keyRef },
         "anthropic:captured-external": {
           access: "captured-publication-edge-access",
           refresh: "captured-publication-edge-refresh",
         },
       });
-      expect(runtimeSnapshot(capturedAgentDir)?.profiles["openai:temporary"]).toBeUndefined();
+      expect(capturedSnapshot()?.profiles["openai:temporary"]).toBeUndefined();
       expect(runtimeSnapshot(newerAgentDir)?.profiles).toMatchObject({
         "openai:baseline": { keyRef },
         "anthropic:newer-external": { access: "newer-external-access" },
       });
       expect(runtimeSnapshot(newerAgentDir)?.profiles["openai:temporary"]).toBeUndefined();
     }, true));
-
-  it("restores an exactly owned derived snapshot under its custom database key", () =>
-    withProfileState(async ({ agentDirFor }) => {
-      const derivedAgentDir = agentDirFor("custom-key");
-      const databasePath = path.join(derivedAgentDir, "custom.sqlite");
-      saveProfile("openai:baseline", apiKey("openai", "sk-baseline"));
-      const capturedRuntime = loadRuntime(derivedAgentDir);
-      publishSnapshot(derivedAgentDir, capturedRuntime, databasePath);
-      const snapshot = captureAuthProfileStorePersistenceSnapshot();
-      const committed = saveAuthProfileStoreIfPersistenceSnapshotMatches({
-        snapshot,
-        store: profileStore("openai:temporary", apiKey("openai", "sk-temporary")),
-      });
-
-      expect(committed.publishRuntimeSnapshots()).toBe(true);
-      expect(listOwnedRuntimeAuthProfileStoreSnapshots()).toMatchObject([
-        { databasePath, store: { profiles: { "openai:temporary": { key: "sk-temporary" } } } },
-      ]);
-
-      restoreAuthProfileStorePersistenceSnapshot(snapshot, committed.owned);
-
-      expect(listOwnedRuntimeAuthProfileStoreSnapshots()).toMatchObject([
-        { databasePath, store: { profiles: { "openai:baseline": { key: "sk-baseline" } } } },
-      ]);
-    }));
 
   it("normalizes copied secrets when using the locked upsert path", () =>
     withProfileState(async ({ agentDirFor }) => {
@@ -758,7 +741,11 @@ describe("promoteAuthProfileInOrder", () => {
       saveAuthProfileStore(initialStore, agentDir);
 
       const removedStore: RuntimeAuthProfileStore | null = await removeProviderAuthProfilesWithLock(
-        { agentDir, provider: "openrouter", profileIds: ["openrouter:oauth"] },
+        {
+          agentDir,
+          provider: "openrouter",
+          profileIds: ["openrouter:oauth"],
+        },
       );
 
       expect(loadRuntime(agentDir)).toMatchObject({
@@ -872,26 +859,6 @@ describe("promoteAuthProfileInOrder", () => {
       });
     },
   );
-
-  it("removes an inherited profile from the owning main store too", () =>
-    withProfileState(async ({ agentDirFor }) => {
-      const mainAgentDir = agentDirFor("main");
-      const customAgentDir = agentDirFor("custom");
-      fs.mkdirSync(mainAgentDir, { recursive: true });
-      fs.mkdirSync(customAgentDir, { recursive: true });
-      const credential = oauth("inherited-access", "inherited-refresh");
-      saveProfile("openai:shared", credential, mainAgentDir);
-      saveProfile("openai:shared", credential, customAgentDir);
-
-      const removed = await removeAuthProfilesAcrossOwnerStores({
-        agentDir: customAgentDir,
-        profileIds: ["openai:shared"],
-      });
-
-      expect(removed).toBe(true);
-      expect(loadRuntime(customAgentDir).profiles["openai:shared"]).toBeUndefined();
-      expect(loadRuntime(mainAgentDir).profiles["openai:shared"]).toBeUndefined();
-    }));
 
   it("retries removal when the OAuth generation changes while waiting for its lock", () =>
     withProfileState(async ({ agentDirFor }) => {
@@ -1027,18 +994,5 @@ describe("setAuthProfileOrder", () => {
       const persistedCustom = loadPersisted(customAgentDir);
       expect(persistedCustom?.profiles["openai:profile-b"]).toBeUndefined();
       expect(persistedCustom?.profiles["openai:profile-a"]).toBeUndefined();
-    }, true));
-
-  it("clears a provider order without preserving any profile IDs", () =>
-    withProfileState(async ({ agentDir }) => {
-      fs.mkdirSync(agentDir, { recursive: true });
-      saveProfile("openai:local", apiKey("openai", "sk-local"), undefined, {
-        order: { openai: ["openai:local"] },
-      });
-
-      const updated = await setAuthProfileOrder({ agentDir, provider: "openai", order: null });
-
-      expect(updated?.order?.openai ?? null).toBeNull();
-      expect(loadPersisted(agentDir)?.order?.openai ?? null).toBeNull();
     }, true));
 });

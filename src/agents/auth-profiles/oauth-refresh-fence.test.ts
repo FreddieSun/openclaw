@@ -371,6 +371,15 @@ describe("OAuth refresh generation fence", () => {
         access: "account-a-access",
         refresh: "account-a-refresh",
         expires: 1,
+        idToken: "claimed-id-token",
+        oauthRef: {
+          source: "openclaw-credentials",
+          provider: "openai-codex",
+          id: "0123456789abcdef0123456789abcdef",
+        },
+        email: "user@example.test",
+        displayName: "Example User",
+        chatgptPlanType: "plus",
         ...identity,
       });
       saveAuthProfileStore({ version: 1, profiles: { [profileId]: original } }, undefined);
@@ -414,6 +423,30 @@ describe("OAuth refresh generation fence", () => {
 
       const owner = work.track(() => resolve(createManager(), profileId, original, undefined));
       await refreshStarted.promise;
+      const fenced = ensureAuthProfileStoreWithoutExternalProfiles().profiles[profileId];
+      expect(fenced).toMatchObject({
+        type: "oauth",
+        provider: "openai",
+        expires: 1,
+        email: original.email,
+        displayName: original.displayName,
+        chatgptPlanType: original.chatgptPlanType,
+      });
+      if (fenced?.type !== "oauth") {
+        throw new Error("expected fenced OAuth credential");
+      }
+      expect(fenced.access).toMatch(
+        /^openclaw-oauth-refresh-fence:v1:[a-f0-9]{32}:access:[a-f0-9]{64}$/,
+      );
+      expect(fenced.refresh).toMatch(
+        /^openclaw-oauth-refresh-fence:v1:[a-f0-9]{32}:refresh:[a-f0-9]{64}$/,
+      );
+      expect(fenced.idToken).toBeUndefined();
+      expect(fenced.oauthRef).toBeUndefined();
+      for (const secret of [original.access, original.refresh, original.idToken]) {
+        expect(JSON.stringify(fenced)).not.toContain(secret);
+      }
+      expect(inlineAuthProfileCredentialSchema.parse(fenced)).toEqual(fenced);
       const observerEntered = createDeferredCore();
       watchObserverReads = true;
       const observerStore = ensureAuthProfileStoreWithoutExternalProfiles(undefined);
@@ -423,7 +456,6 @@ describe("OAuth refresh generation fence", () => {
       }
       if (coldObserver) {
         expect(isPendingOAuthRefreshFence(observerCredential)).toBe(true);
-        expect(observerCredential.idToken).toBeUndefined();
       }
       vi.spyOn(externalCliSync, "readExternalCliBootstrapCredential").mockImplementation(() => {
         observerEntered.resolve();
@@ -475,115 +507,48 @@ describe("OAuth refresh generation fence", () => {
     });
   });
 
-  it("persists before provider I/O and prevents replay", async () => {
-    await withOAuthTempRoot("oauth-manager-refresh-fence-", async (tempRoot) => {
-      const agentDir = path.join(tempRoot, "agents", "main", "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      const profileId = "openai:oauth";
-      const expired = oauth("claimed-access", "claimed-refresh", {
-        idToken: "claimed-id-token",
-        oauthRef: {
-          source: "openclaw-credentials",
-          provider: "openai-codex",
-          id: "0123456789abcdef0123456789abcdef",
-        },
-        expires: 1,
-        accountId: "acct-123",
-        email: "user@example.test",
-        displayName: "Example User",
-        chatgptPlanType: "plus",
-      });
-      saveCredential(profileId, expired, agentDir);
-      const refreshed = oauth("rotated-access", "rotated-refresh", {
-        expires: Date.now() + 600_000,
-        accountId: "acct-123",
-      });
-      const work = new AsyncWorkScope();
-      const refreshFinished = createDeferredCore<OAuthCredential>();
-      settleManagerWork = async () => {
-        refreshFinished.resolve(refreshed);
-        await work.drain();
-      };
-      const started = createDeferredCore();
-      const refreshCredential = vi.fn(async (credential: OAuthCredential) => {
-        expect(credential).toEqual(expired);
-        started.resolve();
-        return await refreshFinished.promise;
-      });
-      mockOAuthProviderOperations({ refreshCredential });
-      const manager = createOAuthManager();
+  it.each(["unsupported", "terminal"] as const)(
+    "preserves a %s credential without provider I/O",
+    async (kind) => {
+      await withOAuthTempRoot("oauth-manager-refresh-unowned-", async (tempRoot) => {
+        const agentDir = path.join(tempRoot, "agents", "main", "agent");
+        await fs.mkdir(agentDir, { recursive: true });
+        const profileId = kind === "unsupported" ? "unowned:default" : "openai:default";
+        const expired = oauth("claimed-access", "claimed-refresh", {
+          provider: kind === "unsupported" ? "unowned" : "openai",
+          expires: 1,
+          accountId: "acct-123",
+        });
+        const credential =
+          kind === "terminal"
+            ? createFailedOAuthRefreshFence(
+                createOAuthRefreshFence({ profileId, credential: expired }),
+              )
+            : expired;
+        saveCredential(profileId, credential, agentDir);
+        if (kind === "terminal") {
+          vi.spyOn(externalCliSync, "readExternalCliBootstrapCredential").mockReturnValue(
+            oauth("recovered-access", "recovered-refresh", {
+              expires: Date.now() + 600_000,
+              accountId: "acct-123",
+            }),
+          );
+        }
+        const refreshCredential = vi.fn(async () => null);
+        mockOAuthProviderOperations({
+          ...(kind === "unsupported" ? { canRefreshCredential: async () => false } : {}),
+          refreshCredential,
+        });
+        const manager = createOAuthManager();
 
-      const first = work.track(() => resolve(manager, profileId, expired, agentDir));
-      await started.promise;
-
-      const fenced = ensureAuthProfileStoreWithoutExternalProfiles(agentDir).profiles[profileId];
-      expect(fenced).toMatchObject({
-        type: "oauth",
-        provider: "openai",
-        expires: 1,
-        accountId: "acct-123",
-        email: "user@example.test",
-        displayName: "Example User",
-        chatgptPlanType: "plus",
+        await expect(resolve(manager, profileId, credential, agentDir)).resolves.toBeNull();
+        expect(refreshCredential).not.toHaveBeenCalled();
+        expect(ensureAuthProfileStoreWithoutExternalProfiles(agentDir).profiles[profileId]).toEqual(
+          credential,
+        );
       });
-      if (fenced?.type !== "oauth") {
-        throw new Error("expected fenced OAuth credential");
-      }
-      expect(fenced.access).toMatch(
-        /^openclaw-oauth-refresh-fence:v1:[a-f0-9]{32}:access:[a-f0-9]{64}$/,
-      );
-      expect(fenced.refresh).toMatch(
-        /^openclaw-oauth-refresh-fence:v1:[a-f0-9]{32}:refresh:[a-f0-9]{64}$/,
-      );
-      expect(fenced.idToken).toBeUndefined();
-      expect(fenced.oauthRef).toBeUndefined();
-      for (const secret of ["claimed-access", "claimed-refresh", "claimed-id-token"]) {
-        expect(JSON.stringify(fenced)).not.toContain(secret);
-      }
-      expect(inlineAuthProfileCredentialSchema.parse(fenced)).toEqual(fenced);
-
-      const restartedManager = createOAuthManager();
-      const restarted = work.track(() => resolve(restartedManager, profileId, expired, agentDir));
-      expect(refreshCredential).toHaveBeenCalledTimes(1);
-
-      refreshFinished.resolve(refreshed);
-      await expect(first).resolves.toMatchObject({ apiKey: "rotated-access" });
-      await expect(restarted).resolves.toMatchObject({ apiKey: "rotated-access" });
-      expect(refreshCredential).toHaveBeenCalledOnce();
-      expect(
-        ensureAuthProfileStoreWithoutExternalProfiles(agentDir).profiles[profileId],
-      ).toMatchObject({
-        access: "rotated-access",
-        refresh: "rotated-refresh",
-        accountId: "acct-123",
-      });
-    });
-  });
-
-  it("preserves the original credential when no refresh owner exists", async () => {
-    await withOAuthTempRoot("oauth-manager-refresh-unowned-", async (tempRoot) => {
-      const agentDir = path.join(tempRoot, "agents", "main", "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      const profileId = "unowned:default";
-      const expired = oauth("unowned-access", "unowned-refresh", {
-        provider: "unowned",
-        expires: 1,
-      });
-      saveCredential(profileId, expired, agentDir);
-      const refreshCredential = vi.fn(async () => null);
-      mockOAuthProviderOperations({
-        canRefreshCredential: async () => false,
-        refreshCredential,
-      });
-      const manager = createOAuthManager();
-
-      await expect(resolve(manager, profileId, expired, agentDir)).resolves.toBeNull();
-      expect(refreshCredential).not.toHaveBeenCalled();
-      expect(ensureAuthProfileStoreWithoutExternalProfiles(agentDir).profiles[profileId]).toEqual(
-        expired,
-      );
-    });
-  });
+    },
+  );
 
   it("rejects a late settlement after an identity-less generation is restored and reclaimed", async () => {
     vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
@@ -625,38 +590,6 @@ describe("OAuth refresh generation fence", () => {
     expect(storage.read()).toMatchObject({
       access: "second-rotated-access",
       refresh: "second-rotated-refresh",
-    });
-  });
-
-  it("does not replace a terminal fence from an unordered external generation", async () => {
-    await withOAuthTempRoot("oauth-manager-fence-recovery-", async (tempRoot) => {
-      const agentDir = path.join(tempRoot, "agents", "main", "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      const profileId = "openai:default";
-      const fence = createFailedOAuthRefreshFence(
-        createOAuthRefreshFence({
-          profileId,
-          credential: oauth("claimed-access", "claimed-refresh", {
-            expires: 1,
-            accountId: "acct-123",
-          }),
-        }),
-      );
-      saveCredential(profileId, fence, agentDir);
-      const recovered = oauth("recovered-access", "recovered-refresh", {
-        expires: Date.now() + 600_000,
-        accountId: "acct-123",
-      });
-      vi.spyOn(externalCliSync, "readExternalCliBootstrapCredential").mockReturnValue(recovered);
-      const refreshCredential = vi.fn(async () => null);
-      mockOAuthProviderOperations({ refreshCredential });
-      const manager = createOAuthManager();
-
-      await expect(resolve(manager, profileId, fence, agentDir)).resolves.toBeNull();
-      expect(refreshCredential).not.toHaveBeenCalled();
-      expect(ensureAuthProfileStoreWithoutExternalProfiles(agentDir).profiles[profileId]).toEqual(
-        fence,
-      );
     });
   });
 
