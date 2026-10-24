@@ -2,14 +2,23 @@ import {
   isInternalDiagnosticEventInterested,
   type InternalDiagnosticEventInterest,
 } from "./diagnostic-event-listener-presence.js";
-import type {
-  DiagnosticDispatchInput,
-  DiagnosticEventPayload,
-  DiagnosticEventMetadata,
-  DiagnosticEventPrivateData,
-} from "./diagnostic-events.js";
-import { getActiveDiagnosticTraceContext } from "./diagnostic-trace-context.js";
+import {
+  getActiveDiagnosticTraceContext,
+  type DiagnosticTraceContext,
+} from "./diagnostic-trace-context.js";
 import { isBlockedObjectKey } from "./prototype-keys.js";
+
+export type DiagnosticBaseEvent = {
+  ts: number;
+  seq: number;
+  trace?: DiagnosticTraceContext;
+};
+
+export type DiagnosticEventMetadata = Readonly<{
+  internal?: boolean;
+  trustedTraceContext?: boolean;
+  trusted: boolean;
+}>;
 
 // Only proven immutable graphs enter this set; their lifetime follows the snapshot.
 const immutableSnapshots = new WeakSet<object>();
@@ -109,12 +118,14 @@ function freezeDiagnosticValue(value: unknown, seen: WeakSet<object>): boolean {
   return shareable;
 }
 
-export function enrichDiagnosticEvent(
+export function enrichDiagnosticEvent<const T extends object>(
   state: { seq: number },
-  event: DiagnosticDispatchInput,
+  event: T,
   captureActiveTrace = true,
-): DiagnosticEventPayload {
-  const enriched = {} as DiagnosticEventPayload & Record<string, unknown>;
+): T & DiagnosticBaseEvent {
+  // SAFETY: The owned envelope receives producer fields and required metadata before it escapes.
+  const enriched = {} as DiagnosticBaseEvent & Record<string, unknown>;
+  // SAFETY: Dispatcher inputs are event records; blocked keys are excluded during the copy.
   for (const [key, value] of Object.entries(event as Record<string, unknown>)) {
     if (isBlockedObjectKey(key)) {
       continue;
@@ -127,18 +138,19 @@ export function enrichDiagnosticEvent(
   state.seq += 1;
   enriched.seq = state.seq;
   enriched.ts = Date.now();
-  return enriched;
+  // SAFETY: The producer fields have been copied and the dispatcher metadata is now populated.
+  return enriched as T & DiagnosticBaseEvent;
 }
 
 export function captureQueuedDiagnosticEvent(
   entry: {
-    event: DiagnosticEventPayload;
+    event: { type: string };
     metadata: DiagnosticEventMetadata;
-    privateData?: DiagnosticEventPrivateData;
+    privateData?: object;
     trustedListenersOnly?: boolean;
   },
   interests: Iterable<
-    | (InternalDiagnosticEventInterest<DiagnosticEventPayload["type"]> & {
+    | (InternalDiagnosticEventInterest & {
         includePrivateData?: boolean;
       })
     | undefined

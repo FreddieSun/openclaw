@@ -21,6 +21,8 @@ import {
   PUBLIC_EXCLUDED_DIAGNOSTIC_EVENT_NAMES,
 } from "./diagnostic-event-queue-policy.js";
 import {
+  type DiagnosticBaseEvent,
+  type DiagnosticEventMetadata,
   captureQueuedDiagnosticEvent,
   enrichDiagnosticEvent,
   cloneDiagnosticValueForListener,
@@ -59,10 +61,7 @@ import {
   TOOL_EXECUTION_LIVENESS_METADATA_KEY,
   type DiagnosticToolExecutionLiveness,
 } from "./diagnostic-tool-execution-liveness.js";
-import {
-  getActiveDiagnosticTraceContext,
-  type DiagnosticTraceContext,
-} from "./diagnostic-trace-context.js";
+import { getActiveDiagnosticTraceContext } from "./diagnostic-trace-context.js";
 import {
   hasDiagnosticTracePropagationConsumer,
   prepareDiagnosticTracePropagation,
@@ -75,16 +74,11 @@ import {
 } from "./worker-diagnostic-script.js";
 
 export { isInternalDiagnosticEventMetadata } from "./diagnostic-event-snapshot.js";
+export type { DiagnosticEventMetadata } from "./diagnostic-event-snapshot.js";
 
 export type { DiagnosticMemoryUsage } from "./diagnostic-process-types.js";
 
 export type DiagnosticSessionState = "idle" | "processing" | "waiting";
-
-type DiagnosticBaseEvent = {
-  ts: number;
-  seq: number;
-  trace?: DiagnosticTraceContext;
-};
 
 type DiagnosticSessionEvent = DiagnosticBaseEvent &
   Pick<DiagnosticRunScopeFields, "sessionKey" | "sessionId">;
@@ -826,15 +820,7 @@ type TrustedToolExecutionEventInput = Extract<
 >;
 type TrustedSkillUsedEventInput = Extract<DiagnosticEventInput, { type: "skill.used" }>;
 
-export type DiagnosticDispatchInput =
-  | DiagnosticEventInput
-  | Omit<DiagnosticSecurityEvent, "seq" | "ts">;
-
-export type DiagnosticEventMetadata = Readonly<{
-  internal?: boolean;
-  trustedTraceContext?: boolean;
-  trusted: boolean;
-}>;
+type DiagnosticDispatchInput = DiagnosticEventInput | Omit<DiagnosticSecurityEvent, "seq" | "ts">;
 
 type InternalDiagnosticEventMetadata = DiagnosticEventMetadata &
   Readonly<{
