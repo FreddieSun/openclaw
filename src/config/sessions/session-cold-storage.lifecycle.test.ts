@@ -8,11 +8,9 @@ import {
   createTempDirTracker,
   useAutoCleanupTempDirTracker,
 } from "../../../test/helpers/temp-dir.js";
-import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import { createVerifiedSqliteSnapshot } from "../../infra/sqlite-snapshot.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
-import type { DB } from "../../state/openclaw-agent-db.generated.js";
 import {
   closeOpenClawAgentDatabaseByPathAsync,
   closeOpenClawAgentDatabasesAsync,
@@ -178,13 +176,9 @@ async function createColdCurrentSession(
     await waitForSessionTranscriptIndexReconcile(options);
     await replaceSessionEntry(scope, { ...loadSessionEntry(scope), ...entry });
     runOpenClawAgentWriteTransaction(({ db }) => {
-      executeSqliteQuerySync(
-        db,
-        getNodeSqliteKysely<DB>(db)
-          .updateTable("session_windows")
-          .set({ updated_at: 1, transcript_updated_at: 1 })
-          .where("session_id", "=", scope.sessionId),
-      );
+      db.prepare(
+        "UPDATE session_windows SET updated_at = 1, transcript_updated_at = 1 WHERE session_id = ?",
+      ).run(scope.sessionId);
     }, options);
     original = loadTranscriptEventsSync(scope);
     await expect(
@@ -392,74 +386,64 @@ type Action = (typeof actions)[number];
 
 async function runAction(action: Action, fixture: Fixture) {
   const { scope, entry, target } = fixture;
+  const nextEntry = { ...entry, sessionId: "reset-next", updatedAt: 2 };
   const resetBoundary = {
     context: "clear" as const,
     reason: "reset" as const,
     cwd: path.dirname(scope.storePath),
   };
-  switch (action) {
-    case "reset":
+  const parentFork = (targetStorePath?: string) =>
+    forkSessionFromParentTranscript({
+      ...scope,
+      parentEntry: entry,
+      parentSessionKey: scope.sessionKey,
+      sessionKey: "agent:main:child",
+      targetStorePath,
+    });
+  const run = {
+    reset: async () => {
       await resetSessionEntryLifecycle({
         storePath: scope.storePath,
         target,
         resetBoundary,
-        buildNextEntry: () => ({ ...entry, sessionId: "reset-next", updatedAt: 2 }),
+        buildNextEntry: () => nextEntry,
       });
       return loadSessionEntry(scope);
-    case "batched reset":
+    },
+    "batched reset": async () => {
       await applySessionEntryLifecycleMutation({
         storePath: scope.storePath,
         skipMaintenance: true,
-        upserts: [
-          {
-            sessionKey: scope.sessionKey,
-            entry: { ...entry, sessionId: "reset-next", updatedAt: 2 },
-            resetBoundary,
-          },
-        ],
+        upserts: [{ sessionKey: scope.sessionKey, entry: nextEntry, resetBoundary }],
       });
       return loadSessionEntry(scope);
-    case "fork":
-      return forkSessionAtMessage({
-        ...scope,
-        entryId: "question",
-        targetKey: "agent:main:forked",
-      });
-    case "rewind":
-      return rewindSessionToMessage({ ...scope, entryId: "question" });
-    case "branch switch":
-      return switchSessionBranch({ ...scope, leafEntryId: "alternate" });
-    case "branch list":
-      return listSessionBranches(scope);
-    case "parent fork":
-    case "cross-store parent fork": {
-      const targetStorePath =
-        action === "cross-store parent fork"
-          ? path.join(tempDirs.make("openclaw-cold-parent-target-"), "openclaw-agent.sqlite")
-          : undefined;
-      if (targetStorePath) {
-        stores.push(targetStorePath);
-      }
-      return forkSessionFromParentTranscript({
-        ...scope,
-        parentEntry: entry,
-        parentSessionKey: scope.sessionKey,
-        sessionKey: "agent:main:child",
-        targetStorePath,
-      });
-    }
-    case "parent entry fork":
-      return forkSessionEntryFromParentTarget({
+    },
+    fork: () =>
+      forkSessionAtMessage({ ...scope, entryId: "question", targetKey: "agent:main:forked" }),
+    rewind: () => rewindSessionToMessage({ ...scope, entryId: "question" }),
+    "branch switch": () => switchSessionBranch({ ...scope, leafEntryId: "alternate" }),
+    "branch list": () => listSessionBranches(scope),
+    "parent fork": () => parentFork(),
+    "cross-store parent fork": () => {
+      const targetStorePath = path.join(
+        tempDirs.make("openclaw-cold-parent-target-"),
+        "openclaw-agent.sqlite",
+      );
+      stores.push(targetStorePath);
+      return parentFork(targetStorePath);
+    },
+    "parent entry fork": () =>
+      forkSessionEntryFromParentTarget({
         agentId: scope.agentId,
         storePath: scope.storePath,
         parentTarget: target,
         sessionTarget: { canonicalKey: "agent:main:child", storeKeys: ["agent:main:child"] },
         fallbackEntry: { sessionId: "child-initial", updatedAt: 2 },
-      });
-    case "parent decision":
-      return resolveSessionParentForkDecision({ parentEntry: entry, storePath: scope.storePath });
-  }
-  return action satisfies never;
+      }),
+    "parent decision": () =>
+      resolveSessionParentForkDecision({ parentEntry: entry, storePath: scope.storePath }),
+  };
+  return run[action]();
 }
 
 describe("cold current transcript lifecycle", () => {

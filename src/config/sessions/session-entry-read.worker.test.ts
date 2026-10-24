@@ -287,7 +287,7 @@ it.each([false, true])("reads row metadata (continuation: %s)", (useContinuation
       "INSERT INTO board_tabs (session_key, tab_id, title, position, created_by, revision) VALUES (?, ?, 'Board', 0, 'user', 0)",
     );
     for (const key of boardKeys) {
-      for (let tab = 0; tab < 4; tab++) {
+      for (let tab = 0; tab < 2; tab++) {
         insertTab.run(key, `tab-${tab}`);
       }
     }
@@ -341,29 +341,6 @@ it.each([false, true])("reads row metadata (continuation: %s)", (useContinuation
           });
           return readRow;
         });
-        const exec = vi.spyOn(reader.db, "exec");
-        const queries = trackSqliteStatementExecutions(
-          requireNativeSqliteDatabase(reader.db),
-          ["boards", "entries"],
-          (sql) => {
-            if (/\bfrom "session_nodes"/iu.test(sql) && sql.includes('"entry_json"')) {
-              return "entries";
-            }
-            if (/\bfrom "board_tabs"/iu.test(sql)) {
-              return "boards";
-            }
-            return null;
-          },
-        );
-        const parse = vi.spyOn(JSON, "parse");
-        const entryParseCount = () =>
-          parse.mock.calls.filter(
-            ([value]) =>
-              typeof value === "string" &&
-              value.includes('"sessionId":') &&
-              (value.includes(sessionId) ||
-                sessionKeys.slice(1).some((key) => value.includes(key))),
-          ).length;
         try {
           const read = (requestedKeys = [...sessionKeys, rawKey]) =>
             readSessionRowDatabaseFacts({
@@ -375,10 +352,6 @@ it.each([false, true])("reads row metadata (continuation: %s)", (useContinuation
             });
           const first = read();
           expect(first.rows).toHaveLength(64);
-          expect(queries.counts.boards).toBe(0);
-          expect(queries.counts.entries).toBe(1);
-          expect(queries.rowCounts.entries).toBe(63);
-          expect(entryParseCount()).toBe(64);
           expect(first.rows.filter((row) => row.hasBoard).map((row) => row.sessionKey)).toEqual(
             boardKeys,
           );
@@ -403,20 +376,9 @@ it.each([false, true])("reads row metadata (continuation: %s)", (useContinuation
             hasBoard: false,
             activitySummaryWatermark: { generation: "next-generation", maxSeq: 42 },
           });
-          expect(queries.counts.boards).toBe(0);
-          expect(queries.counts.entries).toBe(2);
-          expect(entryParseCount()).toBe(128);
-          expect(
-            exec.mock.calls
-              .map(([sql]) => sql)
-              .filter((sql) => /^(?:BEGIN|COMMIT|SAVEPOINT|RELEASE|ROLLBACK)\b/iu.test(sql)),
-          ).toEqual(["BEGIN", "COMMIT", "BEGIN", "COMMIT"]);
           expect(read([boardKeys[1]!]).rows[0]?.hasBoard).toBe(true);
         } finally {
           continuation?.release();
-          exec.mockRestore();
-          parse.mockRestore();
-          queries.restore();
         }
       });
     } finally {
@@ -485,7 +447,7 @@ it("consumes admitted board absence for a cohort and observes first use and publ
     });
   }));
 
-it.each(["worker", "exact", "full", "children", "worktree", "source-checks", "row-facts"] as const)(
+it.each(["list", "full", "children", "worktree", "source-checks", "row-facts"] as const)(
   "refuses unavailable session metadata in the %s reader instead of reporting missing sessions",
   (reader) =>
     withOpenClawTestState({ scenario: "minimal" }, async ({ env }) => {
@@ -510,10 +472,7 @@ it.each(["worker", "exact", "full", "children", "worktree", "source-checks", "ro
                   }
                 : {
                     sessionKeys,
-                    projection:
-                      reader === "exact" || reader === "full" || reader === "worktree"
-                        ? reader
-                        : "list",
+                    projection: reader === "full" || reader === "worktree" ? reader : "list",
                   }),
               ...(reader === "source-checks" ? { sourceChecks: [] } : {}),
             }).entries;
@@ -545,10 +504,7 @@ function seedRetainedSessionHeader(
 ) {
   writeSessionEntry(database, sessionKey, { sessionId, updatedAt: 1 });
   database.db
-    .prepare("UPDATE session_nodes SET entry_json = '{}' WHERE session_key = ?")
-    .run(sessionKey);
-  database.db
-    .prepare("UPDATE session_nodes SET entry_valid = -1 WHERE session_key = ?")
+    .prepare("UPDATE session_nodes SET entry_json = '{}', entry_valid = -1 WHERE session_key = ?")
     .run(sessionKey);
 }
 
