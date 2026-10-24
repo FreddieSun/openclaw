@@ -156,6 +156,7 @@ vi.mock("../infra/exec-approvals.js", async (importOriginal) => {
   };
 });
 
+// mock-isolation: classify inline evaluation deterministically for host approval scenarios.
 vi.mock("../infra/command-analysis/inline-eval.js", () => ({
   describeInterpreterInlineEval: vi.fn(() => "inline-eval"),
   detectInterpreterInlineEvalArgv: inlineEvalMock,
@@ -165,6 +166,7 @@ vi.mock("../infra/node-shell.js", () => ({
   buildNodeShellCommand: vi.fn(() => ["/bin/sh", "-lc", "bun ./script.ts"]),
 }));
 
+// mock-isolation: supply fixture node plans instead of parsing remote preparation responses.
 vi.mock("../infra/system-run-approval-context.js", () => ({
   parsePreparedSystemRunPayload: preparedMock,
 }));
@@ -201,6 +203,7 @@ vi.mock("./bash-tools.exec-runtime.js", async (importOriginal) => ({
   createApprovalSlug: vi.fn(() => "slug-1"),
 }));
 
+// mock-isolation: keep node RPC effects inside the fixture without a live Gateway connection.
 vi.mock("./tools/gateway.js", () => ({
   callGatewayTool: gatewayMock,
 }));
@@ -1593,11 +1596,7 @@ describe("executeNodeHostCommand", () => {
   });
 
   it("uses the prepared cwd when no workdir was requested", async () => {
-    await executeNodeHostCommand(
-      createNodeHostRequest({
-        workdir: undefined,
-      }),
-    );
+    await runNode({ workdir: undefined });
 
     const runParams = requireRunParams(requireGatewayCommand("system.run"));
     expect(runParams.cwd).toBe(preparedPlan.cwd);
