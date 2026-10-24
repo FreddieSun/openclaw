@@ -18,11 +18,17 @@ const repo = fileURLToPath(new URL("../../", import.meta.url));
 const dirs = useAutoCleanupTempDirTracker(afterEach);
 let root: string;
 
-beforeEach(() => {
+beforeEach(async () => {
   root = dirs.make("isolated-adapter-proof-");
   for (const key of ["HOME", "CODEX_HOME", "OPENCLAW_STATE_DIR"]) {
     vi.stubEnv(key, root);
   }
+  // Compile the source-only lazy adapter before timing the real request; built
+  // production modules do not pay Vitest transformation costs inside its deadline.
+  await Promise.all([
+    import("./src/app-server/isolated-completion.js"),
+    import("./src/app-server/config-parsing.js"),
+  ]);
 });
 afterEach(() => vi.unstubAllEnvs());
 

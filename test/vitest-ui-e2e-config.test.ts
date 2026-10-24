@@ -33,7 +33,7 @@ const qaLabFiles = [
   "extensions/qa-lab/src/control-ui-openclaw-delegation.real-gateway.e2e.test.ts",
 ] as const;
 const serialGatewayFiles =
-  `approval-lookup chat-steer-deferred-custody deepseek-search desktop-resize
+  `approval-lookup chat-daybreak chat-steer-deferred-custody deepseek-search desktop-resize
   peer-followup-restart plugin-inline-view`
     .split(/\s+/u)
     .map((name) => `ui/src/e2e/${name}.real-gateway.e2e.test.ts`)

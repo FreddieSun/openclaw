@@ -191,6 +191,7 @@ export function prepareSessionEventProjection(
         projected = {
           ...base,
           session: row,
+          cyberAccessProgram: row.cyberAccessProgram ?? null,
           fastMode: row.fastMode,
           effectiveFastMode: row.effectiveFastMode,
           ancestorSessions: ancestorDelivery?.ancestorSessions,
