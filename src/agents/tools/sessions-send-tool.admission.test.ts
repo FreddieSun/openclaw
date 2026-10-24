@@ -80,6 +80,10 @@ const targetIdentity = {
   sessionId: "target-session",
 };
 const runId = "sessions-send-admission-run";
+const acceptedRun = { runId, status: "accepted" };
+const queuedNotification = { status: "queued", durability: "process", runStarted: false };
+const pendingDelivery = { status: "accepted", delivery: { status: "pending" } };
+const terminalReply = { disposition: "visible", text: "Task complete" } as const;
 const config = {
   agents: { ownership: "explicit", entries: { main: {} } },
   session: { mainKey: "main", scope: "per-sender" },
@@ -122,6 +126,17 @@ function operatorFixture(name: string) {
     () => true,
   );
   return { context, owner, source };
+}
+function callerContext(
+  context: ReturnType<typeof createContext>,
+  sessionKey = requesterSessionKey,
+) {
+  return {
+    agentId: "main",
+    sessionKey,
+    gatewayContextResolver: () => context,
+    receiptAuthority: () => true,
+  };
 }
 function createTool(options: Parameters<typeof createSessionsSendTool>[0] = {}) {
   return createSessionsSendTool({
@@ -212,7 +227,7 @@ async function completeRun(request: GatewayRequest, sessionKey: string, sessionI
       },
     },
   );
-  return { status: "ok", terminalReply: { disposition: "visible", text: "Task complete" } };
+  return { status: "ok", terminalReply };
 }
 
 async function trackActualReplyFlow() {
@@ -253,19 +268,14 @@ describe("sessions_send dispatch admission", () => {
   });
 
   it("applies peer preferences to new notifications without revoking accepted events", async () => {
-    const callGateway = vi.fn();
-    callGateway.mockResolvedValue({ key: targetSessionKey, agentId: "main" });
+    const callGateway = vi.fn().mockResolvedValue({ key: targetSessionKey, agentId: "main" });
     const tool = createTool({ callGateway });
     const first = await tool.execute("notify-peer", {
       sessionKey: targetSessionKey,
       message: "accepted notice",
       mode: "notify",
     });
-    expect(first.details).toMatchObject({
-      status: "queued",
-      durability: "process",
-      runStarted: false,
-    });
+    expect(first.details).toMatchObject(queuedNotification);
     await putSession(targetSessionKey, {
       sessionId: "target-session",
       updatedAt: 2,
@@ -313,8 +323,7 @@ describe("sessions_send dispatch admission", () => {
         spawnedBy: owner,
         spawnDepth: 1,
       });
-      const callGateway = vi.fn();
-      callGateway.mockImplementation(async (request: GatewayRequest) => {
+      const callGateway = vi.fn().mockImplementation(async (request: GatewayRequest) => {
         if (request.method === "sessions.resolve") {
           return { key: child, agentId: "main" };
         }
@@ -348,19 +357,13 @@ describe("sessions_send dispatch admission", () => {
             : undefined,
         ),
       };
-      const send = () =>
-        tool.execute("notify-lineage", {
-          sessionKey: child,
-          message: "retained child context",
-          mode: "notify",
-        });
-      const result = await send();
+      const result = await tool.execute("notify-lineage", {
+        sessionKey: child,
+        message: "retained child context",
+        mode: "notify",
+      });
       if (right === "parent") {
-        expect(result.details).toMatchObject({
-          status: "queued",
-          durability: "process",
-          runStarted: false,
-        });
+        expect(result.details).toMatchObject(queuedNotification);
         expect(drainSystemEvents(child)).toEqual([
           expect.stringContaining("retained child context"),
         ]);
@@ -393,7 +396,7 @@ describe("sessions_send dispatch admission", () => {
         request.assertDispatchCurrent?.();
         request.sessionMutationCommitGuard?.();
         admitted = true;
-        return { runId, status: "accepted" };
+        return acceptedRun;
       });
       const result = await execute(
         createTool({ config: currentConfig, callGateway }),
@@ -514,13 +517,10 @@ describe("sessions_send dispatch admission", () => {
       return await inOperatorScope(context, owner, source, () =>
         withGatewayToolCallerIdentity(
           {
-            agentId: "main",
-            sessionKey: requesterSessionKey,
+            ...callerContext(context),
             requesterOrigin,
             operatorAuthority:
               getPluginRuntimeGatewayRequestScope()?.client?.internal?.operatorRunAuthority,
-            gatewayContextResolver: () => context,
-            receiptAuthority: () => true,
           },
           () => execute(createTool(), "steer-physical-owner", { mode: "steer" }),
         ),
@@ -577,14 +577,13 @@ describe("sessions_send dispatch admission", () => {
         source: { sessionKey: requesterSessionKey, sessionId: "requester-session" },
         target: { sessionKey: targetSessionKey, sessionId: "target-session" },
       });
-      return { runId, status: "accepted" };
+      return acceptedRun;
     });
     try {
       const result = await withGatewayToolCallerIdentity(
         {
+          ...callerContext(context),
           ...caller,
-          gatewayContextResolver: () => context,
-          receiptAuthority: () => true,
         },
         () => execute(createTool({ callGateway }), "durable-steer-fallback", { mode: "steer" }),
       );
@@ -634,11 +633,11 @@ describe("sessions_send dispatch admission", () => {
         await completion.settle(runId, {
           status: "ok",
           replyText: "Task complete",
-          terminalReply: { disposition: "visible", text: "Task complete" },
+          terminalReply,
         });
         completion.finishExecution(runId);
       }
-      return { runId, status: "accepted" };
+      return acceptedRun;
     }, true);
     try {
       const pending = inOperatorScope(context, owner, source, async () => {
@@ -649,11 +648,8 @@ describe("sessions_send dispatch admission", () => {
         try {
           return await withGatewayToolCallerIdentity(
             {
-              agentId: "main",
-              sessionKey: sourceKey,
+              ...callerContext(context, sourceKey),
               personalToolParticipants: participants,
-              gatewayContextResolver: () => context,
-              receiptAuthority: () => true,
             },
             () => {
               invocationStarted = true;
@@ -676,10 +672,7 @@ describe("sessions_send dispatch admission", () => {
       expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
       allowCapture.resolve();
       const result = await pending;
-      expect(result.details).toMatchObject({
-        status: "accepted",
-        delivery: { status: "pending" },
-      });
+      expect(result.details).toMatchObject(pendingDelivery);
       expect(runSessionsSendA2AFlow).toHaveBeenCalledOnce();
       expect(runSessionsSendA2AFlow).toHaveBeenCalledWith(
         expect.objectContaining({ requesterSessionKey: sourceKey, targetSessionKey }),
@@ -787,7 +780,7 @@ describe("sessions_send dispatch admission", () => {
       const result = await execute(tool!, self ? "self-followup" : "send-routed-task", {
         sessionKey: targetKey,
       });
-      expect(result.details).toMatchObject({ status: "accepted", delivery: { status: "pending" } });
+      expect(result.details).toMatchObject(pendingDelivery);
       await settled.promise;
       if (!self) {
         expect(completion).toMatchObject({
