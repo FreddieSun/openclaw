@@ -182,7 +182,7 @@ async function invoke(
 registerSessionSandboxMutationTests({ client, context, withState: withSessionMutationState });
 
 describe("sessions.patch", () => {
-  it("saves and reads dashboard defaults through the agent tool without connected clients", () =>
+  it("persists dashboard defaults without clients and fences revoked commit authority", () =>
     withSessionMutationState(async (state) => {
       const sessionKey = "agent:main:dashboard-default";
       const scope = { agentId: "main", env: state.env, sessionKey };
@@ -234,18 +234,7 @@ describe("sessions.patch", () => {
           expect.anything(),
         );
       });
-    }));
-
-  it("rechecks dashboard tool authority at the actual session commit admission", () =>
-    withSessionMutationState(async (state) => {
-      const sessionKey = "agent:main:dashboard-authority";
-      const scope = { agentId: "main", env: state.env, sessionKey };
-      await seedEntry(state.env, sessionKey, {
-        sessionId: "dashboard-authority",
-        boardPresentation: "split",
-      });
       const before = loadSessionEntry(scope);
-      const requestContext = context({});
       let revoked = false;
       let reachedCommitAdmission = false;
       probe.admission(workerAdmission, (request, grant, admit) => {
@@ -260,7 +249,6 @@ describe("sessions.patch", () => {
         }
         admit(request, grant);
       });
-      const tool = createDashboardTool({ agentSessionKey: sessionKey, agentId: "main" });
       await expect(
         withGatewayToolCallerIdentity(
           {
@@ -268,7 +256,7 @@ describe("sessions.patch", () => {
             receiptAuthority: () => !revoked,
           },
           () =>
-            tool.execute("save", { action: "set_default_presentation", presentation: "expanded" }),
+            tool.execute("revoked", { action: "set_default_presentation", presentation: "split" }),
         ),
       ).rejects.toThrow(/authority.*no longer active/i);
       expect(reachedCommitAdmission).toBe(true);
@@ -413,14 +401,9 @@ describe("sessions.patch", () => {
               permissionMode: "read-only",
               label: "Updated session",
             });
-            expect(patched).toHaveBeenCalledWith(
-              expect.objectContaining({
-                sessionKey,
-                context: expect.objectContaining({
-                  sessionEntry: expect.objectContaining({ permissionMode: "read-only" }),
-                }),
-              }),
-            );
+            expect(patched.mock.calls[0]).toMatchObject([
+              { sessionKey, context: { sessionEntry: { permissionMode: "read-only" } } },
+            ]);
           } else {
             expect(readEntry(state.env, sessionKey)?.permissionMode).toBe("guarded");
           }
@@ -751,14 +734,14 @@ describe("sessions.assignOwner", () => {
       const ownerProfile = ensureProfileForEmail("requester@example.test");
       const nextOwner = () => ({ type: "human", id: ownerProfile.id }) as const;
       using _ = { [Symbol.dispose]: (await prepareUserProfileCatalog({ env: state.env })).release };
-      await seedEntry(state.env, sessionKey, {
-        sessionId: "session-handoff",
+      const provenance = {
         visibility: "shared",
         createdVia: "spawn",
         createdActor: mainAgent(),
         createdAt: 1,
         parentSessionKey: "agent:main:main",
-      });
+      } as const;
+      await seedEntry(state.env, sessionKey, { sessionId: "session-handoff", ...provenance });
       const cfg = handoffConfig();
       const requestContext = context(cfg);
       await expect(
@@ -780,11 +763,7 @@ describe("sessions.assignOwner", () => {
 
       expect(readEntry(state.env, sessionKey)).toMatchObject({
         owner: { actor: nextOwner(), assignedBy: mainAgent() },
-        createdVia: "spawn",
-        createdActor: mainAgent(),
-        createdAt: 1,
-        parentSessionKey: "agent:main:main",
-        visibility: "shared",
+        ...provenance,
       });
     }));
 

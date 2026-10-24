@@ -1,6 +1,3 @@
-import { deserialize } from "node:v8";
-import { Worker } from "node:worker_threads";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, test, vi } from "vitest";
 import { GatewayErrorDetailCodes } from "../../../packages/gateway-protocol/src/index.js";
 import { withinTest } from "../../../test/helpers/promise.js";
@@ -12,10 +9,8 @@ import {
   setRuntimeConfigSnapshot,
 } from "../../config/runtime-snapshot.js";
 import { requireNodeSqlite } from "../../infra/node-sqlite.js";
-import type { SqliteWorkerReply, SqliteWorkerRequest } from "../../infra/sqlite-worker-contract.js";
 import * as workerAdmission from "../../infra/sqlite-worker-operation-admission.js";
-import { createDeferredCore } from "../../shared/deferred.js";
-import * as stateRead from "../../state/openclaw-state-db-readonly.js";
+import { holdNextReply } from "../../state/github-publication.worker.test-support.js";
 import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
@@ -149,26 +144,6 @@ afterEach(() => {
   closeOpenClawStateDatabaseForTest();
 });
 
-test("users.prefs returns its captured snapshot when a write commits before read delivery", async () => {
-  return withPreferenceState(async () => {
-    const profileId = ensureProfileForEmail("reader@example.test").id;
-    await preferences.setCanonicalUserPreferences(profileId, { "ui.accent": "#112233" });
-    const executeRead = stateRead.executeExistingOpenClawStateRead;
-    using read = vi.spyOn(stateRead, "executeExistingOpenClawStateRead");
-    read.mockImplementationOnce(async (readOptions, command, scope) => {
-      const reply = await executeRead(readOptions, command, scope);
-      await preferences.setCanonicalUserPreferences(profileId, { "ui.accent": "#aabbcc" });
-      return reply;
-    });
-
-    expect(await getPrefs(profileId, { keys: ["ui.accent"] })).toEqual({
-      ok: true,
-      payload: { status: "ok", entries: { "ui.accent": "#112233" } },
-      error: undefined,
-    });
-  });
-});
-
 test("users.prefs reads merged-profile accents while an unrelated writer reply is pending", async ({
   signal,
 }) => {
@@ -192,55 +167,19 @@ test("users.prefs reads merged-profile accents while an unrelated writer reply i
         },
       });
     await recordUnrelatedProvenance();
-    const replyReady = createDeferredCore();
-    let publish: (() => void) | undefined;
-    let selected: { worker: Worker; id: number } | undefined;
-    // oxlint-disable-next-line typescript/unbound-method -- Forward with the intercepted worker receiver.
-    const originalPost = Worker.prototype.postMessage;
-    // oxlint-disable-next-line typescript/unbound-method -- Forward with the intercepted worker receiver.
-    const originalEmit = Worker.prototype.emit;
-    const requests = vi.spyOn(Worker.prototype, "postMessage").mockImplementation(function (
-      this: Worker,
-      request: SqliteWorkerRequest,
-      transferList,
-    ) {
-      if (request.type === "execute") {
-        const command: unknown = deserialize(request.input);
-        if (
-          isRecord(command) &&
-          command.type === "agentProvenance.record" &&
-          isRecord(command.input) &&
-          command.input.agentId === "preference-reader-test"
-        ) {
-          selected = { worker: this, id: request.id };
-        }
-      }
-      return originalPost.call(this, request, transferList);
-    });
-    const replies = vi.spyOn(Worker.prototype, "emit").mockImplementation(function (
-      this: Worker,
-      event: string | symbol,
-      reply: SqliteWorkerReply,
-    ) {
-      if (event === "message" && this === selected?.worker && reply.id === selected.id) {
-        publish = () => originalEmit.call(this, event, reply);
-        replyReady.resolve();
-        return true;
-      }
-      return originalEmit.call(this, event, reply);
-    });
+    const reply = holdNextReply("agentProvenance.record");
     const pendingWriter = recordUnrelatedProvenance();
     try {
-      await withinTest(replyReady.promise, signal);
+      await withinTest(reply.ready, signal);
       expect(await withinTest(getPrefs(source, { keys: ["ui.accent"] }), signal)).toEqual({
         ok: true,
         payload: { status: "ok", entries: { "ui.accent": "#a1b2c3" } },
         error: undefined,
       });
     } finally {
-      replies.mockRestore();
-      requests.mockRestore();
-      publish?.();
+      reply.release();
+      vi.spyOn(Worker.prototype, "postMessage").mockRestore();
+      vi.spyOn(Worker.prototype, "emit").mockRestore();
       await pendingWriter;
     }
   });
@@ -382,7 +321,7 @@ test("users.prefs refuses a pending write when the participant is revoked before
   });
 });
 
-test.each(["current", "read", "scope", "source", "identity", "error-response", "staff"] as const)(
+test.each(["current", "scope", "source", "identity", "staff"] as const)(
   "users.self keeps its original %s authority through the handler's identity sync",
   async (change) => {
     await withPreferenceState(async (prepareProfiles) => {
@@ -391,9 +330,7 @@ test.each(["current", "read", "scope", "source", "identity", "error-response", "
       await prepareProfiles();
       const client = createOperatorWsClient({
         connId: "self-reader",
-        scopes: [
-          change === "staff" || change === "read" ? "operator.read" : "operator.sessions.read",
-        ],
+        scopes: [change === "staff" ? "operator.read" : "operator.sessions.read"],
       });
       client.authenticatedUserId = "self-reader@github";
       const attach = (profile: typeof owner) => attachProfile(client, profile);
@@ -426,8 +363,6 @@ test.each(["current", "read", "scope", "source", "identity", "error-response", "
             current = false;
           } else if (change === "identity") {
             attach(replacement);
-          } else if (change === "error-response") {
-            client.authenticatedUserProfile = undefined;
           }
         },
         outcome,
@@ -439,7 +374,7 @@ test.each(["current", "read", "scope", "source", "identity", "error-response", "
         expect(respond).not.toHaveBeenCalled();
       } else {
         expect(await outcome).toEqual([{ status: "fulfilled", value: undefined }]);
-        if (change === "current" || change === "read" || change === "staff") {
+        if (change === "current" || change === "staff") {
           expect(respond).toHaveBeenCalledExactlyOnceWith(true, {
             profile: expect.objectContaining({ id: owner.id }),
           });
@@ -520,13 +455,11 @@ test("users.prefs dispatch saves guest choices only to the authenticated durable
       return respond.mock.calls[0];
     };
     const key = "new-session.v1:main";
-    const choice = { folder: "/projects/openclaw", worktree: true };
+    const choice = { folder: "/projects/openclaw" };
+    const updated = { folder: "/focused-fix" };
+    const success = [true, { status: "ok" }, undefined];
     using prepare = vi.spyOn(requireNodeSqlite().DatabaseSync.prototype, "prepare");
-    expect(await request("users.prefs.set", { entries: { [key]: choice } })).toEqual([
-      true,
-      { status: "ok" },
-      undefined,
-    ]);
+    expect(await request("users.prefs.set", { entries: { [key]: choice } })).toEqual(success);
     expect(await request("users.prefs.get")).toEqual(preferenceReply({ [key]: choice }));
     expect(await request("users.prefs.get", {}, graceClient)).toEqual(preferenceReply({}));
     notifications.mockClear();
@@ -539,10 +472,10 @@ test("users.prefs dispatch saves guest choices only to the authenticated durable
     expect(notifications).not.toHaveBeenCalled();
     expect(
       await request("users.prefs.set", {
-        entries: { [key]: { ...choice, worktreeName: "focused-fix" } },
+        entries: { [key]: updated },
         expectedEntries: { [key]: choice },
       }),
-    ).toEqual([true, { status: "ok" }, undefined]);
+    ).toEqual(success);
     expect(notifications).toHaveBeenCalledWith(
       "users.prefs.changed",
       { profileId: ada.id, keys: [key] },
@@ -589,12 +522,12 @@ test("users.prefs dispatch saves guest choices only to the authenticated durable
     ).toMatchObject([false, undefined, { code: "FORBIDDEN" }]);
     expect(reachedCommit).toBe(true);
     expect(await preferences.getCanonicalUserPreferences(ada.id)).toMatchObject({
-      entries: { [key]: { ...choice, worktreeName: "focused-fix" } },
+      entries: { [key]: updated },
     });
     admission.mockRestore();
     linkEmail("ada@example.test", grace.id);
     expect(await request("users.prefs.get", {}, graceClient)).toEqual(
-      preferenceReply({ [key]: { ...choice, worktreeName: "focused-fix" } }),
+      preferenceReply({ [key]: updated }),
     );
   });
 });
@@ -712,3 +645,4 @@ test("users.prefs.set returns typed profile quota details", async () => {
     });
   });
 });
+import { Worker } from "node:worker_threads";

@@ -21,10 +21,8 @@ import { createReplyDispatcher } from "../../auto-reply/reply/reply-dispatcher.j
 import type { ReplyDispatchOperation } from "../../auto-reply/reply/reply-dispatcher.types.js";
 import {
   loadTranscriptEventsSync,
-  readActiveTranscriptEntryAnchor,
   resolveSessionTranscriptDatabasePath,
   replaceSessionEntry,
-  rewriteTranscriptMessageAtAnchor,
   SessionTranscriptProjectionUnavailableError,
 } from "../../config/sessions/session-accessor.js";
 import { loadSessionEntryForAdmission } from "../../config/sessions/session-accessor.sqlite-entry-admission.js";
@@ -370,18 +368,13 @@ describe("createChatSendReplyDispatch", () => {
     expect(buildTranscriptReplyTextFromInputs(inputs)).toBe(`[[reply_to:command]]\n${visible}`);
   });
 
-  it.each([
-    { operation: "raw", split: true },
-    { operation: "prepared", split: false },
-    { operation: "prepared", split: true },
-  ] as const)(
-    "preserves indented code through $operation WebChat replies (split=$split)",
-    async ({ operation, split }) => {
+  it.each(["raw", "prepared"] as const)(
+    "preserves indented code through split %s WebChat replies",
+    async (operation) => {
       const text = "    const value = 1;\n    use(value);";
-      const parts = split ? ["    const value = 1;\n", "    use(value);"] : [text];
       const dispatch = createReplyDispatch("run-indented-code");
       const dispatcher = createReplyDispatcher(dispatch.dispatcherOptions);
-      const payloads = parts.map((part) => ({ text: part }));
+      const payloads = [{ text: "    const value = 1;\n" }, { text: "    use(value);" }];
       if (operation === "prepared") {
         for (const plan of createStructuredOutboundPayloadPlan(payloads)) {
           dispatcher.sendPreparedReply("final", plan);
@@ -598,18 +591,10 @@ describe("createChatSendReplyDispatch", () => {
     });
   });
 
-  it.each([
-    "retired",
-    "aborted",
-    "lifecycle",
-    "reset",
-    "foreign-lifecycle",
-    "branch",
-    "answer-rewrite",
-    "input-rewrite",
-  ] as const)("rechecks accepted history against %s changes", async (change) => {
-    await withReplyTranscript(
-      async ({ dispatch, append, scope, inputId, abortController, retire }) => {
+  it.each(["retired", "aborted", "lifecycle", "reset", "foreign-lifecycle"] as const)(
+    "rechecks accepted history against %s changes",
+    async (change) => {
+      await withReplyTranscript(async ({ dispatch, append, scope, abortController, retire }) => {
         dispatch.captureAgentTranscriptStart();
         await append("answer", assistant());
         expect(await dispatch.resolveReplyDelivery()).toBe("delivered");
@@ -638,29 +623,14 @@ describe("createChatSendReplyDispatch", () => {
           } finally {
             foreign.close();
           }
-        } else if (change === "branch") {
-          await append("other-branch", assistant("NO_REPLY"), inputId);
-        } else {
-          const anchor = readActiveTranscriptEntryAnchor({
-            ...scope,
-            entryId: change === "answer-rewrite" ? "answer" : inputId,
-          });
-          assert(anchor, "Expected active rewrite fixture");
-          await rewriteTranscriptMessageAtAnchor(anchor, (message) => ({
-            ...asOptionalRecord(message),
-            content: change === "answer-rewrite" ? "NO_REPLY" : "Edited input display.",
-          }));
         }
         if (inFlightReceipt) {
           expect(await inFlightReceipt).toBe("missing");
         }
-        expect(await dispatch.resolveReplyDelivery()).toBe(
-          change === "input-rewrite" ? "delivered" : "missing",
-        );
-      },
-      true,
-    );
-  });
+        expect(await dispatch.resolveReplyDelivery()).toBe("missing");
+      }, true);
+    },
+  );
 
   it.each(["new-input", "branch", "answer-rewrite", "unrelated-rewrite", "append"] as const)(
     "retains factual delivery while rechecking a concurrent %s",

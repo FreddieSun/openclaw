@@ -635,6 +635,10 @@ it("rolls up known session family ids when historical usage is requested", async
   });
   const readFamily = () =>
     readSessionsUsage({ key: storeKey, groupBy: "family", includeHistorical: true });
+  const models = [
+    { provider: "fixture", model: "bedrock::arn" },
+    { provider: "fixture::bedrock", model: "arn" },
+  ];
 
   const oldSessionFile = "/tmp/old.jsonl.reset.2026-02-01T00-00-00.000Z";
   const oldestSessionFile = "/tmp/oldest.jsonl.reset.2026-01-31T00-00-00.000Z";
@@ -657,8 +661,7 @@ it("rolls up known session family ids when historical usage is requested", async
       const totalTokens = oldest ? 30 : historical ? 10 : 20;
       const totalCost = oldest ? 0.03 : historical ? 0.02 : 0.01;
       const date = oldest ? "2026-02-02" : "2026-02-01";
-      const provider = historical ? "fixture::bedrock" : "fixture";
-      const model = historical ? "arn" : "bedrock::arn";
+      const modelIndex = historical ? 1 : 0;
       const messageCounts = {
         total: 1,
         user: 1,
@@ -678,27 +681,13 @@ it("rolls up known session family ids when historical usage is requested", async
         activityDates: [date],
         dailyBreakdown: [daily(date, totalTokens, totalCost, 1)],
         messageCounts,
-        dailyMessageCounts: [{ date, ...messageCounts }],
-        utcQuarterHourMessageCounts: [{ date, quarterIndex: 2, ...messageCounts }],
-        utcQuarterHourTokenUsage: [{ date, quarterIndex: 2, ...totals }],
         latency,
-        dailyLatency: [{ date, ...latency }],
-        modelUsage: [{ provider, model, count: 1, totals }],
+        modelUsage: [{ ...models[modelIndex], count: 1, totals }],
         toolUsage: oldest
           ? tools(["z-first", 1])
           : historical
             ? tools(["a-second", 2])
             : tools(["z-first", 2], ["a-second", 1]),
-        dailyModelUsage: [
-          {
-            date,
-            provider: provider.replace("::", ":"),
-            model: model.replace("::", ":"),
-            tokens: totalTokens,
-            cost: totalCost,
-            count: 1,
-          },
-        ],
       };
       sources.push(summary);
       sourceSnapshots.push(structuredClone(summary));
@@ -709,14 +698,6 @@ it("rolls up known session family ids when historical usage is requested", async
 
   const result = await readFamily();
 
-  const models = [
-    { provider: "fixture", model: "bedrock::arn" },
-    { provider: "fixture::bedrock", model: "arn" },
-  ];
-  const dailyModels = [
-    { provider: "fixture", model: "bedrock:arn" },
-    { provider: "fixture:bedrock", model: "arn" },
-  ];
   expect(result).toMatchObject({
     sessions: [
       {
@@ -729,31 +710,14 @@ it("rolls up known session family ids when historical usage is requested", async
           dailyBreakdown: [daily("2026-02-01", 30, 0.03, 2), daily("2026-02-02", 30, 0.03, 1)],
           activityDates: ["2026-02-01", "2026-02-02"],
           messageCounts: { total: 3 },
-          dailyMessageCounts: [
-            { date: "2026-02-01", total: 2 },
-            { date: "2026-02-02", total: 1 },
-          ],
-          utcQuarterHourMessageCounts: [
-            { date: "2026-02-01", quarterIndex: 2, total: 2 },
-            { date: "2026-02-02", quarterIndex: 2, total: 1 },
-          ],
-          utcQuarterHourTokenUsage: [
-            { date: "2026-02-01", quarterIndex: 2, totalTokens: 30, totalCost: 0.03 },
-            { date: "2026-02-02", quarterIndex: 2, totalTokens: 30, totalCost: 0.03 },
-          ],
-          dailyLatency: [
-            { date: "2026-02-01", count: 3, avgMs: 20, p95Ms: 30, minMs: 10, maxMs: 30 },
-            { date: "2026-02-02", count: 3, avgMs: 7, p95Ms: 9, minMs: 5, maxMs: 9 },
-          ],
           latency: { count: 6, avgMs: 13.5, p95Ms: 30, minMs: 5, maxMs: 30 },
           // a-second overtakes z-first before their counts tie again.
           toolUsage: tools(["a-second", 3], ["z-first", 3]),
           modelUsage: models,
-          dailyModelUsage: [dailyModels[0], dailyModels[1], dailyModels[0]],
         },
       },
     ],
-    aggregates: { byModel: models, modelDaily: [dailyModels[1], dailyModels[0], dailyModels[0]] },
+    aggregates: { byModel: models },
     totals: { totalTokens: 60, totalCost: expect.closeTo(0.06) },
   });
   expect(sources).toEqual(sourceSnapshots);

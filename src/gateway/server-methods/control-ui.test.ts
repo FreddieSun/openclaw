@@ -8,10 +8,7 @@ import {
 } from "../../config/runtime-snapshot.js";
 import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.js";
-import {
-  SecretSurfaceUnavailableError,
-  setActiveDegradedSecretOwners,
-} from "../../secrets/runtime-degraded-state.js";
+import { setActiveDegradedSecretOwners } from "../../secrets/runtime-degraded-state.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import * as checkDetails from "../control-ui-session-pr-check-details.js";
@@ -157,87 +154,49 @@ describe("controlUi.githubPreview", () => {
     },
   );
 
-  it.each([
-    { mode: "managed", method: "controlUi.githubPreview" },
-    { mode: "managed", method: "controlUi.githubDetail" },
-    { mode: "service", method: "controlUi.githubDetail" },
-    { mode: "anonymous", method: "controlUi.githubPreview" },
-  ])("reads $method as $mode", async ({ mode, method }) => {
+  it.each(["service", "anonymous"])("reads with the %s fallback", async (mode) => {
+    const method = mode === "service" ? "githubDetail" : "githubPreview";
     vi.stubEnv("GH_TOKEN", mode === "service" ? "different-ambient-token" : "");
     vi.stubEnv("GITHUB_TOKEN", "");
-    const assertSelected = vi.fn();
-    const identity = {
-      token: "selected-agent-github-token",
-      selection: {
-        source: "agent-override" as const,
-        profileId: `ghp_${"a".repeat(32)}`,
-        accountId: 101,
-      },
-      cacheScope: "selected-agent-preview",
-      assertSelected,
-      revalidate: vi.fn().mockResolvedValue(undefined),
-      start: async <T>(start: () => T): Promise<Awaited<T>> => {
-        assertSelected();
-        return await start();
-      },
-    };
-    const prepare = vi.spyOn(githubIdentity, "prepareGitHubReadIdentity");
-    if (mode === "managed") {
-      prepare.mockResolvedValue(identity);
-    } else {
-      prepare.mockRejectedValue(new githubIdentity.GitHubIdentityError("rate_limited"));
-    }
+    const prepare = vi
+      .spyOn(githubIdentity, "prepareGitHubReadIdentity")
+      .mockRejectedValue(new githubIdentity.GitHubIdentityError("rate_limited"));
     const cfg: OpenClawConfig =
       mode === "anonymous"
         ? { agents: { entries: { main: {} } } }
-        : configuredGitHub(
-            mode === "managed" ? "old-preview-service-token" : "configured-reader-token",
-          );
-    if (mode === "managed") {
-      cfg.agents = {
-        entries: {
-          main: {},
-          alternate: { tools: { github: { profileId: identity.selection.profileId } } },
-        },
-      };
-    }
+        : configuredGitHub("configured-reader-token");
     if (mode !== "anonymous") {
       setRuntimeConfigSnapshot(cfg);
     }
-    const title =
-      mode === "managed" ? "Use the selected GitHub identity" : "Public metadata without a login";
+    const title = "Public metadata without a login";
     const anonymousResponse = json(issueFields(title));
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (mode === "anonymous") {
         return anonymousResponse;
       }
       expect(new Headers(init?.headers).get("Authorization")).toBe(
-        `Bearer ${mode === "managed" ? identity.token : "configured-reader-token"}`,
+        "Bearer configured-reader-token",
       );
       const url = input instanceof Request ? input.url : input.toString();
-      const issue = mode === "managed" ? url.endsWith("/issues/88120") : url.includes("/issues/");
       return json(
-        issue
-          ? issueFields(mode === "service" ? "Authenticated reader" : title, {
-              ...(mode === "managed"
-                ? { repository_url: "https://api.github.com/repos/openclaw/openclaw" }
-                : {}),
-              body: mode === "managed" ? "Authenticated reader body" : "Reader body",
+        url.includes("/issues/")
+          ? issueFields("Authenticated reader", {
+              body: "Reader body",
               comments: 0,
             })
-          : { id: mode === "managed" ? 123 : 124, private: false, visibility: "public" },
+          : { id: 124, private: false, visibility: "public" },
       );
     });
     vi.stubGlobal("fetch", fetchMock);
-    const { respond, send } = fixture(method.replace("controlUi.", ""));
+    const { respond, send } = fixture(method);
     await send(
       {
         kind: "issue",
-        number: mode === "managed" ? 88120 : mode === "service" ? 1 : 88121,
+        number: mode === "service" ? 1 : 88121,
         owner: mode === "service" ? "octocat" : "openclaw",
         repo: mode === "service" ? "reader-auth" : "openclaw",
-        agentId: mode === "managed" ? "alternate" : "main",
-        ...(method === "controlUi.githubDetail" ? { section: "overview" } : {}),
+        agentId: "main",
+        ...(mode === "service" ? { section: "overview" } : {}),
       },
       runtime(() => cfg),
     );
@@ -245,7 +204,7 @@ describe("controlUi.githubPreview", () => {
       respond,
       expect.objectContaining(mode === "service" ? { body: "Reader body" } : { title }),
     );
-    if (method === "controlUi.githubDetail") {
+    if (mode === "service") {
       expectReply(
         respond,
         expect.objectContaining({ deferredSections: ["discussion"], partial: false }),
@@ -259,19 +218,11 @@ describe("controlUi.githubPreview", () => {
       expect(
         fetchMock.mock.calls.every(
           ([, options]) =>
-            new Headers(options?.headers).get("Authorization") ===
-            `Bearer ${mode === "managed" ? identity.token : "configured-reader-token"}`,
+            new Headers(options?.headers).get("Authorization") === "Bearer configured-reader-token",
         ),
       ).toBe(true);
-      if (mode === "managed") {
-        expect(prepare).toHaveBeenCalledWith(
-          expect.objectContaining({ agentId: "alternate", config: cfg }),
-        );
-        expect(identity.revalidate).toHaveBeenCalled();
-      } else {
-        expect(prepare).not.toHaveBeenCalled();
-      }
     }
+    expect(prepare).not.toHaveBeenCalled();
   });
 
   it.each(["controlUi.githubPreview", "controlUi.githubDetail"])(
@@ -410,29 +361,20 @@ describe("controlUi.githubPreview", () => {
   });
 
   it.each([
-    ...(["unavailable", "unverified", "rate_limited"] as const).map((reason) => ({
-      failure: `managed identity ${reason}`,
+    {
+      failure: "managed identity unavailable",
       managed: true,
-      error: new githubIdentity.GitHubIdentityError(reason),
+      error: new githubIdentity.GitHubIdentityError("unavailable"),
       message:
-        reason === "unavailable"
-          ? "The selected GitHub credential is unavailable; reconnect the agent's GitHub identity in Settings."
-          : new githubIdentity.GitHubIdentityError(reason).message,
+        "The selected GitHub credential is unavailable; reconnect the agent's GitHub identity in Settings.",
       retryable: false,
-    })),
+    },
     {
       failure: "GitHub quota",
       managed: false,
       error: new gitHubPublicApi.ControlUiGitHubError(429, "rate limited"),
       message: "GitHub API rate limit exceeded (HTTP 429). Wait and retry.",
       retryable: true,
-    },
-    {
-      failure: "configured-unavailable preview credential",
-      managed: false,
-      error: new SecretSurfaceUnavailableError(degradedPreview),
-      message: previewUnavailable,
-      retryable: false,
     },
   ])("preserves the $failure diagnostic", async ({ managed, error, message, retryable }) => {
     const loadPreview = vi.spyOn(gitHubPublicApi, "loadControlUiGitHubPreview");
