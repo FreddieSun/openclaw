@@ -85,6 +85,18 @@ function profileStore(
   return makeStore({ [profileId]: credential }, extra);
 }
 
+function publishSnapshot(agentDir: string, store: RuntimeAuthProfileStore, databasePath?: string) {
+  publishSnapshots([{ agentDir, store, ...(databasePath ? { databasePath } : {}) }]);
+}
+
+function resolveStoredKey(store: RuntimeAuthProfileStore, profileId: string, key: string) {
+  const credential = store.profiles[profileId];
+  if (credential?.type !== "api_key") {
+    throw new Error("expected API-key profile");
+  }
+  credential.key = key;
+}
+
 function saveProfile(
   profileId: string,
   credential: AuthProfileStore["profiles"][string],
@@ -150,7 +162,7 @@ describe("promoteAuthProfileInOrder", () => {
           { order: { openai: [selected] } },
         );
       saveAuthProfileStore(mainStore("openai:first"));
-      publishSnapshots([{ agentDir: customAgentDir, store: loadRuntime(customAgentDir) }]);
+      publishSnapshot(customAgentDir, loadRuntime(customAgentDir));
       const credentialsRevision = getRuntimeAuthProfileStoreCredentialsRevision();
 
       saveAuthProfileStore(mainStore("openai:second"));
@@ -168,12 +180,8 @@ describe("promoteAuthProfileInOrder", () => {
       saveAuthProfileStore(mainStore("old"));
       saveProfile("anthropic:custom", referencedKey("sk-custom-resolved"), customAgentDir);
       const derivedStore = loadRuntime(customAgentDir);
-      const customCredential = derivedStore.profiles["anthropic:custom"];
-      if (customCredential?.type !== "api_key") {
-        throw new Error("expected custom API-key profile");
-      }
-      customCredential.key = "sk-custom-resolved";
-      publishSnapshots([{ agentDir: customAgentDir, store: derivedStore }]);
+      resolveStoredKey(derivedStore, "anthropic:custom", "sk-custom-resolved");
+      publishSnapshot(customAgentDir, derivedStore);
       expect(runtimeSnapshot(customAgentDir)?.profiles["openai:default"]).toMatchObject({
         access: "old",
       });
@@ -200,12 +208,8 @@ describe("promoteAuthProfileInOrder", () => {
       saveProfile("anthropic:inherited", referencedKey());
       saveProfile("openai:local", apiKey("openai", "sk-local-old"), customAgentDir);
       const runtimeStore = loadRuntime(customAgentDir);
-      const inherited = runtimeStore.profiles["anthropic:inherited"];
-      if (inherited?.type !== "api_key") {
-        throw new Error("expected inherited API-key profile");
-      }
-      inherited.key = "sk-inherited-resolved";
-      publishSnapshots([{ agentDir: customAgentDir, store: runtimeStore }]);
+      resolveStoredKey(runtimeStore, "anthropic:inherited", "sk-inherited-resolved");
+      publishSnapshot(customAgentDir, runtimeStore);
 
       externalAuthTesting.setResolveExternalAuthProfilesForTest(() => {
         throw new Error("external auth hook must not run during postcommit rebuild");
@@ -339,7 +343,7 @@ describe("promoteAuthProfileInOrder", () => {
         apiKey("openai", "sk-candidate"),
       );
       saveAuthProfileStore(initial, agentDir);
-      publishSnapshots([{ agentDir, store: initial }]);
+      publishSnapshot(agentDir, initial);
 
       runAuthProfileWriteTransaction(agentDir, () => {
         expect(() =>
@@ -371,29 +375,24 @@ describe("promoteAuthProfileInOrder", () => {
           { runtimeExternalProfileIds: ["anthropic:external"] },
         );
         saveAuthProfileStore(baselineStore, agentDir);
-        publishSnapshots([{ agentDir, store: baselineStore }]);
+        publishSnapshot(agentDir, baselineStore);
         saveAuthProfileStore(baselineStore, agentDir);
         expect(loadPersisted(agentDir)?.profiles["anthropic:external"]).toBeUndefined();
         const snapshot = captureAuthProfileStorePersistenceSnapshot(agentDir);
 
         const mutateRuntimeStore = () => {
-          publishSnapshots([
-            {
-              agentDir,
-              store: {
-                ...baselineStore,
-                profiles: {
-                  ...baselineStore.profiles,
-                  "anthropic:external": oauth(
-                    "external-after-capture",
-                    "external-refresh-new",
-                    Date.now() + 120_000,
-                    "anthropic",
-                  ),
-                },
-              },
+          publishSnapshot(agentDir, {
+            ...baselineStore,
+            profiles: {
+              ...baselineStore.profiles,
+              "anthropic:external": oauth(
+                "external-after-capture",
+                "external-refresh-new",
+                Date.now() + 120_000,
+                "anthropic",
+              ),
             },
-          ]);
+          });
         };
         if (mutationTiming === "before save") {
           mutateRuntimeStore();
@@ -430,11 +429,7 @@ describe("promoteAuthProfileInOrder", () => {
       const keyRef = { source: "env", provider: "default", id: "OPENAI_API_KEY" } as const;
       saveProfile("openai:baseline", { type: "api_key", provider: "openai", keyRef });
       const capturedRuntime = loadRuntime(capturedAgentDir);
-      const capturedProfile = capturedRuntime.profiles["openai:baseline"];
-      if (capturedProfile?.type !== "api_key") {
-        throw new Error("expected captured derived API-key profile");
-      }
-      capturedProfile.key = "sk-captured-resolved";
+      resolveStoredKey(capturedRuntime, "openai:baseline", "sk-captured-resolved");
       capturedRuntime.profiles["anthropic:captured-external"] = oauth(
         "captured-external-access",
         "captured-external-refresh",
@@ -442,7 +437,7 @@ describe("promoteAuthProfileInOrder", () => {
         "anthropic",
       );
       capturedRuntime.runtimeExternalProfileIds = ["anthropic:captured-external"];
-      publishSnapshots([{ agentDir: capturedAgentDir, store: capturedRuntime }]);
+      publishSnapshot(capturedAgentDir, capturedRuntime);
       const snapshot = captureAuthProfileStorePersistenceSnapshot();
 
       const committed = saveAuthProfileStoreIfPersistenceSnapshotMatches({
@@ -455,7 +450,7 @@ describe("promoteAuthProfileInOrder", () => {
         Date.now() + 120_000,
         "anthropic",
       );
-      publishSnapshots([{ agentDir: capturedAgentDir, store: capturedRuntime }]);
+      publishSnapshot(capturedAgentDir, capturedRuntime);
       expect(committed.publishRuntimeSnapshots()).toBe(true);
       const { owned } = committed;
       const ownedCapturedRuntime = runtimeSnapshot(capturedAgentDir);
@@ -503,7 +498,7 @@ describe("promoteAuthProfileInOrder", () => {
       const databasePath = path.join(derivedAgentDir, "custom.sqlite");
       saveProfile("openai:baseline", apiKey("openai", "sk-baseline"));
       const capturedRuntime = loadRuntime(derivedAgentDir);
-      publishSnapshots([{ databasePath, agentDir: derivedAgentDir, store: capturedRuntime }]);
+      publishSnapshot(derivedAgentDir, capturedRuntime, databasePath);
       const snapshot = captureAuthProfileStorePersistenceSnapshot();
       const committed = saveAuthProfileStoreIfPersistenceSnapshotMatches({
         snapshot,
@@ -802,7 +797,7 @@ describe("promoteAuthProfileInOrder", () => {
         apiKey("openrouter", "api-key"),
       );
       saveAuthProfileStore(initialStore, agentDir);
-      publishSnapshots([{ agentDir, store: loadRuntime(agentDir) }]);
+      publishSnapshot(agentDir, loadRuntime(agentDir));
       const credentialRevision =
         getRuntimeAuthProfileStoreCredentialMutationToken(agentDir).revision;
       const stateRevision = getRuntimeAuthProfileStoreStateMutationToken(agentDir).revision;
@@ -834,12 +829,10 @@ describe("promoteAuthProfileInOrder", () => {
         const store = makeStore({ [profileId]: original, "other:default": unrelated });
         saveAuthProfileStore(store, agentDir);
         expect((await reloadSharedAuthStoreOwnership()).location).toBe("legacy-main");
-        publishSnapshots([
-          {
-            agentDir,
-            store: { ...store, profiles: { ...store.profiles, [profileId]: replacement } },
-          },
-        ]);
+        publishSnapshot(agentDir, {
+          ...store,
+          profiles: { ...store.profiles, [profileId]: replacement },
+        });
         const beforeRemove = vi.fn(async () => {
           expect(loadPersisted()?.profiles[profileId]).toEqual(original);
           if (replaceDuringCleanup) {
