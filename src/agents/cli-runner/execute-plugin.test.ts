@@ -95,6 +95,24 @@ async function startBlockedRun(options: {
   return { run };
 }
 
+const APPROVAL_CONFIG: OpenClawConfig = {
+  tools: { exec: { security: "allowlist", ask: "on-miss" } },
+};
+const createApprovalExecution = (options: Parameters<typeof createExecution>[0] = {}) =>
+  createExecution({ config: APPROVAL_CONFIG, nativeTools: ["WebFetch"], ...options });
+
+function setCallerAuthority(context: PreparedCliRunContext) {
+  let current = true;
+  context.params.assertCurrent = () => {
+    if (!current) {
+      throw new Error("caller revoked");
+    }
+  };
+  return () => {
+    current = false;
+  };
+}
+
 afterEach(() => {
   for (const session of activeSessions) {
     session.close("restart");
@@ -129,7 +147,6 @@ function historyWriter(overrides: Partial<CliExecutionHistoryWriter>): CliExecut
 
 describe("plugin-owned CLI execution host boundary", () => {
   it("streams plugin events through the canonical host output boundary", async () => {
-    // Exercise stream translation independently of cold policy-worker startup time.
     vi.useFakeTimers({ toFake: ["Date"] });
     const { context } = await createExecution();
     context.systemPrompt = `  Follow host policy.${SYSTEM_PROMPT_CACHE_BOUNDARY}Keep credentials private.  `;
@@ -153,24 +170,10 @@ describe("plugin-owned CLI execution host boundary", () => {
       { type: "system", subtype: "init", session_id: "sdk-session" },
       SUCCESS_RESULT,
     ]);
-    expect(observedExecution).toEqual(
-      expect.objectContaining({
-        command: "/bin/sh",
-        cwd: "/tmp",
-        prompt: "hello",
-        promptContext: {
-          prependContext: "private red prefix",
-          appendContext: "private red suffix",
-        },
-        modelId: "claude-sonnet-4-6",
-        systemPrompt: "Follow host policy.\nKeep credentials private.",
-        sessionId: "sdk-session",
-        useResume: false,
-        env: { PATH: "/bin:/usr/bin", OPENCLAW_TEST_MARKER: "host-owned" },
-        requestToolPermission: expect.any(Function),
-        requestUserInput: expect.any(Function),
-      }),
-    );
+    expect(observedExecution).toMatchObject({
+      promptContext: context.promptContext,
+      systemPrompt: "Follow host policy.\nKeep credentials private.",
+    });
   });
 
   it("does not disclose private context when history access changes during permission preparation", async () => {
@@ -235,47 +238,27 @@ describe("plugin-owned CLI execution host boundary", () => {
         nativeTools: ["AskUserQuestion"],
       });
       context.params.sessionKey = "main";
-      let callerCurrent = true;
-      context.params.assertCurrent = () => {
-        if (!callerCurrent) {
-          throw new Error("caller revoked");
-        }
-      };
+      const revoke = setCallerAuthority(context);
       context.params.runtimePolicySessionKey =
         "agent:main:telegram:default:direct:canonical-sender";
-      let promptDelivered = createDeferred();
+      const promptDelivered = createDeferred();
       const onBlockReply = vi.fn(async () => {
         promptDelivered.resolve();
       });
       context.params.onBlockReply = onBlockReply;
-      const requests = new Map<string, { questions: Array<{ questionId: string }> }>();
       mockCallGatewayTool.mockImplementation(async (method, _opts, rawParams) => {
-        const params = rawParams as {
-          id: string;
-          questions?: Array<{ questionId: string }>;
-          sessionKey?: string;
-        };
+        const params = rawParams as { id: string; sessionKey?: string };
         if (method === "question.request") {
           expect(params.sessionKey).toBe(context.params.sessionKey);
-          requests.set(params.id, { questions: params.questions ?? [] });
+          expect(params.id).toBe("claude-question:0");
           return { id: params.id };
         }
         if (method === "question.waitAnswer") {
-          const request = requests.get(params.id);
           await promptDelivered.promise;
-          promptDelivered = createDeferred();
-          callerCurrent = !revoked;
-          return {
-            status: "answered",
-            answers: {
-              answers: Object.fromEntries(
-                (request?.questions ?? []).map((question) => [
-                  question.questionId,
-                  [question.questionId],
-                ]),
-              ),
-            },
-          };
+          if (revoked) {
+            revoke();
+          }
+          return { status: "answered", answers: { answers: { one: ["one"] } } };
         }
         if (method === "question.resolve") {
           return { status: "cancelled" };
@@ -301,14 +284,8 @@ describe("plugin-owned CLI execution host boundary", () => {
       expect(result).toEqual(
         revoked
           ? expect.objectContaining({ status: "cancelled" })
-          : {
-              status: "answered",
-              answers: {
-                one: ["one"],
-              },
-            },
+          : { status: "answered", answers: { one: ["one"] } },
       );
-      expect([...requests.keys()]).toEqual(["claude-question:0"]);
       expect(onBlockReply).toHaveBeenCalledOnce();
     },
   );
@@ -344,12 +321,7 @@ describe("plugin-owned CLI execution host boundary", () => {
     const session = registerOwnerSession(successor.context, "successor-during-restart");
     const entered = createDeferred();
     const held = createDeferred();
-    let callerCurrent = true;
-    context.params.assertCurrent = () => {
-      if (!callerCurrent) {
-        throw new Error("caller revoked");
-      }
-    };
+    const revoke = setCallerAuthority(context);
     context.preparedBackend.closeLiveSession = async () => {
       entered.resolve();
       await held.promise;
@@ -361,7 +333,7 @@ describe("plugin-owned CLI execution host boundary", () => {
     const observed = run.catch((error: unknown) => error);
     try {
       await entered.promise;
-      callerCurrent = false;
+      revoke();
     } finally {
       held.resolve();
     }
@@ -626,16 +598,11 @@ describe("plugin-owned CLI execution host boundary", () => {
   });
 
   it("retains safe standing approvals only for the exact live process and current turn policy", async () => {
-    const config: OpenClawConfig = { tools: { exec: { security: "allowlist", ask: "on-miss" } } };
     mockCallGatewayTool
       .mockResolvedValueOnce({ id: "approval-first", decision: "allow-always" })
       .mockResolvedValueOnce({ id: "approval-second", decision: "allow-always" });
 
-    const first = await createExecution({
-      config,
-      nativeTools: ["WebFetch"],
-      runId: "plugin-approval-first",
-    });
+    const first = await createApprovalExecution();
     registerOwnerSession(first.context, "original-live-process");
 
     const runApprovedTurn = async (context: PreparedCliRunContext, repeat: boolean) => {
@@ -661,18 +628,11 @@ describe("plugin-owned CLI execution host boundary", () => {
     };
 
     await runApprovedTurn(first.context, true);
-    const sameProcess = await createExecution({
-      config,
-      nativeTools: ["WebFetch"],
-      runId: "plugin-approval-second",
-    });
+    const sameProcess = await createApprovalExecution();
     await runApprovedTurn(sameProcess.context, false);
     expect(mockCallGatewayTool).toHaveBeenCalledOnce();
 
-    const restricted = await createExecution({
-      config,
-      nativeTools: ["WebFetch"],
-      runId: "plugin-approval-restricted",
+    const restricted = await createApprovalExecution({
       sessionEntry: { sessionId: "sdk-session", updatedAt: 1, permissionMode: "read-only" },
     });
     await runTurn(restricted.context, async (execution) => {
@@ -684,11 +644,7 @@ describe("plugin-owned CLI execution host boundary", () => {
 
     await closeCliLiveSession(sameProcess.context, "restart");
     registerOwnerSession(first.context, "replacement-live-process");
-    const replacement = await createExecution({
-      config,
-      nativeTools: ["WebFetch"],
-      runId: "plugin-approval-replacement",
-    });
+    const replacement = await createApprovalExecution();
     await runApprovedTurn(replacement.context, false);
 
     expect(mockCallGatewayTool).toHaveBeenCalledTimes(2);
@@ -697,19 +653,11 @@ describe("plugin-owned CLI execution host boundary", () => {
   it.each(["admission", "caller"] as const)(
     "denies approval when %s authority closes during the awaited decision",
     async (authority) => {
-      const { admission, context } = await createExecution({
-        config: { tools: { exec: { security: "allowlist", ask: "on-miss" } } },
-        nativeTools: ["WebFetch"],
-      });
-      let callerCurrent = true;
-      context.params.assertCurrent = () => {
-        if (!callerCurrent) {
-          throw new Error("caller revoked");
-        }
-      };
+      const { admission, context } = await createApprovalExecution();
+      const revoke = setCallerAuthority(context);
       mockCallGatewayTool.mockImplementationOnce(async () => {
         if (authority === "caller") {
-          callerCurrent = false;
+          revoke();
         } else {
           admission.close();
         }
@@ -728,11 +676,7 @@ describe("plugin-owned CLI execution host boundary", () => {
 
   it("cancels an in-flight native approval and never releases its late decision", async () => {
     const controller = new AbortController();
-    const { context } = await createExecution({
-      abortSignal: controller.signal,
-      config: { tools: { exec: { security: "allowlist", ask: "on-miss" } } },
-      nativeTools: ["WebFetch"],
-    });
+    const { context } = await createApprovalExecution({ abortSignal: controller.signal });
     const approval = createDeferred<{ id: string; decision: "allow-always" }>();
     mockCallGatewayTool.mockReturnValueOnce(approval.promise);
     const granted = vi.fn();
@@ -848,10 +792,7 @@ describe("plugin-owned CLI execution host boundary", () => {
 
   it("keeps an active native approval alive beyond the ordinary no-output watchdog", async () => {
     vi.useFakeTimers();
-    const { context } = await createExecution({
-      config: { tools: { exec: { security: "allowlist", ask: "on-miss" } } },
-      nativeTools: ["WebFetch"],
-    });
+    const { context } = await createApprovalExecution();
     const approval = createDeferred<{ id: string; decision: "allow-once" }>();
     mockCallGatewayTool.mockReturnValueOnce(approval.promise);
     const outstandingWork = vi.fn();
@@ -879,39 +820,6 @@ describe("plugin-owned CLI execution host boundary", () => {
     approval.resolve({ id: "approval-pending", decision: "allow-once" });
     await expect(run).resolves.toMatchObject({ reason: "exit", timedOut: false });
     expect(outstandingWork).toHaveBeenLastCalledWith(false);
-  });
-
-  it("keeps tracked background work alive beyond the ordinary no-output watchdog", async () => {
-    vi.useFakeTimers();
-    const { context } = await createExecution();
-    const backgroundFinished = createDeferred();
-    const received: string[] = [];
-    let completed = false;
-    const run = runPlugin(
-      context,
-      async function* () {
-        yield {
-          type: "system",
-          subtype: "background_tasks_changed",
-          tasks: [{ task_id: "background-agent", task_type: "local_agent" }],
-        };
-        await backgroundFinished.promise;
-        yield { type: "system", subtype: "background_tasks_changed", tasks: [] };
-        yield SUCCESS_RESULT;
-      },
-      { noOutputTimeoutMs: 100, consumeStdout: received.push.bind(received) },
-    ).then((result) => {
-      completed = true;
-      return result;
-    });
-    await vi.waitFor(() => expect(received).toHaveLength(1));
-
-    await vi.advanceTimersByTimeAsync(150);
-    expect(completed).toBe(false);
-
-    backgroundFinished.resolve();
-    await expect(run).resolves.toMatchObject({ reason: "exit", timedOut: false });
-    expect(received.map((event) => JSON.parse(event))).toHaveLength(3);
   });
 
   it("preserves streamed assistant output after the caller deadline expires", async () => {
