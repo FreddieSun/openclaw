@@ -55,6 +55,18 @@ handler that performs additional caller-specific authorization or nested request
 must remain request-local. Omit these options for mutations, subscriptions, and
 connection-bound providers.
 
+### Bounded directory inventories
+
+`walkDirectory(root, options?)` and `walkDirectorySync(root, options?)` from
+`openclaw/plugin-sdk/file-access-runtime` return `{ relativePath, dirent }` entries
+in lexical relative-path order. They report symlinks without following them and
+reject a symlink root. Missing roots throw `ENOENT`; callers may explicitly treat
+that as an empty inventory. `maxDepth` defaults to 64 (immediate children have
+depth 1), and `maxEntries` defaults to 100,000, counting directories and symlinks.
+Exceeding either throws `DirectoryWalkLimitError`, never a truncated result.
+These inventories do not authorize later reads or writes against concurrent path
+replacement; use the root-bound file APIs for that boundary.
+
 ### File-watch capacity errors
 
 `getFileWatchCapacityCode(error)` from `openclaw/plugin-sdk/file-access-runtime`

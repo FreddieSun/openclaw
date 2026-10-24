@@ -14,6 +14,7 @@ function fixture(rule: string, file: string, violations: number, lines?: number[
   };
 }
 const cases = [
+  fixture("no-recursive-readdir", "recursive-readdir-violation.ts", 6, [3, 4, 5, 6, 7, 8]),
   fixture(
     forcedExit,
     "forced-process-exit-violation.ts",

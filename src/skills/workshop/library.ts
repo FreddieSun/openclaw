@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { resolveAgentWorkspaceDir } from "../../agents/agent-scope-config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { walkDirectory } from "../../infra/directory-walk.js";
 import { ignoreMissingPath } from "../../infra/errno.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { removePathWithinRoot } from "../../infra/fs-safe-remove.js";
@@ -117,15 +118,14 @@ async function readSkillFile(skillDir: string, filePath: string): Promise<string
 async function listSkillFiles(
   skillDir: string,
 ): Promise<{ files: string[]; sizeBytes: number; updatedAtMs: number }> {
-  const entries = await fs.readdir(skillDir, { recursive: true, withFileTypes: true });
+  const entries = await walkDirectory(skillDir);
   const files: string[] = [];
   let sizeBytes = 0;
   let updatedAtMs = 0;
-  for (const entry of entries) {
+  for (const { relativePath: relative, dirent: entry } of entries) {
     if (!entry.isFile()) {
       continue;
     }
-    const relative = path.relative(skillDir, path.join(entry.parentPath, entry.name));
     const segments = relative.split(path.sep);
     if (segments.some((segment) => segment.startsWith("."))) {
       continue;
@@ -228,11 +228,8 @@ async function readRestorableVersion(
   }
   const versionRoot = await root(versionDir);
   const files: Array<[string, Buffer]> = [];
-  for (const entry of await fs.readdir(versionDir, { recursive: true, withFileTypes: true })) {
-    const filePath = path
-      .relative(versionDir, path.join(entry.parentPath, entry.name))
-      .split(path.sep)
-      .join("/");
+  for (const { relativePath, dirent: entry } of await walkDirectory(versionDir)) {
+    const filePath = relativePath.split(path.sep).join("/");
     // Dot entries (e.g. .DS_Store) are not part of a skill and are never restored.
     if (entry.isDirectory() || filePath.split("/").some((segment) => segment.startsWith("."))) {
       continue;

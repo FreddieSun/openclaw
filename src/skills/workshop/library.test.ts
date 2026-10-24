@@ -99,6 +99,8 @@ it("reports unreadable skill files instead of returning an incomplete inventory"
 it("skips directories without SKILL.md but still lists hand-edited broken frontmatter", async () => {
   await fs.mkdir(skillPath("missing"), { recursive: true });
   await seed("broken", "---\nname: [\n---\n");
+  await fs.symlink(skillPath("broken"), skillPath("broken", "loop"), "dir");
+  await fs.symlink(skillPath("broken", "SKILL.md"), skillPath("broken", "linked.md"), "file");
 
   expect(await listWorkshopSkills({}, "main")).toMatchObject([
     { name: "broken", description: "", files: ["SKILL.md"] },

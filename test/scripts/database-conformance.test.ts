@@ -47,6 +47,7 @@ beforeAll(() => {
   ]) {
     write(file);
   }
+  copyFileSync("src/infra/directory-walk.ts", path.join(scripts, "../src/infra/directory-walk.ts"));
   write("test-projects.mts", "console.log(JSON.stringify(process.argv.slice(2)));\n");
 });
 

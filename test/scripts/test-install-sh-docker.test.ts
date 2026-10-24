@@ -1421,6 +1421,11 @@ printf 'command-status=%s\\n' "$command_result"
       const versionFile = join(root, "version");
       const callsFile = join(root, "updates.jsonl");
       const preload = join(root, "native-inspection.cjs");
+      const systemd = join(root, "systemd");
+      mkdirSync(systemd);
+      if (scenario === "service definition") {
+        writeFileSync(join(systemd, "openclaw-gateway.service"), "fixture service");
+      }
       mkdirSync(join(globalRoot, "openclaw"), { recursive: true });
       writeFileSync(join(globalRoot, "openclaw", "package.json"), '{"version":"2026.8.2"}');
       writeFileSync(versionFile, "2026.8.2");
@@ -1458,6 +1463,7 @@ if (args[0] === "--version") {
         `const fs = require("node:fs");
 const realRead = fs.readFileSync;
 const realList = fs.readdirSync;
+const realOpen = fs.opendirSync;
 const realStat = fs.lstatSync;
 const absent = () => { throw Object.assign(new Error("absent"), { code: "ENOENT" }); };
 Object.defineProperty(process, "platform", { value: "linux" });
@@ -1471,11 +1477,14 @@ fs.lstatSync = (file, ...args) => {
 };
 fs.readdirSync = (file, ...args) => {
   if (file === "/proc") return ["1", String(process.pid), ...(process.env.FAKE_SCENARIO === "live process" ? ["42"] : [])];
+  return realList(file, ...args);
+};
+fs.opendirSync = (file, ...args) => {
   if (String(file).endsWith("/systemd")) {
     if (process.env.FAKE_SCENARIO === "inspection failure") throw Object.assign(new Error("inspection denied"), { code: "EACCES" });
-    return process.env.FAKE_SCENARIO === "service definition" ? [{ name: "openclaw-gateway.service", parentPath: file }] : [];
+    return realOpen(process.env.FAKE_SYSTEMD_DIR, ...args);
   }
-  return realList(file, ...args);
+  return realOpen(file, ...args);
 };
 fs.readFileSync = (file, ...args) => {
   if (file === "/proc/1/cmdline") return "bash\\0/usr/local/bin/openclaw-install-smoke\\0";
@@ -1490,6 +1499,7 @@ fs.readFileSync = (file, ...args) => {
           PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
           NODE_OPTIONS: `--require=${preload}`,
           FAKE_SCENARIO: scenario,
+          FAKE_SYSTEMD_DIR: systemd,
           FAKE_GLOBAL_ROOT: globalRoot,
           FAKE_VERSION_FILE: versionFile,
           FAKE_CALLS_FILE: callsFile,
@@ -1508,6 +1518,12 @@ fs.readFileSync = (file, ...args) => {
         .map((line) => JSON.parse(line) as string[]);
       expect(result.status, result.stderr).toBe(exitCode);
       expect(calls).toHaveLength(updateCount);
+      if (scenario === "service definition") {
+        expect(result.stderr).toContain("service definition exists");
+      }
+      if (scenario === "inspection failure") {
+        expect(result.stderr).toContain("inspection denied");
+      }
       if (updateCount > 0) {
         expect(calls[0]).toContain("--no-restart");
         expect(calls[1]).not.toContain("--no-restart");
