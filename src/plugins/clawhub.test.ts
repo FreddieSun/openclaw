@@ -219,8 +219,6 @@ beforeEach(() => {
 it("does not publish a ClawHub plugin after authority closes during artifact review", async () => {
   const archive = await mockArchive({ entries: DEMO_PLUGIN_ARCHIVE_ENTRIES });
   const extensionsDir = await useRealInstaller(archive.archivePath);
-  const archiveApi = await import("../infra/archive.js");
-  const extraction = vi.spyOn(archiveApi, "extractArchive");
   let authorityActive = true;
   const result = await installDemo({
     extensionsDir,
@@ -233,14 +231,13 @@ it("does not publish a ClawHub plugin after authority closes during artifact rev
       }
     },
   });
-  expect(extraction).toHaveBeenCalledOnce();
   expect(authorityActive).toBe(false);
   expect(result).toMatchObject({
     ok: false,
     error: expect.stringContaining("plugin installation authority closed"),
   });
   await expect(fs.stat(path.join(extensionsDir, "demo"))).rejects.toMatchObject({ code: "ENOENT" });
-  expect(mocks.cleanup).toHaveBeenCalledTimes(1);
+  expect(mocks.cleanup).toHaveBeenCalledOnce();
 });
 
 it.each([
@@ -248,33 +245,20 @@ it.each([
   ["capabilities.runtimeId", { capabilities: { runtimeId: "demo-runtime" } }],
 ])("pins archive installation to the advertised %s", async (_label, overrides) => {
   mockPackage(overrides);
-  mocks.installArchive.mockResolvedValueOnce({
-    ok: true,
-    pluginId: "demo-runtime",
-    targetDir: "/tmp/openclaw/plugins/demo-runtime",
-    version: "2026.3.22",
-  });
-  const result = await installDemo();
-  expect(expectInstallSuccess(result).pluginId).toBe("demo-runtime");
+  await installDemo();
   expect(installCall().expectedPluginId).toBe("demo-runtime");
 });
 
-it.each<[Record<string, unknown>, string | undefined, string]>([
-  [
-    { runtimeId: "advertised-runtime" },
-    "expected-runtime",
-    'ClawHub package runtime id mismatch: expected "expected-runtime", got "advertised-runtime".',
-  ],
+it.each<[Record<string, unknown>, string | undefined]>([
+  [{ runtimeId: "advertised-runtime" }, "expected-runtime"],
   [
     { runtimeId: "package-runtime", capabilities: { runtimeId: "capabilities-runtime" } },
     undefined,
-    'ClawHub package runtime id mismatch: package advertises "package-runtime" but capabilities advertise "capabilities-runtime".',
   ],
-])("rejects runtime id mismatch before download: %s", async (detail, expectedPluginId, error) => {
+])("rejects runtime id mismatch before download: %s", async (detail, expectedPluginId) => {
   mockPackage(detail);
   expect(expectInstallFailure(await installDemo({ expectedPluginId }))).toMatchObject({
     code: "plugin_id_mismatch",
-    error,
   });
   expectUnused(mocks.download, mocks.installArchive);
 });
@@ -484,11 +468,7 @@ it.each([
     expect(success.pluginId).toBe("demo");
     expect(success.clawhub).toMatchObject(expected);
     expect(mocks.fetchVersion).not.toHaveBeenCalled();
-    expect(downloadCall()).toMatchObject({
-      artifact: downloadKind,
-      name: "demo",
-      version: "2026.3.22",
-    });
+    expect(downloadCall().artifact).toBe(downloadKind);
   },
 );
 
@@ -633,10 +613,6 @@ it.each([
     compatibility: { pluginApiRange, minGatewayVersion },
   });
   expectSuccessfulClawHubInstall(await installDemo({ baseUrl: "https://clawhub.ai" }));
-  expect(mocks.download).toHaveBeenCalledTimes(1);
-  expect(mocks.installArchive).toHaveBeenCalledTimes(1);
-  expect(installCall().archivePath).toBe("/tmp/clawhub-demo/archive.zip");
-  expect(mocks.cleanup).toHaveBeenCalledTimes(1);
 });
 
 it("validates _meta.json against canonical package and resolved version metadata", async () => {

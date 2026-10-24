@@ -206,12 +206,6 @@ function expectStale(result: ReturnType<typeof loadPluginRegistrySnapshotWithMet
   expectDiagnosticsContainCode(result.diagnostics, "persisted-registry-stale-source");
 }
 
-function packageRegistry(disabled = false) {
-  const params = configuredRegistry(disabled);
-  writeRegistryPackagePlugin(params.rootDir);
-  return { ...params, index: loadInstalledPluginIndex({ config: params.config, env: params.env }) };
-}
-
 function dropStartupConfigPaths(
   plugin: InstalledPluginIndex["plugins"][number],
 ): InstalledPluginIndex["plugins"][number] {
@@ -460,22 +454,6 @@ describe("loadPluginRegistrySnapshotWithMetadata", () => {
     );
   });
 
-  it("rebuilds legacy config-path persisted registries before startup scoping", async () => {
-    const { rootDir, stateDir, env, config } = configuredRegistry();
-    writeRegistryPackagePlugin(rootDir, { configPaths: ["browser"] });
-    const index = loadInstalledPluginIndex({ config, env });
-    const legacyIndex: InstalledPluginIndex = {
-      ...index,
-      plugins: index.plugins.map(dropStartupConfigPaths),
-    };
-    await writePersistedInstalledPluginIndex(legacyIndex, { stateDir });
-
-    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
-
-    expectStale(result);
-    expect(result.snapshot.plugins[0]?.startup.configPaths).toEqual(["browser"]);
-  });
-
   it("keeps persisted package plugins with dot-prefixed package metadata paths", async () => {
     const { rootDir, stateDir, env, config } = configuredRegistry();
     writeRegistryPackagePlugin(rootDir);
@@ -570,35 +548,47 @@ describe("loadPluginRegistrySnapshotWithMetadata", () => {
     },
   );
 
-  it("rejects escaped missing package metadata for disabled records", async () => {
-    const { stateDir, env, config, index } = packageRegistry(true);
-    await persistFirstPlugin(index, stateDir, {
-      packageJson: { path: "../gone/package.json", hash: "missing" },
-    });
-
-    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
-
-    expectStale(result);
-  });
-
-  it("detects same-size same-mtime manifest replacements", async () => {
-    const { rootDir, stateDir, env, config, index } = packageRegistry();
-    await writePersistedInstalledPluginIndex(index, { stateDir });
-
-    replaceFilePreservingSizeAndMtime(
-      path.join(rootDir, "openclaw.plugin.json"),
-      JSON.stringify({
-        id: "demo",
-        name: "Demo",
-        description: "two",
-        configSchema: { type: "object" },
-      }),
-    );
-
-    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
-
-    expectStale(result);
-  });
+  it.each(["legacy config paths", "escaped metadata", "manifest bytes", "package bytes"])(
+    "rebuilds stale persisted records: %s",
+    async (change) => {
+      const { rootDir, stateDir, env, config } = configuredRegistry(change === "escaped metadata");
+      writeRegistryPackagePlugin(
+        rootDir,
+        change === "legacy config paths" ? { configPaths: ["browser"] } : {},
+      );
+      const index = structuredClone(loadInstalledPluginIndex({ config, env }));
+      if (change === "legacy config paths") {
+        index.plugins = index.plugins.map(dropStartupConfigPaths);
+      } else if (change === "escaped metadata") {
+        index.plugins[0]!.packageJson = { path: "../gone/package.json", hash: "missing" };
+      } else if (change === "package bytes") {
+        const file = path.join(rootDir, "package.json");
+        replaceFilePreservingSizeAndMtime(file, JSON.stringify({ name: "demo", version: "1.0.1" }));
+        const plugin = requirePluginRecord(index.plugins, "demo");
+        if (!plugin.packageJson) {
+          throw new Error("expected test plugin package metadata");
+        }
+        plugin.packageJson.fileSignature = fileSignature(file);
+      }
+      await writePersistedInstalledPluginIndex(index, { stateDir });
+      if (change === "manifest bytes") {
+        replaceFilePreservingSizeAndMtime(
+          path.join(rootDir, "openclaw.plugin.json"),
+          JSON.stringify({
+            id: "demo",
+            name: "Demo",
+            description: "two",
+            configSchema: { type: "object" },
+          }),
+        );
+      }
+      const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
+      expectStale(result);
+      if (change === "legacy config paths") {
+        expect(result.snapshot.plugins[0]?.startup.configPaths).toEqual(["browser"]);
+      }
+    },
+  );
 
   it.each([true, false])(
     "trusts an unchanged Doctor signature and rehashes legacy records (signature: %s)",
@@ -634,36 +624,6 @@ describe("loadPluginRegistrySnapshotWithMetadata", () => {
       }
     },
   );
-
-  it("detects package.json replacements even when stored stat fields still match", async () => {
-    const { rootDir, stateDir, env, config, index } = packageRegistry();
-
-    replaceFilePreservingSizeAndMtime(
-      path.join(rootDir, "package.json"),
-      JSON.stringify({ name: "demo", version: "1.0.1" }),
-    );
-    const stat = fs.statSync(path.join(rootDir, "package.json"));
-    const [plugin] = index.plugins;
-    if (!plugin?.packageJson) {
-      throw new Error("expected test plugin package metadata");
-    }
-    const stalePlugin = {
-      ...plugin,
-      packageJson: {
-        ...plugin.packageJson,
-        fileSignature: { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs },
-      },
-    };
-    const staleIndex: InstalledPluginIndex = {
-      ...index,
-      plugins: [stalePlugin, ...index.plugins.slice(1)],
-    };
-    await writePersistedInstalledPluginIndex(staleIndex, { stateDir });
-
-    const result = loadPluginRegistrySnapshotWithMetadata({ config, env, stateDir });
-
-    expectStale(result);
-  });
 
   it("keeps mixed source-checkout bundled roots from the same checkout", async () => {
     const { packageRoot, bundledRoot, sourceRoot, stateDir, env } = bundledRegistry();
