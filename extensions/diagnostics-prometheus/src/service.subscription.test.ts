@@ -144,6 +144,32 @@ openclaw_gateway_rpc_stage_thread_cpu_seconds_sum{method="sessions.catalog.list"
   });
 });
 
+it("exports bounded chat startup phases without private content or asynchronous CPU attribution", () => {
+  using metrics = createMetricsHarness();
+  const event = phaseEvent("chat.startup.pending_inputs", 1_250, {
+    privateText: "synthetic-private-content",
+    threadCpuMs: 999,
+  });
+  metrics.record(event, trusted);
+  metrics.record({ ...event, name: "chat.startup.projection_final", durationMs: 0 }, trusted);
+  const rendered = metrics.render();
+  expectMetrics(
+    rendered,
+  )(`openclaw_gateway_rpc_stage_seconds_count{method="chat.startup",phase="pending_inputs"} 1
+openclaw_gateway_rpc_stage_seconds_sum{method="chat.startup",phase="pending_inputs"} 1.25
+openclaw_gateway_rpc_stage_seconds_count{method="chat.startup",phase="projection_final"} 1`);
+  expectExcludes(rendered, "privateText", "synthetic-private-content", "thread_cpu");
+  metrics.record(event, untrusted);
+  metrics.record(event, { trusted: false, internal: true });
+  for (const name of ["chat.startup.private-session", "chat.history.pending_inputs"]) {
+    metrics.record({ ...event, name }, trusted);
+  }
+  for (const durationMs of [undefined, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    metrics.record({ ...event, durationMs }, trusted);
+  }
+  expect(metrics.render()).toBe(rendered);
+});
+
 it("exports chat.send startup and deferred histograms with bounded, trusted labels", () => {
   using metrics = createMetricsHarness();
   const event = phaseEvent("chat.send.snapshot", 10, {
