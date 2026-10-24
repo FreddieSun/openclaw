@@ -61,7 +61,7 @@ function eventFixture(context: PreparedCliRunContext, tracking = buildToolTracki
   return { handlers, events, start, emitResult, data };
 }
 
-function captureCompletions(matcher = ["exec", "web_fetch"]) {
+function captureCompletions(matcher: readonly [string, ...string[]] = ["exec", "web_fetch"]) {
   const observed: unknown[] = [];
   initializeGlobalHookRunner(
     createMockPluginRegistry([

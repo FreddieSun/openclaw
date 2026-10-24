@@ -521,7 +521,7 @@ describe("checkGatewayHealth", () => {
       const direct = kind === "typed-rate-limit";
       let error: Error;
       if (direct || kind === "missing-scope") {
-        error = new GatewayClientRequestError(
+        const protocolError = new GatewayClientRequestError(
           direct
             ? {
                 code: "INVALID_REQUEST",
@@ -544,7 +544,8 @@ describe("checkGatewayHealth", () => {
                 },
               },
         );
-        retainGatewayResponsePayload(error, undefined);
+        error = protocolError;
+        retainGatewayResponsePayload(protocolError, undefined);
       } else {
         error = new Error("gateway.auth.password unavailable");
         (kind === "secret-ref"

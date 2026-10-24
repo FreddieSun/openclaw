@@ -30,7 +30,6 @@ import { projectPublicSessionEntry } from "../config/sessions/session-entry-proj
 import { rewritePreparedTranscriptMessageAtAnchor } from "../config/sessions/session-message-rewrite.js";
 import { readSessionTranscriptAnchorsAsync } from "../config/sessions/session-transcript-anchor-read.js";
 import { waitForSessionTranscriptProjection } from "../config/sessions/session-transcript-reconcile.js";
-import type { InternalSessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import * as admission from "../infra/sqlite-worker-operation-admission.js";
 import {
@@ -48,16 +47,14 @@ import * as availability from "./github-publication-availability.js";
 import * as baseRefresh from "./github-publication-base-refresh.js";
 import * as inspect from "./github-publication-inspect.js";
 import * as preflight from "./github-publication-pr-preflight.js";
+import * as requester from "./github-publication-requester.js";
 import { invalidateOperatorRolePolicy } from "./operator-role-policy.js";
 import { SESSION_READ_SCOPE, SESSION_WRITE_SCOPE } from "./operator-scopes.js";
 import { createDirectChatContext } from "./server-chat.agent-events.test-helpers.js";
 import { handleGatewayRequest } from "./server-methods.js";
 import { sessionsFilesHandlers } from "./server-methods/sessions-files.js";
 import type { GatewayClient } from "./server-methods/types.js";
-import {
-  createOperatorWsClient,
-  dispatchProfile,
-} from "./server/ws-connection/authenticated-request-dispatch.test-support.js";
+import { createOperatorWsClient } from "./server/ws-connection/authenticated-request-dispatch.test-support.js";
 import { prepareGatewayConnectOperatorAccess } from "./server/ws-connection/connect-operator-access.js";
 import { adoptUnboundPullRequestWorkspace } from "./session-pr-workspace-adoption.js";
 import * as allocation from "./session-worktree-preparation.js";
@@ -74,15 +71,13 @@ async function requestSessionFile(
   sessionKey: string,
   params: Record<string, unknown>,
   client: GatewayClient | null = null,
-  operation: "get" | "set" | "assets" = "get",
 ) {
-  const method = `sessions.files.${operation}`;
   const respond = vi.fn();
   await handleGatewayRequest({
     req: {
       type: "req",
-      id: method,
-      method,
+      id: "sessions.files.get",
+      method: "sessions.files.get",
       params: { sessionKey, path: "notes.md", ...params },
     },
     client,
@@ -95,74 +90,15 @@ async function requestSessionFile(
   return respond.mock.calls[0]!;
 }
 
-function createAdoptionFixture(workspaceDir: string, sessionId: string) {
-  const cfg = { agents: { entries: { main: { workspace: workspaceDir } } } };
-  setRuntimeConfigSnapshot(cfg);
-  const target = {
-    agentId: "main",
-    sessionKey: `agent:main:${sessionId}`,
-    storePath: resolveSessionStorePathCore(undefined, { agentId: "main" }),
-  };
-  return { cfg, target, scope: { ...target, sessionId } };
-}
-
-async function createConversation(
-  workspaceDir: string,
-  sessionId: string,
-  entry: Partial<InternalSessionEntry> = {},
-) {
-  const fixture = createAdoptionFixture(workspaceDir, sessionId);
-  await upsertSessionEntryCore(fixture.target, {
-    sessionId,
-    updatedAt: 1,
-    sessionRoot: workspaceDir,
-    ...entry,
-  });
-  const manager = await SessionManager.openAsync(fixture.scope, workspaceDir);
-  const createContext = () => createDirectChatContext({ getRuntimeConfig: () => fixture.cfg });
-  const createSandbox = () =>
-    createSandboxTestContext({
-      overrides: {
-        sessionKey: fixture.target.sessionKey,
-        workspaceDir,
-        workspaceSource: undefined,
-      },
-    });
-  const adopt = (
-    context: ReturnType<typeof createContext>,
-    sandbox: ReturnType<typeof createSandbox>,
-  ) =>
-    adoptUnboundPullRequestWorkspace({
-      context,
-      target: fixture.target,
-      sandbox,
-      entry: loadSessionEntryReadOnly(fixture.target)!,
-      assertCurrent() {},
-      async verifyBeforeBinding() {},
-    });
-  return { ...fixture, manager, createContext, createSandbox, adopt };
-}
-
-function expectOriginalFile(
-  result: Awaited<ReturnType<typeof requestSessionFile>>,
-  content: string,
-) {
-  expect(result).toMatchObject([true, { file: { content } }]);
-  expect(result[1].file.hash).toBeUndefined();
-  expect(result[1].source).toBeUndefined();
-}
-
-function createManagedSandbox(sessionKey: string, workspaceDir: string) {
-  return {
-    ...createSandboxTestContext({
-      overrides: { sessionKey, workspaceDir, workspaceSource: "managed-worktree" },
-    }),
-    [Symbol.dispose]() {},
-  };
-}
-
 it("adopts one empty owner and keeps original message files separate from same-name current files", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const cfg = { agents: { entries: { main: { workspace: state.workspaceDir } } } };
+    setRuntimeConfigSnapshot(cfg);
+    const target = {
+      agentId: "main",
+      sessionKey: "agent:main:adopt",
+      storePath: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+    };
     // A guest's first turn records its selected skill libraries before adoption.
     const entry = {
       sessionId: "adopt",
@@ -181,36 +117,58 @@ it("adopts one empty owner and keeps original message files separate from same-n
         ],
       },
     };
-    const {
-      cfg,
-      target,
-      scope,
-      manager,
-      createContext,
-      createSandbox,
-      adopt: adoptWorkspace,
-    } = await createConversation(state.workspaceDir, "adopt", entry);
     const sibling = { ...target, sessionKey: "agent:main:sibling" };
+    await upsertSessionEntryCore(target, entry);
     await upsertSessionEntryCore(sibling, { ...entry, sessionId: "sibling" });
     const siblingBefore = loadSessionEntryReadOnly(sibling);
+    const manager = await SessionManager.openAsync(
+      { ...target, sessionId: entry.sessionId },
+      state.workspaceDir,
+    );
     const oldMessage = await manager.appendMessageAsync(makeUserMessage("Open notes.md", 1));
     const boundaryMessage = await manager.appendMessageAsync(makeUserMessage("Prepare my PR", 2));
     assert(oldMessage && boundaryMessage, "Original transcript messages must be persisted");
     await fs.writeFile(path.join(state.workspaceDir, "notes.md"), "same original bytes\n");
-    const context = createContext();
+    const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
     const request = async (
       operation: "get" | "set" | "assets",
       params: Record<string, unknown> = {},
-    ) => requestSessionFile(context, target.sessionKey, params, null, operation);
+    ) => {
+      const method = `sessions.files.${operation}`;
+      const respond = vi.fn();
+      await handleGatewayRequest({
+        req: {
+          type: "req",
+          id: method,
+          method,
+          params: { sessionKey: target.sessionKey, path: "notes.md", ...params },
+        },
+        client: null,
+        context,
+        respond,
+        isWebchatConnect: () => false,
+        extraHandlers: sessionsFilesHandlers,
+      });
+      expect(respond).toHaveBeenCalledOnce();
+      return respond.mock.calls[0]!;
+    };
     const before = await request("get");
     expect(before[0]).toBe(true);
     const oldHash = before[1].file.hash;
-    const sandbox = createSandbox();
-    const adopt = () => adoptWorkspace(context, sandbox);
+    const sandbox = createSandboxTestContext({
+      overrides: {
+        sessionKey: target.sessionKey,
+        workspaceDir: state.workspaceDir,
+        workspaceSource: undefined,
+      },
+    });
+    // The lower-level adoption fixture starts from the fully persisted conversation.
+    const handlerEntry = loadSessionEntryReadOnly(target);
+    assert(handlerEntry, "The adoption fixture must read the conversation");
     const input = {
       context,
       target,
-      entry: loadSessionEntryReadOnly(target)!,
+      entry: handlerEntry,
       sandbox,
       assertCurrent() {},
       async verifyBeforeBinding() {},
@@ -277,6 +235,7 @@ it("adopts one empty owner and keeps original message files separate from same-n
       });
     try {
       await expect(adoptUnboundPullRequestWorkspace(input)).rejects.toThrow("queued input");
+      expect(queued?.phase).toBe("preparing");
       expect(loadSessionEntryReadOnly(target)?.worktree).toBeUndefined();
       expect(await managedWorktrees.findLiveByOwner("session", target.sessionKey)).toBeUndefined();
     } finally {
@@ -318,13 +277,21 @@ it("adopts one empty owner and keeps original message files separate from same-n
       await expect(adoptUnboundPullRequestWorkspace(input)).rejects.toMatchObject({
         code: "outcome-unknown",
       });
+      expect(lostCommit).toHaveBeenCalledOnce();
       expect(loadSessionEntryReadOnly(target)?.worktree?.id).toBeDefined();
     } finally {
       getSessionEntryPatchDelivery().afterCommit = undefined;
       restoreSettlement.forEach((restore) => restore());
       captureAdmission.mockRestore();
     }
-    const adopted = await adopt();
+    const adopted = await adoptUnboundPullRequestWorkspace({
+      context,
+      target,
+      entry: loadSessionEntryReadOnly(target)!,
+      sandbox,
+      assertCurrent() {},
+      async verifyBeforeBinding() {},
+    });
     const worktree = await managedWorktrees.findLiveByOwner("session", target.sessionKey);
     expect(worktree).toBeDefined();
     try {
@@ -335,6 +302,7 @@ it("adopts one empty owner and keeps original message files separate from same-n
         fileRoot: state.workspaceDir,
       });
       expect(await fs.readdir(worktree!.path)).toEqual([".git"]);
+      expect(loadSessionEntryReadOnly(sibling)).toEqual(siblingBefore);
       await fs.writeFile(path.join(worktree!.path, "notes.md"), "same original bytes\n");
       const nextMessage = await manager.appendMessageAsync(
         makeUserMessage("Open the new notes.md", 2),
@@ -368,13 +336,17 @@ it("adopts one empty owner and keeps original message files separate from same-n
       });
       expect(saved[0]).toBe(true);
       const historical = await request("get", { messageEntryId: oldMessage });
-      expectOriginalFile(historical, "same original bytes\n");
+      expect(historical[0]).toBe(true);
+      expect(historical[1].file.content).toBe("same original bytes\n");
+      expect(historical[1].file.hash).toBeUndefined();
+      expect(historical[1].source).toBeUndefined();
       const assistant = makeAssistantMessageFixture({
         stopReason: "stop",
         content: [{ type: "text", text: "Imported the PR" }],
       });
       const assistantId = await manager.appendMessageAsync(assistant);
       assert(assistantId, "Assistant rewrite target must be persisted");
+      const scope = { ...target, sessionId: entry.sessionId };
       const beforeRewrite = await readSessionTranscriptAnchorsAsync(scope, {
         entryIds: [assistantId],
         includeWatermark: true,
@@ -383,10 +355,14 @@ it("adopts one empty owner and keeps original message files separate from same-n
         ...assistant,
         content: [{ type: "text" as const, text: "Imported the PR with an attachment" }],
       }));
-      expectOriginalFile(
-        await request("get", { messageEntryId: oldMessage }),
-        "same original bytes\n",
-      );
+      const rewritten = await readSessionTranscriptAnchorsAsync(scope, {
+        entryIds: [oldMessage],
+        includeWatermark: true,
+      });
+      expect(rewritten.watermark?.generation).not.toBe(beforeRewrite.watermark?.generation);
+      const afterMedia = await request("get", { messageEntryId: oldMessage });
+      expect(afterMedia[1].file).toMatchObject({ content: "same original bytes\n" });
+      expect(afterMedia[1].file.hash).toBeUndefined();
       expect((await request("get", { messageEntryId: nextMessage }))[1].file.content).toBe(
         "current source edit\n",
       );
@@ -396,16 +372,34 @@ it("adopts one empty owner and keeps original message files separate from same-n
           preserveTrailing: (message) => message.id === nextMessage || message.id === assistantId,
         }),
       ).toBe(1);
-      expectOriginalFile(
-        await request("get", { messageEntryId: oldMessage }),
-        "same original bytes\n",
-      );
+      expect(refreshed.getEntry(nextMessage)?.parentId).toBe(oldMessage);
+      expect(refreshed.getEntry(assistantId)?.parentId).toBe(nextMessage);
+      const afterSuffix = await request("get", { messageEntryId: oldMessage });
+      expect(afterSuffix[1].file).toMatchObject({ content: "same original bytes\n" });
+      expect(afterSuffix[1].file.hash).toBeUndefined();
       expect((await request("get", { messageEntryId: nextMessage }))[0]).toBe(false);
       await refreshed.branchAsync(assistantId);
-      await refreshed.appendMessageAsync(makeUserMessage("Continue the retained PR branch", 3));
+      const resumedMessage = await refreshed.appendMessageAsync(
+        makeUserMessage("Continue the retained PR branch", 3),
+      );
+      assert(resumedMessage, "Resumed branch message must be persisted");
       await waitForSessionTranscriptProjection(scope);
+      const resumedAnchors = await readSessionTranscriptAnchorsAsync(scope, {
+        entryIds: [oldMessage, nextMessage, assistantId, resumedMessage],
+      });
+      expect(resumedAnchors.anchors.map((anchor) => anchor.entryId)).toEqual([
+        oldMessage,
+        nextMessage,
+        assistantId,
+        resumedMessage,
+      ]);
       const originalAfterBranch = await request("get", { messageEntryId: oldMessage });
-      expectOriginalFile(originalAfterBranch, "same original bytes\n");
+      expect(originalAfterBranch).toMatchObject([
+        true,
+        { file: { content: "same original bytes\n" } },
+      ]);
+      expect(originalAfterBranch[1].file.hash).toBeUndefined();
+      expect(originalAfterBranch[1].source).toBeUndefined();
       const currentAfterBranch = await request("get", { messageEntryId: nextMessage });
       expect(currentAfterBranch).toMatchObject([
         true,
@@ -428,7 +422,14 @@ it("adopts one empty owner and keeps original message files separate from same-n
       expect(Buffer.from(assets[1].assets[0].content, "base64").toString()).toBe(
         "body { color: blue; }",
       );
-      const repeated = await adopt();
+      const repeated = await adoptUnboundPullRequestWorkspace({
+        context,
+        target,
+        entry: loadSessionEntryReadOnly(target)!,
+        sandbox,
+        assertCurrent() {},
+        async verifyBeforeBinding() {},
+      });
       expect(repeated.worktree?.id).toBe(worktree!.id);
       expect(await fs.readFile(path.join(worktree!.path, "notes.md"), "utf8")).toBe(
         "current source edit\n",
@@ -439,7 +440,11 @@ it("adopts one empty owner and keeps original message files separate from same-n
       expect(loadSessionEntryReadOnly(sibling)).toEqual(siblingBefore);
     } finally {
       if (worktree) {
-        await removeWorktree(worktree.id);
+        await managedWorktrees.remove({
+          id: worktree.id,
+          reason: "test-cleanup",
+          allowSnapshotLoss: true,
+        });
       }
     }
   });
@@ -447,8 +452,20 @@ it("adopts one empty owner and keeps original message files separate from same-n
 
 it("keeps earlier message files original after a maintenance rewrite re-appends them", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const { target, scope, manager, createContext, createSandbox, adopt } =
-      await createConversation(state.workspaceDir, "adopt-rewrite");
+    const cfg = { agents: { entries: { main: { workspace: state.workspaceDir } } } };
+    setRuntimeConfigSnapshot(cfg);
+    const target = {
+      agentId: "main",
+      sessionKey: "agent:main:adopt-rewrite",
+      storePath: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+    };
+    const scope = { ...target, sessionId: "adopt-rewrite" };
+    await upsertSessionEntryCore(target, {
+      sessionId: scope.sessionId,
+      updatedAt: 1,
+      sessionRoot: state.workspaceDir,
+    });
+    const manager = await SessionManager.openAsync(scope, state.workspaceDir);
     await manager.appendMessageAsync(makeUserMessage("Write notes.md", 1));
     await manager.appendMessageAsync(
       makeAssistantMessageFixture({
@@ -470,8 +487,22 @@ it("keeps earlier message files original after a maintenance rewrite re-appends 
     );
     assert(earlier, "The earlier message must be persisted");
     await fs.writeFile(path.join(state.workspaceDir, "notes.md"), "original notes\n");
-    const context = createContext();
-    await adopt(context, createSandbox());
+    const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
+    const sandbox = createSandboxTestContext({
+      overrides: {
+        sessionKey: target.sessionKey,
+        workspaceDir: state.workspaceDir,
+        workspaceSource: undefined,
+      },
+    });
+    await adoptUnboundPullRequestWorkspace({
+      context,
+      target,
+      entry: loadSessionEntryReadOnly(target)!,
+      sandbox,
+      assertCurrent() {},
+      async verifyBeforeBinding() {},
+    });
     const worktree = await managedWorktrees.findLiveByOwner("session", target.sessionKey);
     assert(worktree, "Adoption must bind a managed workspace");
     try {
@@ -498,7 +529,9 @@ it("keeps earlier message files original after a maintenance rewrite re-appends 
       const original = await requestSessionFile(context, target.sessionKey, {
         messageEntryId: copyOf("Saved notes.md"),
       });
-      expectOriginalFile(original, "original notes\n");
+      expect(original).toMatchObject([true, { file: { content: "original notes\n" } }]);
+      expect(original[1].file.hash).toBeUndefined();
+      expect(original[1].source).toBeUndefined();
       const current = await requestSessionFile(context, target.sessionKey, {
         messageEntryId: copyOf("Open the PR notes.md"),
       });
@@ -508,7 +541,11 @@ it("keeps earlier message files original after a maintenance rewrite re-appends 
       ]);
       expect(current[1].file.hash).toBeDefined();
     } finally {
-      await removeWorktree(worktree.id);
+      await managedWorktrees.remove({
+        id: worktree.id,
+        reason: "test-cleanup",
+        allowSnapshotLoss: true,
+      });
     }
   });
 });
@@ -533,11 +570,19 @@ function stubPullRequestPreparation(sessionKey: string) {
   } as never);
   vi.spyOn(availability, "matchesCurrentGitHubPublicationIdentity").mockReturnValue(true);
   vi.spyOn(preflight, "assertExistingPullRequestWriteAccess").mockResolvedValue(undefined);
-  const resolveSandbox = vi
-    .spyOn(sandboxContext, "resolveSandboxContext")
-    .mockImplementation(
-      async (params) => createManagedSandbox(sessionKey, params.workspaceDir) as never,
-    );
+  const resolveSandbox = vi.spyOn(sandboxContext, "resolveSandboxContext").mockImplementation(
+    async (params) =>
+      ({
+        ...createSandboxTestContext({
+          overrides: {
+            sessionKey,
+            workspaceDir: params.workspaceDir,
+            workspaceSource: "managed-worktree",
+          },
+        }),
+        [Symbol.dispose]() {},
+      }) as never,
+  );
   const integrate = vi
     .spyOn(baseRefresh, "integrateManagedWorkspaceSource")
     .mockImplementation(async (params) => {
@@ -613,13 +658,91 @@ async function preparePullRequest(params: {
 async function removeOwnedWorktree(sessionKey: string) {
   const worktree = await managedWorktrees.findLiveByOwner("session", sessionKey);
   if (worktree) {
-    await removeWorktree(worktree.id);
+    await managedWorktrees.remove({
+      id: worktree.id,
+      reason: "test-cleanup",
+      allowSnapshotLoss: true,
+    });
   }
 }
 
-async function removeWorktree(id: string) {
-  await managedWorktrees.remove({ id, reason: "test-cleanup", allowSnapshotLoss: true });
-}
+it("prepares an own PR in an ordinary sandboxed chat through the registered handler", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const cfg = { agents: { entries: { main: { workspace: state.workspaceDir } } } };
+    setRuntimeConfigSnapshot(cfg);
+    const target = {
+      agentId: "main",
+      sessionKey: "agent:main:adopt-handler",
+      storePath: resolveSessionStorePathCore(undefined, { agentId: "main" }),
+    };
+    // Any earlier turn records a skills snapshot before the PR link arrives.
+    const skillsSnapshot = {
+      prompt: "",
+      skills: [],
+      librarySelections: [
+        {
+          skillId: "22222222-2222-4222-8222-222222222222",
+          revision: "b".repeat(64),
+          name: "handler-notes",
+          ownerProfileId: "handler-owner",
+        },
+      ],
+    };
+    await upsertSessionEntryCore(target, {
+      sessionId: "adopt-handler",
+      updatedAt: 1,
+      sessionRoot: state.workspaceDir,
+      skillsSnapshot,
+    });
+    const manager = await SessionManager.openAsync(
+      { ...target, sessionId: "adopt-handler" },
+      state.workspaceDir,
+    );
+    const earlier = await manager.appendMessageAsync(makeUserMessage("Open notes.md", 1));
+    assert(earlier, "The earlier message must be persisted");
+    await fs.writeFile(path.join(state.workspaceDir, "notes.md"), "original notes\n");
+    vi.spyOn(requester, "prepareGitHubPublicationRequesterV2").mockResolvedValue({
+      requester: { snapshot: { actor: { kind: "system" } }, assertCurrent() {} },
+      release() {},
+    } as never);
+    stubPullRequestPreparation(target.sessionKey);
+    const context = createPreparationContext(cfg);
+    const prepareWorktree = vi.spyOn(allocation, "prepareSessionWorktree");
+    try {
+      const respond = await preparePullRequest({
+        context,
+        sessionKey: target.sessionKey,
+        sessionId: "adopt-handler",
+        workspaceDir: state.workspaceDir,
+        client: null,
+      });
+      const worktreePreparation = prepareWorktree.mock.calls[0]?.[0];
+      assert(worktreePreparation, "PR preparation must allocate a managed workspace");
+      expect(worktreePreparation.target.entry?.skillsSnapshot).toEqual(skillsSnapshot);
+      const worktree = await managedWorktrees.findLiveByOwner("session", target.sessionKey);
+      expect(respond).toHaveBeenCalledWith(
+        true,
+        expect.objectContaining({ status: "prepared", headCommit: "a".repeat(40) }),
+      );
+      const bound = loadSessionEntryReadOnly(target);
+      expect(bound?.worktree?.id).toBe(worktree?.id);
+      expect(bound?.worktree?.githubPullRequest).toMatchObject({
+        number: 1,
+        preparedHeadCommit: "a".repeat(40),
+      });
+      expect(bound?.priorWorkspace?.fileRoot).toBe(state.workspaceDir);
+      const read = await requestSessionFile(context, target.sessionKey, {
+        messageEntryId: earlier,
+      });
+      expect(read[0]).toBe(true);
+      expect(read[1].file.content).toBe("original notes\n");
+      expect(read[1].file.hash).toBeUndefined();
+      expect(read[1].source).toBeUndefined();
+    } finally {
+      await removeOwnedWorktree(target.sessionKey);
+    }
+  });
+});
 
 it("refuses another guest and lost access before binding, PR import and earlier file reads", async () => {
   await withOpenClawTestState(
@@ -653,7 +776,13 @@ it("refuses another guest and lost access before binding, PR import and earlier 
       // Each caller is an authenticated connection; only the creator owns the conversation.
       const connect = (profileId: string, clientScopes: string[] = scopes) => {
         const client = createOperatorWsClient({ connId: profileId, scopes: clientScopes });
-        client.authenticatedUserProfile = dispatchProfile(profileId);
+        client.authenticatedUserProfile = {
+          profileId,
+          displayName: null,
+          avatarRevision: "fixture",
+          hasAvatar: false,
+          updatedAt: 1,
+        };
         prepareGatewayConnectOperatorAccess(client);
         return client;
       };
@@ -707,6 +836,7 @@ it("refuses another guest and lost access before binding, PR import and earlier 
           return allocated;
         });
         await expect(prepare(guestClient)).rejects.toThrow("no longer authorized");
+        expect(allocate).toHaveBeenCalledOnce();
         unbound();
         expect(
           await managedWorktrees.findLiveByOwner("session", target.sessionKey),
@@ -716,7 +846,16 @@ it("refuses another guest and lost access before binding, PR import and earlier 
         // Access lost after binding is refused before PR source import.
         resolveSandbox.mockImplementationOnce(async (params) => {
           await setGuestRole("revoked");
-          return createManagedSandbox(target.sessionKey, params.workspaceDir) as never;
+          return {
+            ...createSandboxTestContext({
+              overrides: {
+                sessionKey: target.sessionKey,
+                workspaceDir: params.workspaceDir,
+                workspaceSource: "managed-worktree",
+              },
+            }),
+            [Symbol.dispose]() {},
+          } as never;
         });
         await expect(prepare(guestClient)).rejects.toThrow("no longer authorized");
         expect(integrate).not.toHaveBeenCalled();
@@ -725,21 +864,18 @@ it("refuses another guest and lost access before binding, PR import and earlier 
 
         expect(await prepare(guestClient)).toHaveBeenCalledWith(
           true,
-          expect.objectContaining({ status: "prepared", headCommit: "a".repeat(40) }),
+          expect.objectContaining({ status: "prepared" }),
         );
+        expect(integrate).toHaveBeenCalledOnce();
         const readEarlier = (client: GatewayClient) =>
           requestSessionFile(context, target.sessionKey, { messageEntryId: earlier }, client);
-        expectOriginalFile(await readEarlier(guestClient), "original notes\n");
+        expect(await readEarlier(guestClient)).toMatchObject([
+          true,
+          { file: { content: "original notes\n" } },
+        ]);
         // A viewing guest or an admin sees the current files, never the owner's originals.
         const worktree = await managedWorktrees.findLiveByOwner("session", target.sessionKey);
         assert(worktree, "Preparation must bind the PR workspace");
-        expect(loadSessionEntryReadOnly(target)).toMatchObject({
-          worktree: {
-            id: worktree.id,
-            githubPullRequest: { number: 1, preparedHeadCommit: "a".repeat(40) },
-          },
-          priorWorkspace: { fileRoot: state.workspaceDir },
-        });
         await fs.writeFile(path.join(worktree.path, "notes.md"), "PR notes\n");
         const refused = [false, undefined];
         for (const client of [otherClient, adminClient]) {

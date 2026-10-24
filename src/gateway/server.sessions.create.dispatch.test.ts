@@ -10,6 +10,7 @@ import type { SessionEntry } from "../config/sessions.js";
 import {
   loadSessionEntry,
   loadTranscriptEvents,
+  resolveSessionEntryAccessTarget,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
@@ -43,6 +44,7 @@ import {
   writeSessionStore,
 } from "./test-helpers.js";
 import {
+  createCompactedSessionFixture,
   directSessionReq,
   getGatewayConfigModule,
   sessionStoreEntry,
@@ -65,18 +67,6 @@ type CreatedSessionPayload = {
   runStarted?: boolean;
   runId?: string;
 };
-
-function expectCreationEvent(broadcast: ReturnType<typeof vi.fn>, agentId: string) {
-  expect(broadcast).toHaveBeenCalledWith(
-    "sessions.changed",
-    expect.objectContaining({ sessionKey: "global", agentId, reason: "create" }),
-    new Set(["conn-1"]),
-    expect.any(Object),
-  );
-}
-
-const transcriptMessage = (content: string) =>
-  expect.objectContaining({ type: "message", message: expect.objectContaining({ content }) });
 
 async function createDashboard(ws: WebSocket, key: string) {
   const created = await rpcReq<CreatedSessionPayload>(ws, "sessions.create", {
@@ -114,11 +104,11 @@ function resetSelectedStore() {
   testState.agentsConfig = undefined;
 }
 
-async function selectedGlobalFixture(key = "global") {
+async function selectedGlobalFixture() {
   const stores = await createSelectedGlobalSessionStore();
   const target = (agentId: "main" | "work") => ({
     agentId,
-    sessionKey: key,
+    sessionKey: "global",
     storePath: agentId === "main" ? stores.mainStorePath : stores.workStorePath,
   });
   return {
@@ -127,12 +117,11 @@ async function selectedGlobalFixture(key = "global") {
     seed: (agentId: "main" | "work", id: string, entry?: Partial<SessionEntry>) =>
       writeSessionStore({
         ...target(agentId),
-        entries: { [key]: sessionStoreEntry(id, entry) },
+        entries: { global: sessionStoreEntry(id, entry) },
       }),
-    transcript: (agentId: "main" | "work", sessionId: string, content: string, sessionKey = key) =>
+    transcript: (agentId: "main" | "work", sessionId: string, content: string) =>
       seedSessionTranscript({
         ...target(agentId),
-        sessionKey,
         sessionId,
         messages: [{ role: "user", content }],
       }),
@@ -155,6 +144,50 @@ function holdTitleDispatch() {
   });
   return { started: started.promise, finish: pending.resolve, isFinished: () => finished };
 }
+
+test("sessions.create publishes repository metadata before the next socket read", async () => {
+  const { storePath } = await createSessionStoreDir();
+  const { ws } = await openClient();
+  const key = "agent:main:dashboard:repository-worker";
+  try {
+    const created = await rpcReq<{
+      key: string;
+      entry: { repositoryWorkspaceId: string };
+    }>(ws, "sessions.create", {
+      agentId: "main",
+      key,
+      repository: { url: "https://github.com/example/repository.git", ref: "main" },
+    });
+    expect(created.ok, JSON.stringify(created.error)).toBe(true);
+    const workspaceId = requireNonEmptyString(
+      created.payload?.entry.repositoryWorkspaceId,
+      "created repository workspace",
+    );
+    expect(created.payload?.key).toBe(key);
+    expect(loadSessionEntry({ agentId: "main", sessionKey: key, storePath })).toMatchObject({
+      repositoryWorkspaceId: workspaceId,
+    });
+
+    const listed = await rpcReq<{
+      sessions: Array<{
+        key: string;
+        repositoryWorkspaceId?: string;
+        repository?: { url: string; ref?: string; branch: string };
+      }>;
+    }>(ws, "sessions.list", { agentId: "main", limit: 100 });
+    expect(listed.ok, JSON.stringify(listed.error)).toBe(true);
+    expect(listed.payload?.sessions.find((row) => row.key === key)).toMatchObject({
+      repositoryWorkspaceId: workspaceId,
+      repository: {
+        url: "https://github.com/example/repository.git",
+        ref: "main",
+        branch: `openclaw/${workspaceId}`,
+      },
+    });
+  } finally {
+    ws.close();
+  }
+});
 
 test("chat.send deletes a session before its pending dashboard title finishes", async () => {
   const { storePath } = await createSessionStoreDir();
@@ -221,54 +254,62 @@ test("chat.send deletes a session before its pending dashboard title finishes", 
   }
 });
 
-test("chat.send names its session before reply startup or progress", async ({ signal }) => {
-  const { storePath } = await createSessionStoreDir();
-  const { ws } = await openClient();
-  const dispatchStarted = createDeferredCore();
-  const titlePersisted = createDeferredCore();
-  const dispatchPending = createDeferredCore();
-  let dispatchFinished = false;
-  let stopTitleObserver = () => {};
-  let sessionKey: string | undefined;
-  const eventContext = new AsyncLocalStorage<string>();
-  dashboardTitleGenerationMocks.generate.mockImplementation(async () =>
-    eventContext.getStore() ? "Wrong event context" : "Generated Dashboard Title",
-  );
-  dispatchInboundMessageMock.mockImplementationOnce(async ({ replyOptions }) => {
-    dispatchStarted.resolve();
-    await dispatchPending.promise;
-    dispatchFinished = true;
-    const runId = requireNonEmptyString(replyOptions?.runId, "reply run id");
-    replyOptions?.onAgentRunStart?.(runId);
-    eventContext.run("provider event", () => {
-      emitAgentEvent({ runId, stream: "assistant", data: { text: "Planning the release" } });
-      emitAgentEvent({ runId, stream: "lifecycle", data: { phase: "end" } });
-    });
-    return { queuedFinal: false, counts: { block: 0, final: 0, tool: 0 } };
-  });
-  try {
-    const created = await createDashboard(ws, "agent:main:dashboard:title-before-reply");
-    sessionKey = requireNonEmptyString(created.payload?.key, "created session key");
-    stopTitleObserver = observeTitle(storePath, sessionKey, titlePersisted);
-    await sendTitleTurn(ws, sessionKey, "dashboard-title-before-reply");
-    await dispatchStarted.promise;
-    await withinTest(titlePersisted.promise, signal);
-    expect(dispatchFinished).toBe(false);
-    const listed = await rpcReq<SessionsListResult>(ws, "sessions.list", { agentId: "main" });
-    expect(listed.payload?.sessions.find((row) => row.key === sessionKey)?.displayName).toBe(
-      "Generated Dashboard Title",
+test.for(["reply", "empty", "error"])(
+  "chat.send names its session before %s startup or progress",
+  async (outcome, { signal }) => {
+    const { storePath } = await createSessionStoreDir();
+    const { ws } = await openClient();
+    const dispatchStarted = createDeferredCore();
+    const titlePersisted = createDeferredCore();
+    const dispatchPending = createDeferredCore();
+    let dispatchFinished = false;
+    let stopTitleObserver = () => {};
+    let sessionKey: string | undefined;
+    const eventContext = new AsyncLocalStorage<string>();
+    dashboardTitleGenerationMocks.generate.mockImplementation(async () =>
+      eventContext.getStore() ? "Wrong event context" : "Generated Dashboard Title",
     );
-  } finally {
-    stopTitleObserver();
-    const released = captureSessionControllerSettlement({
-      scope: storePath,
-      identities: [sessionKey],
+    dispatchInboundMessageMock.mockImplementationOnce(async ({ replyOptions }) => {
+      dispatchStarted.resolve();
+      await dispatchPending.promise;
+      dispatchFinished = true;
+      if (outcome === "error") {
+        throw new Error("Reply preparation failed");
+      }
+      if (outcome === "reply") {
+        const runId = requireNonEmptyString(replyOptions?.runId, "reply run id");
+        replyOptions?.onAgentRunStart?.(runId);
+        eventContext.run("provider event", () => {
+          emitAgentEvent({ runId, stream: "assistant", data: { text: "Planning the release" } });
+          emitAgentEvent({ runId, stream: "lifecycle", data: { phase: "end" } });
+        });
+      }
+      return { queuedFinal: false, counts: { block: 0, final: 0, tool: 0 } };
     });
-    dispatchPending.resolve();
-    await released;
-    ws.close();
-  }
-});
+    try {
+      const created = await createDashboard(ws, `agent:main:dashboard:title-before-${outcome}`);
+      sessionKey = requireNonEmptyString(created.payload?.key, "created session key");
+      stopTitleObserver = observeTitle(storePath, sessionKey, titlePersisted);
+      await sendTitleTurn(ws, sessionKey, `dashboard-title-before-${outcome}`);
+      await dispatchStarted.promise;
+      await withinTest(titlePersisted.promise, signal);
+      expect(dispatchFinished).toBe(false);
+      const listed = await rpcReq<SessionsListResult>(ws, "sessions.list", { agentId: "main" });
+      expect(listed.payload?.sessions.find((row) => row.key === sessionKey)?.displayName).toBe(
+        "Generated Dashboard Title",
+      );
+    } finally {
+      stopTitleObserver();
+      const released = captureSessionControllerSettlement({
+        scope: storePath,
+        identities: [sessionKey],
+      });
+      dispatchPending.resolve();
+      await released;
+      ws.close();
+    }
+  },
+);
 
 test("chat.send retries a title that failed during its turn once that turn settles", async () => {
   const { storePath } = await createSessionStoreDir();
@@ -343,7 +384,11 @@ test.each(mentionCreationOwners)(
       };
       let key: string | undefined;
       try {
-        const created = await directSessionReq<CreatedSessionPayload>(
+        const created = await directSessionReq<{
+          key: string;
+          sessionId: string;
+          runStarted: boolean;
+        }>(
           "sessions.create",
           {
             agentId,
@@ -522,7 +567,18 @@ test("sessions.create applies configured fixed-store ownership to bare keys", as
     expect(loadSessionEntry({ agentId: "ops", sessionKey: "global", storePath })?.sessionId).toBe(
       created.payload?.sessionId,
     );
-    expectCreationEvent(broadcastToConnIds, "ops");
+    expect(broadcastToConnIds).toHaveBeenCalledWith(
+      "sessions.changed",
+      expect.objectContaining({ sessionKey: "global", agentId: "ops", reason: "create" }),
+      new Set(["conn-1"]),
+      {
+        dropIfSlow: true,
+        agentId: "ops",
+        sessionKeys: ["global"],
+        sessionEventSubscriptionKeys: ["agent:ops:global", "global"],
+        prepareSessionProjection: expect.any(Function),
+      },
+    );
 
     const conflict = await directSessionReq("sessions.create", {
       key: "global",
@@ -569,15 +625,20 @@ test("sessions.create loads selected global parent from the requested agent stor
       thinkingLevel: "high",
     });
 
-    expect(sessionHookMocks.triggerInternalHook.mock.calls.map(([event]) => event)).toContainEqual(
-      expect.objectContaining({
-        type: "command",
-        action: "new",
-        context: expect.objectContaining({
-          sessionEntry: expect.objectContaining({ sessionId: "sess-work-parent" }),
-        }),
-      }),
-    );
+    const commandNewEvent = sessionHookMocks.triggerInternalHook.mock.calls
+      .map(([event]) => event)
+      .find(
+        (event) =>
+          event !== null &&
+          typeof event === "object" &&
+          "type" in event &&
+          event.type === "command" &&
+          "action" in event &&
+          event.action === "new",
+      );
+    expect(commandNewEvent).toMatchObject({
+      context: { sessionEntry: { sessionId: "sess-work-parent" } },
+    });
     expect(sessionLifecycleHookMocks.runSessionEnd.mock.calls[0]?.[0]).toMatchObject({
       sessionId: "sess-work-parent",
       sessionKey: "global",
@@ -595,10 +656,22 @@ test("sessions.get reads selected global messages from the requested agent store
     await f.transcript("main", "sess-main-global", "main global");
     await f.transcript("work", "sess-work-global", "work global");
 
-    const result = await directSessionReq<{ messages?: unknown[] }>("sessions.get", {
-      key: "global",
-      agentId: "work",
-    });
+    const cfg = {
+      agents: { entries: { main: {}, work: {} } },
+      session: { scope: "global", store: f.storeTemplate },
+    };
+    const result = await directSessionReq<{ messages?: unknown[] }>(
+      "sessions.get",
+      {
+        key: "global",
+        agentId: "work",
+      },
+      {
+        context: {
+          getRuntimeConfig: () => cfg,
+        },
+      },
+    );
 
     expect(result.ok, JSON.stringify(result)).toBe(true);
     const renderedMessages = JSON.stringify(result.payload?.messages ?? []);
@@ -634,9 +707,27 @@ test("sessions.create checks selected global initialization in the requested age
       sessionId: "sess-main-initializing",
       initializationPending: true,
     });
-    expectCreationEvent(broadcastToConnIds, "work");
+    expect(broadcastToConnIds).toHaveBeenCalledWith(
+      "sessions.changed",
+      expect.objectContaining({ sessionKey: "global", agentId: "work", reason: "create" }),
+      new Set(["conn-1"]),
+      {
+        dropIfSlow: true,
+        agentId: "work",
+        sessionKeys: ["global"],
+        sessionEventSubscriptionKeys: ["agent:work:global"],
+        prepareSessionProjection: expect.any(Function),
+      },
+    );
 
     await f.seed("work", "sess-work-initializing", { initializationPending: true });
+    expect(
+      resolveSessionEntryAccessTarget({
+        cfg: getRuntimeConfig(),
+        sessionKey: "global",
+        agentId: "work",
+      }).entry,
+    ).toMatchObject({ sessionId: "sess-work-initializing", initializationPending: true });
     const blocked = await directSessionReq("sessions.create", { key: "global", agentId: "work" });
     expect(blocked).toMatchObject({
       ok: false,
@@ -672,14 +763,25 @@ test("sessions.create sends selected global initial tasks to the requested agent
   const runId = requireNonEmptyString(created.payload?.runId, "selected global run id");
   const wait = await rpcReq(ws, "agent.wait", { runId, timeoutMs: 1_000 });
   expect(wait.ok).toBe(true);
-  const workTarget = { agentId: "work", sessionKey: "global", storePath: workStorePath };
-  const workEntry = loadSessionEntry(workTarget);
+  const workEntry = loadSessionEntry({
+    agentId: "work",
+    sessionKey: "global",
+    storePath: workStorePath,
+  });
+  const workSessionId = requireNonEmptyString(workEntry?.sessionId, "selected global session id");
   await expect(
     loadTranscriptEvents({
-      ...workTarget,
-      sessionId: requireNonEmptyString(workEntry?.sessionId, "selected global session id"),
+      agentId: "work",
+      sessionId: workSessionId,
+      sessionKey: "global",
+      storePath: workStorePath,
     }),
-  ).resolves.toContainEqual(transcriptMessage("hello selected global"));
+  ).resolves.toContainEqual(
+    expect.objectContaining({
+      message: expect.objectContaining({ content: "hello selected global" }),
+      type: "message",
+    }),
+  );
   expect(
     loadSessionEntry({ agentId: "main", sessionKey: "global", storePath: mainStorePath }),
   ).toBeUndefined();
@@ -687,17 +789,32 @@ test("sessions.create sends selected global initial tasks to the requested agent
   ws.close();
 });
 
-test.each([
+test.each<
+  [
+    name: string,
+    explicit: boolean,
+    defaultAgent: boolean,
+    agentId: string | undefined,
+    key: string | undefined,
+    expectedAgent: string,
+    fork: boolean,
+  ]
+>([
   ["legacy explicit target", false, false, "main", undefined, "main", true],
   ["legacy ambient target", false, false, undefined, undefined, "main", true],
   ["explicit fleet without default", true, false, undefined, undefined, "work", false],
   ["explicit fleet with another default", true, true, undefined, undefined, "work", false],
   ["explicit cross-agent target", true, false, "main", undefined, "main", true],
   ["explicit child key", true, false, undefined, "agent:main:dashboard:child-target", "main", true],
-] as const)(
+])(
   "sessions.create resolves an agent-qualified parent from its own store: %s",
   async (_name, explicit, defaultAgent, agentId, key, expectedAgent, fork) => {
-    const f = await selectedGlobalFixture("main");
+    const { dir } = await createSessionStoreDir();
+    const storeTemplate = path.join(dir, "{agentId}", "sessions.json");
+    const mainStorePath = storeTemplate.replace("{agentId}", "main");
+    const workStorePath = storeTemplate.replace("{agentId}", "work");
+    const workDir = path.dirname(workStorePath);
+    testState.sessionStorePath = storeTemplate;
     testState.sessionConfig = { scope: "per-sender" };
     testState.agentsConfig = {
       ownership: explicit ? "explicit" : undefined,
@@ -706,13 +823,31 @@ test.each([
     testState.agentConfig = defaultAgent ? { systemAgent: { agentId: "main" } } : undefined;
     const { ws } = await openClient();
     try {
-      await f.seed("work", "parent");
-      await f.transcript("work", "parent", "parent transcript", "agent:work:main");
+      await fs.mkdir(workDir, { recursive: true });
+      const parent = await createCompactedSessionFixture(workDir);
+      await writeSessionStore({
+        storePath: workStorePath,
+        agentId: "work",
+        entries: {
+          main: sessionStoreEntry(parent.sessionId, { sessionFile: parent.sessionFile }),
+        },
+      });
+      await seedSessionTranscript({
+        agentId: "work",
+        sessionId: parent.sessionId,
+        sessionKey: "agent:work:main",
+        storePath: workStorePath,
+        messages: [
+          { role: "user", content: "before compaction" },
+          { role: "assistant", content: [{ type: "text", text: "working on it" }] },
+        ],
+      });
+
       const created = await rpcReq<CreatedSessionPayload>(ws, "sessions.create", {
-        agentId,
-        key,
+        ...(agentId ? { agentId } : {}),
+        ...(key ? { key } : {}),
         parentSessionKey: "agent:work:main",
-        fork,
+        ...(fork ? { fork: true } : {}),
       });
       expect(created.ok, JSON.stringify(created.error)).toBe(true);
       expect(created.payload?.key).toMatch(new RegExp(`^agent:${expectedAgent}:dashboard:`));
@@ -720,22 +855,29 @@ test.each([
         expect(created.payload?.key).toBe(key);
       }
       const childKey = requireNonEmptyString(created.payload?.key, "created child key");
-      const childTarget = {
-        agentId: expectedAgent,
-        sessionKey: childKey,
-        storePath: expectedAgent === "work" ? f.workStorePath : f.mainStorePath,
-      };
-      expect(loadSessionEntry(childTarget)).toMatchObject({
-        sessionId: created.payload?.sessionId,
-      });
+      const described = await rpcReq<{ session: { key: string; agentId: string } }>(
+        ws,
+        "sessions.describe",
+        { key: childKey },
+      );
+      expect(described.ok, JSON.stringify(described.error)).toBe(true);
+      expect(described.payload?.session).toMatchObject({ key: childKey, agentId: expectedAgent });
+      expect(
+        loadSessionEntry({
+          agentId: expectedAgent,
+          sessionKey: childKey,
+          storePath: expectedAgent === "work" ? workStorePath : mainStorePath,
+        }),
+      ).toMatchObject({ sessionId: created.payload?.sessionId });
       expect(
         loadSessionEntry({
           agentId: expectedAgent === "work" ? "main" : "work",
           sessionKey: childKey,
-          storePath: expectedAgent === "work" ? f.mainStorePath : f.workStorePath,
+          storePath: expectedAgent === "work" ? mainStorePath : workStorePath,
         }),
       ).toBeUndefined();
       expect(created.payload?.entry?.parentSessionKey).toBe("agent:work:main");
+      expect(created.payload?.entry).not.toHaveProperty("sessionFile");
       if (!fork) {
         expect(created.payload?.entry).not.toHaveProperty("forkSource");
         expect(created.payload?.entry).not.toHaveProperty("forkedFromParent");
@@ -743,14 +885,27 @@ test.each([
       }
       expect(created.payload?.entry?.forkSource).toEqual({
         sessionKey: "agent:work:main",
-        sessionId: "parent",
+        sessionId: parent.sessionId,
       });
+      expect(created.payload?.entry?.forkedFromParent).toBe(true);
       await expect(
         loadTranscriptEvents({
-          ...childTarget,
-          sessionId: requireNonEmptyString(created.payload?.sessionId, "forked session id"),
+          sessionId: requireNonEmptyString(
+            created.payload?.sessionId,
+            "agent-qualified forked session id",
+          ),
+          sessionKey: created.payload?.key ?? "",
+          agentId: expectedAgent,
+          storePath: expectedAgent === "work" ? workStorePath : mainStorePath,
         }),
-      ).resolves.toContainEqual(transcriptMessage("parent transcript"));
+      ).resolves.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            message: expect.objectContaining({ content: "before compaction" }),
+            type: "message",
+          }),
+        ]),
+      );
     } finally {
       await closeGatewayTestWebSocket(ws);
       testState.agentConfig = undefined;
