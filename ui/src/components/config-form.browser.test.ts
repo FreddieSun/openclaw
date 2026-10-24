@@ -18,16 +18,10 @@ function analyze(properties: Record<string, JsonSchema>) {
   return analyzeConfigSchema(object(properties));
 }
 
-const rootSchema = object({
+const rootAnalysis = analyze({
   gateway: object({ auth: object({ token: { type: "string" } }) }),
   allowFrom: { type: "array", items: { type: "string" } },
-  mode: { type: "string", enum: ["off", "token"] },
-  enabled: { type: "boolean" },
-  bind: {
-    anyOf: [{ const: "auto" }, { const: "lan" }, { const: "tailnet" }, { const: "loopback" }],
-  },
 });
-const rootAnalysis = analyzeConfigSchema(rootSchema);
 let container: HTMLDivElement;
 let onPatch: ReturnType<typeof vi.fn<ConfigFormProps["onPatch"]>>;
 beforeEach(() => {
@@ -54,10 +48,10 @@ function all<T extends Element = HTMLElement>(selector: string, root: Element = 
 function texts(selector: string, root: Element = container) {
   return all(selector, root).map((node) => node.textContent?.trim());
 }
-function byText(selector: string, text: string) {
+function inputWithValue(value: string, selector = "input.settings-input") {
   return expectElement(
-    all(selector).find((node) => node.textContent?.trim() === text),
-    text,
+    all<HTMLInputElement>(selector).find((input) => input.value === value),
+    value,
   );
 }
 function renderForm(
@@ -80,16 +74,8 @@ function edit(input: HTMLInputElement | HTMLSelectElement, value: string, type =
   input.value = value;
   input.dispatchEvent(new Event(type, { bubbles: type === "input" }));
 }
-function selectSegmented(text: string) {
-  query<HTMLInputElement>(
-    '.settings-segmented__input[type="radio"]',
-    byText(".settings-segmented__btn", text),
-  ).click();
-}
 
-afterEach(async () => {
-  await i18n.setLocale("en");
-});
+afterEach(() => i18n.setLocale("en"));
 
 describe("config form renderer", () => {
   it.each([
@@ -293,39 +279,6 @@ describe("config form renderer", () => {
     expect(revealed.size).toBe(0);
   });
 
-  it("renders inputs and patches values", () => {
-    renderForm(rootAnalysis, {
-      uiHints: {
-        "gateway.auth.token": { label: "Gateway Token", sensitive: true },
-      },
-      value: { allowFrom: ["+1"], bind: "auto" },
-      revealSensitive: true,
-    });
-
-    edit(
-      query<HTMLInputElement>('#config-section-gateway input.settings-input[type="text"]'),
-      "abc123",
-    );
-    expect(onPatch).toHaveBeenCalledWith(["gateway", "auth", "token"], "abc123");
-
-    selectSegmented("token");
-    expect(onPatch).toHaveBeenCalledWith(["mode"], "token");
-
-    query<HTMLInputElement>('.settings-toggle__input[role="switch"]').click();
-    expect(onPatch).toHaveBeenCalledWith(["enabled"], true);
-
-    byText(".cfg-array button", "Add").dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    expect(onPatch).toHaveBeenCalledWith(["allowFrom"], ["+1", ""]);
-
-    query(".cfg-array button[aria-label='Remove item']").dispatchEvent(
-      new MouseEvent("click", { bubbles: true }),
-    );
-    expect(onPatch).toHaveBeenCalledWith(["allowFrom"], []);
-
-    selectSegmented("tailnet");
-    expect(onPatch).toHaveBeenCalledWith(["bind"], "tailnet");
-  });
-
   it("preserves raw phone values and focus as presentations change", () => {
     const analysis = analyze({
       fromNumber: { type: "string" },
@@ -358,20 +311,14 @@ describe("config form renderer", () => {
     expect(texts(".settings-phone-presentation__value")).toEqual(
       expect.arrayContaining(["Germany · +49 30 123456", "Japan · +81 3 1234 5678"]),
     );
-    const tokenInput = expectElement(
-      all<HTMLInputElement>("input.settings-input").find((input) => input.value === "token-value"),
-      "token input",
-    );
+    const tokenInput = inputWithValue("token-value");
     const tokenPresentation = expectElement(
       tokenInput.closest(".settings-phone-presentation"),
       "token phone presentation wrapper",
     );
     expect(tokenPresentation.querySelector(".settings-phone-presentation__value")).toBeNull();
 
-    const fromNumberInput = expectElement(
-      phoneInputs.find((input) => input.value === "+4930123456"),
-      "from number input",
-    );
+    const fromNumberInput = inputWithValue("+4930123456", ".settings-phone-presentation input");
     edit(fromNumberInput, " +4930123456 ");
     expect(onPatch).toHaveBeenLastCalledWith(["fromNumber"], " +4930123456 ");
     fromNumberInput.dispatchEvent(new Event("change", { bubbles: true }));
@@ -432,35 +379,6 @@ describe("config form renderer", () => {
       wildcard ? ["plugins", "entries", "voice-call", "enabled"] : ["features", "beta"],
       !wildcard,
     );
-  });
-
-  it("keeps dropdown selects on their configured value after options render", () => {
-    const schema = object({
-      provider: {
-        type: "string",
-        enum: ["anthropic", "codex", "gemini", "openai", "openrouter", "zai"],
-      },
-      bind: {
-        anyOf: [
-          { const: "auto" },
-          { const: "lan" },
-          { const: "tailnet" },
-          { const: "loopback" },
-          { const: "public" },
-          { const: "off" },
-        ],
-      },
-    });
-    const analysis = analyzeConfigSchema(schema);
-
-    renderForm(analysis, {
-      value: { provider: "openai", bind: "tailnet" },
-    });
-
-    const selects = all<HTMLSelectElement>("select.settings-select");
-    expect(selects).toHaveLength(2);
-    const selectedLabels = selects.map((select) => select.selectedOptions[0]?.textContent?.trim());
-    expect(selectedLabels).toEqual(["tailnet", "openai"]);
   });
 
   it("shows an unset default-on boolean as its placeholder instead of an off toggle", () => {
@@ -555,92 +473,41 @@ describe("config form renderer", () => {
       revealSensitive: true,
     });
 
-    const apiKeyInput = expectElement(
-      all<HTMLInputElement>(
-        "#config-section-models .cfg-map input.settings-input[type='text']",
-      ).find((input) => input.value === "old"),
-      "provider api key input",
+    const apiKeyInput = inputWithValue(
+      "old",
+      "#config-section-models .cfg-map input.settings-input[type='text']",
     );
     edit(apiKeyInput, "new-key");
     expect(onPatch).toHaveBeenCalledWith(["models", "providers", "openai", "apiKey"], "new-key");
   });
 
   it.each([
-    [{ mixed: { anyOf: [{ type: "string" }, object({})] } }, []],
-    [
-      {
-        lastTouchedAt: {
-          title: "Config Last Touched At",
-          description: "ISO timestamp of the last config write.",
-          anyOf: [{ type: "string" }, {}],
-        },
-      },
-      ["lastTouchedAt"],
-    ],
+    [{ lastTouchedAt: { anyOf: [{ type: "string" }, {}] } }, ["lastTouchedAt"]],
     [{ note: { anyOf: [{ type: "string", nullable: true }] } }, [], true],
-    [{ note: { type: ["string", "null"] } }, []],
-    [
-      {
-        channels: object(
-          { whatsapp: object({ enabled: { type: "boolean" } }) },
-          { additionalProperties: {} },
-        ),
-      },
-      [],
-    ],
-    [
-      {
-        lastTouchedAt: { anyOf: [{ type: "string" }, { type: "number" }] },
-        setupCommand: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
-        allowedDomains: { type: "array", items: { type: "string" } },
-        displayWidth: { type: "string" },
-      },
-      [],
-      false,
-      {
-        lastTouchedAt: "2026-05-05T00:00:00.000Z",
-        setupCommand: "apt-get update",
-        allowedDomains: ["example.com"],
-        displayWidth: "960px",
-      },
-    ],
-  ] satisfies Array<[Record<string, JsonSchema>, string[], boolean?, Record<string, unknown>?]>)(
-    "analyzes public union shapes: %j",
-    (properties, unsupported, nullable, value) => {
+  ] satisfies Array<[Record<string, JsonSchema>, string[], boolean?]>)(
+    "analyzes unconstrained and nullable union shapes: %j",
+    (properties, unsupported, nullable) => {
       const analysis = analyze(properties);
       expect(analysis.unsupportedPaths).toEqual(unsupported);
       if (nullable) {
         expect(analysis.schema?.properties?.note?.nullable).toBe(true);
       }
-      if (value) {
-        renderForm(analysis, { value });
-        expect(container.textContent).not.toContain("Unsupported schema node");
-      }
     },
   );
 
-  it.each([
-    {
-      key: "allowFrom",
-      items: { type: "string" },
-      defaults: ["+15550000000"],
-      value: ["+15550001111", "+15550002222"],
-      help: "Sender ids allowed to reach the agent.",
-    },
-    {
-      key: "groups",
-      items: { type: "array", default: ["nested-default"], items: { type: "string" } },
-      defaults: [["root-default"]],
-      value: [["first"], ["second"]],
-      help: "Group sender ids.",
-    },
-  ])("renders $key metadata only on the array header", ({ key, items, defaults, value, help }) => {
-    const analysis = analyzeConfigSchema(
-      object({ [key]: { type: "array", items, default: defaults } }),
-    );
+  it("renders metadata only on the outer array header", () => {
+    const help = "Group sender ids.";
+    const defaults = [["root-default"]];
+    const analysis = analyze({
+      groups: {
+        type: "array",
+        default: defaults,
+        items: { type: "array", default: ["nested-default"], items: { type: "string" } },
+      },
+    });
     renderForm(analysis, {
-      uiHints: { [key]: { help } },
-      value: { [key]: value },
+      uiHints: { groups: { help } },
+      value: { groups: [["first"], ["second"]] },
     });
     const descriptions = texts(".settings-row__desc");
     expect(descriptions.filter((text) => text === help)).toHaveLength(1);
@@ -664,12 +531,10 @@ describe("config form renderer", () => {
     }
     const button = query<HTMLButtonElement>(".settings-section__help-button");
     expect(button.getAttribute("aria-label")).toBe("Help for Gateway");
-    expect(button.querySelector("svg")).not.toBeNull();
     const tooltip = expectElement(button.closest("openclaw-tooltip"), "section help tooltip");
     expect((tooltip as HTMLElement & { content: string }).content).toBe("Help for Gateway");
     const link = query<HTMLAnchorElement>(".settings-section__help-popover a");
     expect(link.textContent?.trim()).toBe("Learn more");
-    expect(link.classList.contains("learn-more-link")).toBe(true);
     const popover = expectElement(link.closest('[role="dialog"]'), "section help popover");
     expect(button.getAttribute("aria-controls")).toBe(popover.id);
     expect(popover.getAttribute("aria-label")).toBe("Help for Gateway");

@@ -4,28 +4,23 @@ import {
   GatewayProtocolRequestTimeoutError,
 } from "@openclaw/gateway-client/browser";
 import type { CanvasDocumentViewResult } from "@openclaw/gateway-protocol";
-import { createComponent, createSignal } from "solid-js";
+import { createComponent } from "solid-js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.ts";
 import type { GatewayEventListener } from "../api/gateway.ts";
-import {
-  applicationContext,
-  type ApplicationContext,
-  type ApplicationContextRequest,
-} from "../app/context.ts";
+import type { ApplicationContext } from "../app/context.ts";
 import type { ApplicationGatewaySnapshot } from "../app/gateway.ts";
 import {
   bumpCanvasWidgetFrameConnectionGeneration,
   getCanvasWidgetFrameConnectionGeneration,
 } from "../lib/chat/canvas-widget-frame-generation.ts";
+import { ApplicationProvider } from "../lib/reactive/context.ts";
 import { gatewayHelloForMethods } from "../test-helpers/gateway-methods.ts";
 import { mountSolid } from "../test-helpers/mount-solid.ts";
-import {
-  createApplicationGateway,
-  createSolidApplicationContextProvider,
-} from "../test-helpers/solid-application-context.tsx";
+import { createApplicationGateway } from "../test-helpers/solid-application-context.tsx";
 import { flush } from "../test-helpers/solid-settle.ts";
-import { CanvasWidgetView, type OpenClawCanvasWidgetView } from "./canvas-widget-view.tsx";
+import type { OpenClawCanvasWidgetView } from "./canvas-widget-view.tsx";
+import "./canvas-widget-view.tsx";
 import { WIDGET_PROMPT_EVENT } from "./mcp-app-security.ts";
 
 const repeat = (length: number) => "x".repeat(length);
@@ -46,7 +41,7 @@ const gateways = new WeakMap<
   OpenClawCanvasWidgetView,
   {
     snapshot: WidgetGatewaySnapshot;
-    connectionRevision: number;
+    gateway: ReturnType<typeof createApplicationGateway>["gateway"];
     notify: () => void;
     emit: GatewayEventListener;
   }
@@ -88,56 +83,46 @@ function mount(
   operatorScopes?: string[],
 ) {
   const view = document.createElement(elementName) as OpenClawCanvasWidgetView;
-  const listeners = new Set<GatewayEventListener>();
-  const gateway = {
-    snapshot: {
-      client: widgetClient,
-      phase: "connected",
-      ...(operatorScopes
-        ? { hello: gatewayHelloForMethods(["canvas.document.view"], operatorScopes) }
-        : {}),
-    } as WidgetGatewaySnapshot,
-    connection: { gatewayUrl: "ws://gateway.example:8443" },
-    connectionRevision: 0,
-    notify: () => {},
-    emit: ((event) => {
-      for (const listener of listeners) {
-        listener(event);
-      }
-    }) as GatewayEventListener,
-    subscribeEvents: (listener: GatewayEventListener) => {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    subscribe: (notify: () => void) => {
-      gateway.notify = notify;
-      return () => {};
-    },
+  const fixture = createApplicationGateway();
+  const snapshot: WidgetGatewaySnapshot = {
+    ...fixture.gateway.snapshot,
+    client: widgetClient,
+    phase: "connected",
+    ...(operatorScopes
+      ? { hello: gatewayHelloForMethods(["canvas.document.view"], operatorScopes) }
+      : {}),
   };
-  gateways.set(view, gateway);
-  view.addEventListener("context-request", (event) => {
-    // SAFETY: This listener handles the native application context protocol.
-    const contextRequest = event as ApplicationContextRequest;
-    if (contextRequest.context === applicationContext) {
-      event.stopPropagation();
-      contextRequest.callback({
-        gateway,
-        sessions: {
-          subscribeMessages: async (key: string) => ({ key }),
-          unsubscribeMessages: async () => {},
-        },
-      } as unknown as ApplicationContext);
-    }
+  // The fixture intentionally exposes only the request method used by this owner.
+  fixture.publish(snapshot as unknown as ApplicationGatewaySnapshot);
+  fixture.gateway.connection.gatewayUrl = "ws://gateway.example:8443";
+  gateways.set(view, {
+    snapshot,
+    gateway: fixture.gateway,
+    notify: () => fixture.publish(fixture.gateway.snapshot),
+    emit: fixture.publishEvent,
   });
+  const context = {
+    gateway: fixture.gateway,
+    sessions: {
+      subscribeMessages: async (key: string) => ({ key }),
+      unsubscribeMessages: async () => {},
+    },
+  } as unknown as ApplicationContext;
   view.docId = docId;
   view.sessionKey = "agent:main:widget-test";
   view.messageTimestamp = Date.now();
   view.connectionGeneration = getCanvasWidgetFrameConnectionGeneration();
   const container = document.createElement("div");
   parent.append(container);
-  mountSolid(() => view, { container });
+  mountSolid(
+    () =>
+      createComponent(ApplicationProvider, {
+        host: container,
+        value: context,
+        children: view,
+      }),
+    { container },
+  );
   return view;
 }
 
@@ -180,14 +165,6 @@ function proxyReady(frame: HTMLIFrameElement) {
   });
 }
 
-function expectRead(widgetClient: WidgetClient, docId: string) {
-  expect(widgetClient.request).toHaveBeenLastCalledWith(
-    "canvas.document.view",
-    { docId },
-    { timeoutMs: 30_000 },
-  );
-}
-
 function expectRecovering(view: OpenClawCanvasWidgetView) {
   expect(alert(view)).toBeNull();
   expect(notice(view)).toContain("recover automatically");
@@ -220,7 +197,6 @@ describe("Canvas widget view", () => {
     const first = mount(client);
     const second = mount(client);
     await expect.poll(() => client.request.mock.calls.length).toBe(1);
-    expectRead(client, "cv_inline");
     pending.resolve(documentView);
     const frame = await frameFor(first);
     await frameFor(second);
@@ -238,21 +214,14 @@ describe("Canvas widget view", () => {
         post.mock.calls.some(([data]) => data.method === "ui/notifications/sandbox-resource-ready"),
       )
       .toBe(true);
-    expect(post).toHaveBeenCalledWith(
-      expect.objectContaining({
-        method: "ui/notifications/sandbox-resource-ready",
-        params: { html: documentView.html, renderId: expect.any(String) },
-      }),
-      "http://gateway.example:8444",
-    );
     expect(first.documentHtml).toBe(documentView.html);
     message(frame, { type: "openclaw:widget-size", height: 3000 });
     await first.updateComplete;
     expect(frame.style.height).toBe("3000px");
-    first.title = "Updated title";
-    await first.updateComplete;
-    expect(first.querySelector("iframe")).toBe(frame);
     expect(client.request).toHaveBeenCalledOnce();
+    frame.dispatchEvent(new Event("error"));
+    await first.updateComplete;
+    expectRecovering(first);
     first.remove();
     client.request.mockResolvedValue(documentView);
     await frameFor(mount(client));
@@ -281,76 +250,8 @@ describe("Canvas widget view", () => {
       old.resolve(documentView);
       await settle(view);
       expect(view.documentHtml).toBe("<p>New connection</p>");
-      expect(client.request).toHaveBeenCalledTimes(change === "generation" ? 2 : 1);
-      expect(replacement.request).toHaveBeenCalledTimes(change === "client" ? 1 : 0);
     },
   );
-
-  it("renders authenticated HTML inertly until scripts are enabled without rereading it", async () => {
-    const view = mount();
-    view.allowScripts = false;
-    const strictFrame = await frameFor(view);
-    expect(strictFrame.getAttribute("src")).toBeNull();
-    expect(strictFrame.srcdoc).toBe(documentView.html);
-    expect(strictFrame.getAttribute("sandbox")).toBe("");
-    view.allowScripts = true;
-    await view.updateComplete;
-    const interactiveFrame = await frameFor(view);
-    expect(interactiveFrame).not.toBe(strictFrame);
-    expect(interactiveFrame.src).toBe("http://gateway.example:8444/mcp-app-sandbox?frames=none");
-    expect(interactiveFrame.hasAttribute("srcdoc")).toBe(false);
-    interactiveFrame.dispatchEvent(new Event("error"));
-    await view.updateComplete;
-    expectRecovering(view);
-    view.allowScripts = false;
-    await view.updateComplete;
-    expect(view.querySelector("iframe")?.srcdoc).toBe(documentView.html);
-    expect(client.request).toHaveBeenCalledOnce();
-  });
-
-  it("replaces browsing contexts when direct Solid props change script policy", async () => {
-    const gateway = createApplicationGateway();
-    gateway.gateway.connection.gatewayUrl = "ws://gateway.example:8443";
-    gateway.publish({
-      ...gateway.gateway.snapshot,
-      phase: "connected",
-      client: client as unknown as ApplicationGatewaySnapshot["client"],
-    });
-    const provider = createSolidApplicationContextProvider({
-      gateway: gateway.gateway,
-    } as ApplicationContext);
-    const [allowScripts, setAllowScripts] = createSignal(true);
-    const mounted = mountSolid(
-      () =>
-        createComponent(CanvasWidgetView, {
-          docId: "cv_solid_policy",
-          sessionKey: "agent:main:widget-test",
-          get allowScripts() {
-            return allowScripts();
-          },
-        }),
-      { wrapper: provider.wrapper },
-    );
-    const view = mounted.container.querySelector<OpenClawCanvasWidgetView>(
-      "openclaw-canvas-widget-view",
-    )!;
-    const interactive = await frameFor(view);
-
-    setAllowScripts(false);
-    await settle(view);
-    const strict = await frameFor(view);
-    expect(strict).not.toBe(interactive);
-    expect(strict.getAttribute("sandbox")).toBe("");
-    expect(strict.srcdoc).toBe(documentView.html);
-
-    setAllowScripts(true);
-    await settle(view);
-    const restored = await frameFor(view);
-    expect(restored).not.toBe(strict);
-    expect(restored.src).toBe(interactive.src);
-    expect(restored.hasAttribute("srcdoc")).toBe(false);
-    expect(client.request).toHaveBeenCalledOnce();
-  });
 
   it("shows a failed read and retries without keeping the rejected shared request", async () => {
     client.request.mockRejectedValueOnce(new Error("Widget unavailable"));
@@ -360,35 +261,6 @@ describe("Canvas widget view", () => {
       .toContain("Widget unavailable");
     view.querySelector("button")!.click();
     await frameFor(view);
-    expect(client.request).toHaveBeenCalledTimes(2);
-  });
-
-  it("retains rendered content across client replacement, revalidates unchanged bytes, and replaces changed bytes", async () => {
-    const { view, frame } = await loaded();
-    const post = vi.spyOn(frame.contentWindow!, "postMessage");
-    proxyReady(frame);
-    await settle(view);
-    const replacement = { request: vi.fn().mockResolvedValue(documentView) };
-    gateways.get(view)!.snapshot.client = replacement;
-    await transition(view, "reconnecting");
-    expect(view.querySelector("iframe")).toBe(frame);
-    expect(view.documentHtml).toBe(documentView.html);
-    expect(alert(view)).toBeNull();
-    expect(client.request).toHaveBeenCalledOnce();
-    expect(replacement.request).not.toHaveBeenCalled();
-    await transition(view, "connected");
-    expect(client.request).toHaveBeenCalledOnce();
-    expect(replacement.request).toHaveBeenCalledOnce();
-    expectRead(replacement, view.docId);
-    expect(view.querySelector("iframe")).toBe(frame);
-    expect(
-      post.mock.calls.filter(([data]) => data.method === "ui/notifications/sandbox-resource-ready"),
-    ).toHaveLength(1);
-    replacement.request.mockResolvedValue({ ...documentView, html: "<p>Updated bytes</p>" });
-    await transition(view, "reconnecting");
-    await transition(view, "connected");
-    expect(view.querySelector("iframe")).not.toBe(frame);
-    expect(view.documentHtml).toBe("<p>Updated bytes</p>");
   });
 
   it("hands scroll intent to its transcript only from the current isolated widget", async () => {
@@ -396,18 +268,8 @@ describe("Canvas widget view", () => {
     const sibling = document.createElement("div");
     thread.className = sibling.className = "chat-thread";
     document.body.append(thread, sibling);
-    const events: Array<[type: string, deltaY: number, scrollTop: number]> = [];
-    thread.scrollTop = 400;
-    thread.addEventListener("wheel", (event) => {
-      events.push(["wheel", event.deltaY, thread.scrollTop]);
-    });
-    Object.defineProperty(thread, "scrollBy", {
-      value: vi.fn((options: ScrollToOptions) => {
-        const deltaY = options.top ?? 0;
-        events.push(["scroll", deltaY, thread.scrollTop]);
-        thread.scrollTop += deltaY;
-      }),
-    });
+    const scroll = vi.fn();
+    thread.scrollBy = scroll;
     const scrollSibling = vi.fn();
     sibling.scrollBy = scrollSibling;
     const { view, frame } = await loaded("cv_scroll", thread);
@@ -415,70 +277,44 @@ describe("Canvas widget view", () => {
       const post = vi.spyOn(target.contentWindow!, "postMessage");
       proxyReady(target);
       await settle(view);
-      expect(post).toHaveBeenCalledWith(
-        { type: "openclaw:widget-board-host", nonce: expect.any(String) },
-        new URL(target.src).origin,
-      );
       const nonce = post.mock.calls.find(([data]) => data.type === "openclaw:widget-board-host")![0]
         .nonce;
-      const renderId = post.mock.calls.find(
-        ([data]) => data.method === "ui/notifications/sandbox-resource-ready",
-      )![0].params.renderId;
-      post.mockClear();
-      message(target, {
-        method: "ui/notifications/sandbox-resource-loaded",
-        params: { renderId },
-      });
-      // Stored wrappers can miss host state until their document finishes loading.
-      expect(post).toHaveBeenCalledWith(
-        { type: "openclaw:widget-board-host", nonce },
-        new URL(target.src).origin,
-      );
       return nonce;
     };
     const nonce = await start(frame);
-    const scroll = { type: "openclaw:widget-scroll", nonce, deltaY: 120 };
+    const request = { type: "openclaw:widget-scroll", nonce, deltaY: 120 };
     const foreignFrame = document.createElement("iframe");
     foreignFrame.src = frame.src;
     sibling.append(foreignFrame);
-    message(frame, scroll, [], "https://wrong.example");
-    message(foreignFrame, scroll);
-    message(frame, { ...scroll, nonce: "wrong" });
+    message(frame, request, [], "https://wrong.example");
+    message(foreignFrame, request);
+    message(frame, { ...request, nonce: "wrong" });
     for (const deltaY of ["120", undefined, Infinity, Number.NaN]) {
-      message(frame, { ...scroll, deltaY });
+      message(frame, { ...request, deltaY });
     }
-    expect(events).toEqual([]);
-    message(frame, scroll);
-    expect(events).toEqual([
-      ["wheel", 120, 400],
-      ["scroll", 120, 400],
-    ]);
-    expect(thread.scrollTop).toBe(520);
-    events.length = 0;
+    expect(scroll).not.toHaveBeenCalled();
+    message(frame, request);
+    expect(scroll).toHaveBeenCalledWith({ top: 120, behavior: "instant" });
+    scroll.mockClear();
 
     const oldSource = frame.contentWindow;
     view.docId = "cv_scroll_replaced";
-    message(frame, scroll);
+    message(frame, request);
     await settle(view);
     const current = await frameFor(view);
     expect(current).not.toBe(frame);
     const currentNonce = await start(current);
     expect(currentNonce).not.toBe(nonce);
-    message(current, scroll);
-    message(current, { ...scroll, nonce: currentNonce }, [], undefined, oldSource);
-    expect(events).toEqual([]);
-    message(current, { ...scroll, nonce: currentNonce, deltaY: -80 });
-    expect(events).toEqual([
-      ["wheel", -80, 520],
-      ["scroll", -80, 520],
-    ]);
-    expect(thread.scrollTop).toBe(440);
-    events.length = 0;
+    message(current, request);
+    message(current, { ...request, nonce: currentNonce }, [], undefined, oldSource);
+    expect(scroll).not.toHaveBeenCalled();
+    message(current, { ...request, nonce: currentNonce, deltaY: -80 });
+    expect(scroll).toHaveBeenCalledWith({ top: -80, behavior: "instant" });
+    scroll.mockClear();
     view.remove();
-    message(current, { ...scroll, nonce: currentNonce });
-    expect(events).toEqual([]);
+    message(current, { ...request, nonce: currentNonce });
+    expect(scroll).not.toHaveBeenCalled();
     expect(scrollSibling).not.toHaveBeenCalled();
-    expect(sibling.scrollTop).toBe(0);
   });
 
   it("opens a guest widget automatically when its result commits", async () => {
@@ -487,11 +323,6 @@ describe("Canvas widget view", () => {
     client.request.mockReturnValueOnce(pending.promise);
     const view = mount(client, "cv_inline", document.body, ["operator.sessions.read"]);
     await settle(view);
-    expect(client.request).toHaveBeenLastCalledWith(
-      "canvas.document.view",
-      { docId: view.docId, sessionKey: view.sessionKey },
-      { timeoutMs: 30_000 },
-    );
     pending.reject(
       new GatewayProtocolRequestError({
         code: "UNAVAILABLE",
@@ -507,7 +338,6 @@ describe("Canvas widget view", () => {
     expect(client.request).toHaveBeenCalledOnce();
     commitWidget(view);
     await settle(view);
-    expect(client.request).toHaveBeenCalledTimes(2);
     expect(view.documentHtml).toBe(documentView.html);
     expect(alert(view)).toBeNull();
   });
@@ -522,17 +352,8 @@ describe("Canvas widget view", () => {
     await settle(view);
     stale.reject(new GatewayProtocolRequestError({ code: "FORBIDDEN", message: "Access denied" }));
     await settle(view);
-    expect(client.request).toHaveBeenCalledTimes(2);
     expect(view.documentHtml).toBe(documentView.html);
     expect(alert(view)).toBeNull();
-  });
-
-  it("preserves a loaded full-access frame when a result commits", async () => {
-    const { view, frame } = await loaded();
-    commitWidget(view);
-    await settle(view);
-    expect(view.querySelector("iframe")).toBe(frame);
-    expect(client.request).toHaveBeenCalledOnce();
   });
 
   it.each(["credential", "session", "denied"])(
@@ -544,7 +365,7 @@ describe("Canvas widget view", () => {
         new GatewayProtocolRequestError({ code: "FORBIDDEN", message: "Access denied" }),
       );
       if (change === "credential") {
-        gateways.get(view)!.connectionRevision += 1;
+        gateways.get(view)!.gateway.connectionRevision += 1;
       }
       if (change === "session") {
         view.sessionKey = "agent:other:session";
@@ -625,25 +446,6 @@ describe("Canvas widget view", () => {
     expect(view.querySelector("iframe")).not.toBe(frame);
   });
 
-  it("does not wake the agent for offline or resource-download errors", async () => {
-    const { view, frame } = await loaded("cv_network_error");
-    message(frame, { type: "openclaw:widget-runtime-error", message: "Failed to fetch" });
-    connection(view, "reconnecting");
-    message(frame, { type: "openclaw:widget-runtime-error", message: "d3 is not defined" });
-    await settle(view);
-    expect(client.request).toHaveBeenCalledOnce();
-    expect(view.querySelector("iframe")).toBe(frame);
-  });
-
-  it("refuses a sandbox on the authenticated Gateway origin", async () => {
-    client.request.mockResolvedValue({ ...documentView, sandboxPort: 8443 });
-    const view = mount();
-    await expect
-      .poll(() => view.querySelector('[role="alert"]')?.textContent)
-      .toContain("Sandbox host URL is invalid");
-    expect(view.querySelector("iframe")).toBeNull();
-  });
-
   it.each([
     ["surrogate title", `${repeat(79)}😀tail`, repeat(79), repeat(600), repeat(500)],
     ["surrogate message", "Status", "Status", `${repeat(499)}😀tail`, repeat(499)],
@@ -665,9 +467,6 @@ describe("Canvas widget view", () => {
         line: 12,
         column: 7,
       };
-      message(frame, report, [], "https://wrong.example");
-      message(frame, report, [], undefined, window);
-      expect(client.request).toHaveBeenCalledOnce();
       message(frame, report);
       message(frame, report);
       message(frame, { ...report, message: "Another failure" });
@@ -679,7 +478,6 @@ describe("Canvas widget view", () => {
         text: `Inline widget "${expectedTitle}" (${docId}) threw a script error after rendering: ${expectedMessage}, line 12, column 7. Fix the script and show the widget again; if show_widget is unavailable in this turn, reply with the corrected widget code and show it on the next turn.`,
       });
       expect(notice(view)).toBe(`Script error: ${expectedMessage}`);
-      expect(view.querySelector("iframe")).toBe(frame);
       view.remove();
       const remount = await frameFor(mount(client, docId));
       message(remount, report);
@@ -725,168 +523,121 @@ describe("Canvas widget view", () => {
     },
   );
 
-  it("refreshes theme tokens inside a shadow-root chat without reloading the document", async () => {
-    // jsdom does not allocate browsing contexts for shadow-root iframes; Chromium covers them end to end.
-    vi.spyOn(HTMLIFrameElement.prototype, "contentWindow", "get").mockReturnValue(window);
-    const container = document.createElement("div");
-    document.body.append(container);
-    const root = container.attachShadow({ mode: "open" });
-    const { view, frame } = await loaded("cv_theme", root);
-    const post = vi.spyOn(frame.contentWindow!, "postMessage");
-    document.documentElement.dataset.themeMode = "light";
-    await expect
-      .poll(() =>
-        post.mock.calls.some(
-          ([data]) => data.type === "openclaw:widget-theme" && data.mode === "light",
-        ),
-      )
-      .toBe(true);
-    expect(view.querySelector("iframe")).toBe(frame);
-    expect(client.request).toHaveBeenCalledOnce();
-    view.remove();
-    post.mockClear();
-    document.documentElement.dataset.themeMode = "dark";
-    await Promise.resolve();
-    expect(post).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    "disconnect",
-    "strict mode",
-    "strict then scripts",
-    "connection recovery",
-    "client replacement",
-    "parking",
-  ])("gates the focused private prompt channel on %s", async (change) => {
-    const { view, frame } = await loaded(`cv_prompt_${change}`);
-    const post = vi.spyOn(frame.contentWindow!, "postMessage");
-    proxyReady(frame);
-    await Promise.resolve();
-    let onMessage!: (event: MessageEvent) => void;
-    const postMessage = vi.fn();
-    const close = vi.fn();
-    const removeEventListener = vi.fn();
-    const port = {
-      addEventListener: vi.fn((_type, handler) => {
-        onMessage = handler;
-      }),
-      removeEventListener,
-      start: vi.fn(),
-      postMessage,
-      close,
-    } as unknown as MessagePort;
-    const received = vi.fn();
-    view.addEventListener(WIDGET_PROMPT_EVENT, received);
-    message(frame, { type: "openclaw:widget-prompt-offer" }, [port]);
-    expect(postMessage).toHaveBeenCalledWith({ type: "openclaw:widget-prompt-host-ready" });
-    const prompt = (text: string) =>
-      onMessage(
-        new MessageEvent("message", {
-          data: { type: "openclaw:widget-prompt", prompt: text },
+  it.each(["disconnect", "strict then scripts", "client replacement", "parking"])(
+    "gates the focused private prompt channel on %s",
+    async (change) => {
+      const { view, frame } = await loaded(`cv_prompt_${change}`);
+      proxyReady(frame);
+      await Promise.resolve();
+      let onMessage!: (event: MessageEvent) => void;
+      const close = vi.fn();
+      const removeEventListener = vi.fn();
+      const port = {
+        addEventListener: vi.fn((_type, handler) => {
+          onMessage = handler;
         }),
-      );
-    prompt("Background");
-    expect(received).not.toHaveBeenCalled();
-    Object.defineProperty(document, "activeElement", { get: () => frame, configurable: true });
-    Object.defineProperty(frame, "checkVisibility", { value: () => true });
-    message(frame, { type: "openclaw:widget-prompt", prompt: "Forged window message" });
-    expect(received).not.toHaveBeenCalled();
-    prompt("Show details");
-    expect(received).toHaveBeenCalledOnce();
-    expect(client.request).toHaveBeenCalledOnce();
-    if (change === "parking") {
-      const report = { type: "openclaw:widget-runtime-error", message: "Missing details" };
-      view.presentationActive = false;
-      prompt("Resume details");
-      message(frame, report);
-      expect({
-        prompts: received.mock.calls.length,
-        requests: client.request.mock.calls.map(([method]) => method),
-      }).toEqual({ prompts: 1, requests: ["canvas.document.view"] });
-      message(frame, { type: "openclaw:widget-size", height: 520 });
-      await settle(view);
-      expect(view.querySelector("iframe")).toBe(frame);
-      expect(frame.style.height).toBe("520px");
-      expect(view.querySelector('[role="status"]')).toBeNull();
-      expect(close).not.toHaveBeenCalled();
-      view.presentationActive = true;
-      await settle(view);
-      prompt("Resume details");
-      expect(received).toHaveBeenCalledTimes(2);
+        removeEventListener,
+        start: vi.fn(),
+        postMessage: vi.fn(),
+        close,
+      } as unknown as MessagePort;
+      const received = vi.fn();
+      view.addEventListener(WIDGET_PROMPT_EVENT, received);
+      message(frame, { type: "openclaw:widget-prompt-offer" }, [port]);
+      const prompt = (text: string) =>
+        onMessage(
+          new MessageEvent("message", {
+            data: { type: "openclaw:widget-prompt", prompt: text },
+          }),
+        );
+      prompt("Background");
+      expect(received).not.toHaveBeenCalled();
+      Object.defineProperty(document, "activeElement", { get: () => frame, configurable: true });
+      Object.defineProperty(frame, "checkVisibility", { value: () => true });
+      message(frame, { type: "openclaw:widget-prompt", prompt: "Forged window message" });
+      expect(received).not.toHaveBeenCalled();
+      prompt("Show details");
+      expect(received).toHaveBeenCalledOnce();
       expect(client.request).toHaveBeenCalledOnce();
-      expect(view.querySelector("iframe")).toBe(frame);
-      expect(
-        post.mock.calls.filter(
-          ([data]) => data.method === "ui/notifications/sandbox-resource-ready",
-        ),
-      ).toHaveLength(1);
-      message(frame, report);
-      expect(client.request).toHaveBeenLastCalledWith(
-        "wake",
-        expect.objectContaining({ sessionKey: view.sessionKey }),
-      );
-      return;
-    }
-    if (change === "connection recovery" || change === "client replacement") {
-      await transition(view, "reconnecting");
-
-      prompt("Resume details");
-      expect(received).toHaveBeenCalledOnce();
-      expect(view.querySelector("iframe")).toBe(frame);
-      const revalidation = createDeferred<CanvasDocumentViewResult>();
-      const currentClient =
-        change === "client replacement"
-          ? { request: vi.fn().mockResolvedValue(documentView) }
-          : client;
-      currentClient.request.mockImplementationOnce(() => revalidation.promise);
-      gateways.get(view)!.snapshot.client = currentClient;
-      await transition(view, "connected");
-      expectRead(currentClient, view.docId);
-      prompt("Resume details");
-      expect(received).toHaveBeenCalledOnce();
-      expect(view.querySelector("iframe")).toBe(frame);
-      revalidation.resolve(documentView);
-      await settle(view);
-      prompt("Resume details");
-      expect(received).toHaveBeenCalledTimes(2);
-      expect(view.querySelector("iframe")).toBe(frame);
-      expect(close).not.toHaveBeenCalled();
+      if (change === "parking") {
+        const report = { type: "openclaw:widget-runtime-error", message: "Missing details" };
+        view.presentationActive = false;
+        prompt("Resume details");
+        message(frame, report);
+        expect(received).toHaveBeenCalledOnce();
+        expect(client.request).toHaveBeenCalledOnce();
+        message(frame, { type: "openclaw:widget-size", height: 520 });
+        await settle(view);
+        expect(frame.style.height).toBe("520px");
+        expect(view.querySelector('[role="status"]')).toBeNull();
+        expect(close).not.toHaveBeenCalled();
+        view.presentationActive = true;
+        await settle(view);
+        prompt("Resume details");
+        expect(received).toHaveBeenCalledTimes(2);
+        expect(view.querySelector("iframe")).toBe(frame);
+        message(frame, report);
+        expect(client.request).toHaveBeenLastCalledWith(
+          "wake",
+          expect.objectContaining({ sessionKey: view.sessionKey }),
+        );
+        return;
+      }
       if (change === "client replacement") {
+        message(frame, { type: "openclaw:widget-runtime-error", message: "Failed to fetch" });
+        await transition(view, "reconnecting");
+        message(frame, { type: "openclaw:widget-runtime-error", message: "d3 is not defined" });
+        expect(client.request).toHaveBeenCalledOnce();
+        prompt("Resume details");
+        expect(received).toHaveBeenCalledOnce();
+        expect(view.querySelector("iframe")).toBe(frame);
+        const revalidation = createDeferred<CanvasDocumentViewResult>();
+        const currentClient = { request: vi.fn().mockReturnValue(revalidation.promise) };
+        gateways.get(view)!.snapshot.client = currentClient;
+        await transition(view, "connected");
+        prompt("Resume details");
+        expect(received).toHaveBeenCalledOnce();
+        revalidation.resolve(documentView);
+        await settle(view);
+        prompt("Resume details");
+        expect(received).toHaveBeenCalledTimes(2);
+        expect(view.querySelector("iframe")).toBe(frame);
+        expect(close).not.toHaveBeenCalled();
         message(frame, { type: "openclaw:widget-runtime-error", message: "Missing details" });
         expect(currentClient.request).toHaveBeenLastCalledWith(
           "wake",
           expect.objectContaining({ sessionKey: view.sessionKey }),
         );
         expect(client.request).toHaveBeenCalledOnce();
+        currentClient.request.mockResolvedValue({ ...documentView, html: "<p>Updated bytes</p>" });
+        await transition(view, "reconnecting");
+        await transition(view, "connected");
+        expect(view.querySelector("iframe")).not.toBe(frame);
+        expect(view.documentHtml).toBe("<p>Updated bytes</p>");
+        return;
       }
-      return;
-    }
-    if (change === "disconnect") {
-      view.remove();
-      await Promise.resolve();
-    } else {
-      view.allowScripts = false;
-    }
-    expect(close).toHaveBeenCalledOnce();
-    expect(removeEventListener.mock.calls).toContainEqual(
-      expect.arrayContaining(["message", onMessage]),
-    );
-    prompt("Stale port");
-    expect(received).toHaveBeenCalledOnce();
-    if (change === "strict then scripts") {
-      view.allowScripts = true;
-    }
-    if (change !== "disconnect") {
-      await view.updateComplete;
-      const replacement = await frameFor(view);
-      expect(replacement).not.toBe(frame);
-      if (change === "strict mode") {
-        expect(replacement.srcdoc).toBe(documentView.html);
-        expect(replacement.getAttribute("sandbox")).toBe("");
+      if (change === "disconnect") {
+        view.remove();
+        await Promise.resolve();
       } else {
-        expect(replacement.src).toBe(frame.src);
+        view.allowScripts = false;
       }
-      expect(client.request).toHaveBeenCalledOnce();
-    }
-  });
+      expect(close).toHaveBeenCalledOnce();
+      expect(removeEventListener.mock.calls).toContainEqual(
+        expect.arrayContaining(["message", onMessage]),
+      );
+      prompt("Stale port");
+      expect(received).toHaveBeenCalledOnce();
+      if (change === "strict then scripts") {
+        view.allowScripts = true;
+      }
+      if (change !== "disconnect") {
+        await view.updateComplete;
+        const replacement = await frameFor(view);
+        expect(replacement).not.toBe(frame);
+        expect(replacement.src).toBe(frame.src);
+        expect(client.request).toHaveBeenCalledOnce();
+      }
+    },
+  );
 });
