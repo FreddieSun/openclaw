@@ -19,6 +19,32 @@ import type { WorkerTunnelManager } from "./tunnel.js";
 type WorkerEnvironmentServiceError = support.WorkerEnvironmentServiceError;
 type WorkerLifecycleLease = support.WorkerLifecycleLease;
 
+function holdBootstrap() {
+  const pending = createDeferred();
+  const entered = createDeferred();
+  support.testState.bootstrapWorker = vi.fn(async () => {
+    entered.resolve();
+    await pending.promise;
+    return support.BOOTSTRAP_RECEIPT;
+  });
+  return { entered: entered.promise, release: pending.resolve };
+}
+
+async function seedProvisioning(environmentId: string) {
+  await support.testState.store.createIntent({
+    environmentId,
+    providerId: "fake",
+    profileId: "development",
+    profileSnapshot: { settings: { region: "test" } },
+    provisionOperationId: `provision:${environmentId}`,
+  });
+  return support.testState.store.transition({
+    environmentId,
+    from: "requested",
+    to: "provisioning",
+  });
+}
+
 describe("worker environment service", () => {
   support.setupWorkerEnvironmentServiceSuite();
 
@@ -713,20 +739,14 @@ describe("worker environment service", () => {
   );
 
   it("rejects a create queued before service shutdown once its lock is acquired", async () => {
-    const { promise: bootstrapPending, resolve: finishBootstrap } = createDeferred();
-    support.testState.bootstrapWorker = vi.fn(async () => {
-      await bootstrapPending;
-      return support.BOOTSTRAP_RECEIPT;
-    });
+    const bootstrap = holdBootstrap();
     const provision = vi.fn(support.createProvider().provision);
     const workerService = support.createService(support.createProvider({ provision }));
     const first = workerService.createWithRequest({
       profileId: "development",
       idempotencyKey: "request-queued-before-stop",
     });
-    await support.waitForFast(() =>
-      expect(support.testState.bootstrapWorker).toHaveBeenCalledTimes(1),
-    );
+    await bootstrap.entered;
     const queued = workerService.createWithRequest({
       profileId: "development",
       idempotencyKey: "request-queued-before-stop",
@@ -736,7 +756,7 @@ describe("worker environment service", () => {
     } satisfies Partial<WorkerEnvironmentServiceError>);
 
     const stopping = workerService.stop();
-    finishBootstrap?.();
+    bootstrap.release();
 
     await expect(first).resolves.toMatchObject({ state: "ready" });
     await queuedResult;
@@ -745,27 +765,21 @@ describe("worker environment service", () => {
   });
 
   it("drains a destroy accepted before service shutdown while it waits for the lock", async () => {
-    const { promise: bootstrapPending, resolve: finishBootstrap } = createDeferred();
-    support.testState.bootstrapWorker = vi.fn(async () => {
-      await bootstrapPending;
-      return support.BOOTSTRAP_RECEIPT;
-    });
+    const bootstrap = holdBootstrap();
     const destroy = vi.fn(async () => {});
     const workerService = support.createService(support.createProvider({ destroy }));
     const creation = workerService.createWithRequest({
       profileId: "development",
       idempotencyKey: "request-destroy-before-stop",
     });
-    await support.waitForFast(() =>
-      expect(support.testState.bootstrapWorker).toHaveBeenCalledTimes(1),
-    );
+    await bootstrap.entered;
     const environmentId = support.testState.store.list()[0]?.environmentId;
     expect(environmentId).toBeTruthy();
     const teardown = workerService.destroy(environmentId!);
     const teardownResult = expect(teardown).resolves.toMatchObject({ state: "destroyed" });
 
     const stopping = workerService.stop();
-    finishBootstrap?.();
+    bootstrap.release();
 
     await expect(creation).resolves.toMatchObject({ state: "ready" });
     await teardownResult;
@@ -793,19 +807,13 @@ describe("worker environment service", () => {
 
   it("drains accepted operations after readiness rejects during shutdown", async () => {
     const durableStore = support.testState.store;
-    const { promise: bootstrapPending, resolve: finishBootstrap } = createDeferred();
-    support.testState.bootstrapWorker = vi.fn(async () => {
-      await bootstrapPending;
-      return support.BOOTSTRAP_RECEIPT;
-    });
+    const bootstrap = holdBootstrap();
     const workerService = support.createService(support.createProvider());
     const creation = workerService.createWithRequest({
       profileId: "development",
       idempotencyKey: "request-stop-after-reconcile-failure",
     });
-    await support.waitForFast(() =>
-      expect(support.testState.bootstrapWorker).toHaveBeenCalledTimes(1),
-    );
+    await bootstrap.entered;
     try {
       vi.spyOn(durableStore, "ready").mockRejectedValueOnce(
         new Error("reconcile database read failed"),
@@ -822,14 +830,14 @@ describe("worker environment service", () => {
       await reconciliationResult;
       await Promise.resolve();
       expect(stopped).toBe(false);
-      finishBootstrap?.();
+      bootstrap.release();
 
       await expect(creation).resolves.toMatchObject({ state: "ready" });
       await stopping;
       expect(stopped).toBe(true);
       expect(durableStore.list()).toHaveLength(1);
     } finally {
-      finishBootstrap();
+      bootstrap.release();
     }
   });
 
@@ -846,20 +854,7 @@ describe("worker environment service", () => {
       const environmentId = "worker-scheduler-bootstrap";
       const initial = await (transport === "ssh"
         ? support.seedBootstrapping(environmentId)
-        : (async () => {
-            await support.testState.store.createIntent({
-              environmentId,
-              providerId: "fake",
-              profileId: "development",
-              profileSnapshot: { settings: { region: "test" } },
-              provisionOperationId: `provision:${environmentId}`,
-            });
-            return support.testState.store.transition({
-              environmentId,
-              from: "requested",
-              to: "provisioning",
-            });
-          })());
+        : seedProvisioning(environmentId));
       const entered = createDeferred();
       const finishProducer = createDeferred();
       let activeSignal: AbortSignal | undefined;
@@ -920,20 +915,7 @@ describe("worker environment service", () => {
       const environmentId = "worker-owner-cancellation";
       const preparing = kind === "bundle" || kind === "npm";
       const initial = await (kind === "provision" || kind === "provision-node"
-        ? (async () => {
-            await support.testState.store.createIntent({
-              environmentId,
-              providerId: "fake",
-              profileId: "development",
-              profileSnapshot: { settings: { region: "test" } },
-              provisionOperationId: `provision:${environmentId}`,
-            });
-            return support.testState.store.transition({
-              environmentId,
-              from: "requested",
-              to: "provisioning",
-            });
-          })()
+        ? seedProvisioning(environmentId)
         : kind === "refresh"
           ? support.seedReadyNodeDesktop(environmentId)
           : kind === "bootstrap" || preparing
