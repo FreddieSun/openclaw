@@ -45,7 +45,6 @@ export function sidebarPanelDefinitions(
       icon,
       available: Boolean(
         panelContext &&
-        slot !== "context" &&
         (slot === "portal"
           ? state &&
             canCallGatewayMethod(

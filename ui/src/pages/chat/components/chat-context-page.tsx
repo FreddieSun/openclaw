@@ -17,8 +17,9 @@ import {
   ChatContextReport,
   contextLabelKeys,
   contextGroupLabelKeys,
-} from "./chat-context-breakdown.tsx";
+} from "./chat-context-report.tsx";
 import type { ChatDetailsProps } from "./chat-details-types.ts";
+import "../../../styles/chat/context-breakdown.css";
 
 export type ContextPageDetails = Pick<
   ChatDetailsProps,
