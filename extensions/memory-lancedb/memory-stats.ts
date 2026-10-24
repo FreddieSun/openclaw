@@ -29,7 +29,7 @@ let usage;
 const result = {};
 try {
   const { loadLanceDbModule, acquireMemoryTableUsage } = await import(input.moduleUrl);
-  usage = await acquireMemoryTableUsage(input.dbPath);
+  usage = await acquireMemoryTableUsage(input.dbPath, await import(input.fileLockUrl));
   const lancedb = await loadLanceDbModule();
   db = await lancedb.connect(input.dbPath, { storageOptions: input.storageOptions });
   if ((await db.tableNames()).includes(input.tableName)) {
@@ -58,6 +58,8 @@ export async function readMemoryStats(source: MemoryStatsSource, agentId: string
       input: JSON.stringify({
         ...source,
         moduleUrl: moduleUrl.href,
+        // Raw child processes do not inherit the host plugin loader's SDK aliases.
+        fileLockUrl: import.meta.resolve("openclaw/plugin-sdk/file-lock"),
         tableName: MEMORY_TABLE_NAME,
         predicate: memoryAgentPredicate(agentId),
       }),
