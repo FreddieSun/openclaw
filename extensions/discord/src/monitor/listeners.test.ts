@@ -53,6 +53,8 @@ const mocks = vi.hoisted(() => ({
   readMessagesDiscord: vi.fn(async (): Promise<APIMessage[]> => []),
 }));
 
+const route = { agentId: "molty", sessionKey: "agent:molty:discord:channel:channel-1" };
+
 vi.mock("openclaw/plugin-sdk/channel-join-intro-runtime", async (importOriginal) => ({
   ...(await importOriginal<typeof import("openclaw/plugin-sdk/channel-join-intro-runtime")>()),
   reportChannelRoomJoin: mocks.reportChannelRoomJoin,
@@ -118,11 +120,7 @@ function guildSnapshot(
   presences: Array<Omit<GatewayPresenceUpdate, "guild_id">>,
   memberCount = 100,
 ): GatewayGuildCreateDispatchData {
-  return {
-    id: "guild-1",
-    member_count: memberCount,
-    presences,
-  } as GatewayGuildCreateDispatchData;
+  return { id: "guild-1", member_count: memberCount, presences } as GatewayGuildCreateDispatchData;
 }
 
 function presenceClient(fetchUser = async () => ({ bot: false })): Client {
@@ -268,9 +266,9 @@ function createHarness(
 ) {
   const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(null, { status: 204 }));
   const logger = createSubsystemLogger("discord/test-listeners");
-  vi.spyOn(logger, "info").mockImplementation(() => {});
-  vi.spyOn(logger, "warn").mockImplementation(() => {});
-  vi.spyOn(logger, "error").mockImplementation(() => {});
+  for (const level of ["info", "warn", "error"] as const) {
+    vi.spyOn(logger, level).mockImplementation(() => {});
+  }
   const client = new Client(
     {
       clientId: "test-app",
@@ -329,10 +327,7 @@ beforeEach(() => {
   mocks.canViewDiscordGuildChannel.mockReset().mockResolvedValue(true);
   mocks.hasAnyChannelPermissionDiscord.mockReset().mockResolvedValue(true);
   mocks.readMessagesDiscord.mockReset().mockResolvedValue([]);
-  mocks.resolveAgentRoute.mockReturnValue({
-    agentId: "molty",
-    sessionKey: "agent:molty:discord:channel:channel-1",
-  });
+  mocks.resolveAgentRoute.mockReturnValue(route);
 });
 
 afterEach(() => vi.restoreAllMocks());
@@ -608,15 +603,13 @@ describe("DiscordPresenceListener", () => {
 
     expect(mocks.enqueueSessionEvent).toHaveBeenCalledTimes(2);
     expect(registerIfAbsent).toHaveBeenCalledTimes(2);
-    const route = { agentId: "molty", sessionKey: "agent:molty:discord:channel:channel-1" };
-    const destination = { to: "channel:channel-1", accountId: "molty" };
     expect(mocks.enqueueSessionEvent).toHaveBeenLastCalledWith(
       expect.stringContaining('user_id="user-1"'),
       expect.objectContaining({
         ...route,
         expectedTarget: await mocks.captureSessionEventTarget.mock.results.at(-1)?.value,
         createIfMissing: true,
-        deliveryContext: { ...destination, channel: "discord" },
+        deliveryContext: { to: "channel:channel-1", accountId: "molty", channel: "discord" },
       }),
     );
   });
@@ -631,16 +624,10 @@ describe("DiscordPresenceListener", () => {
         sessionKey: "agent:replacement:discord:channel:channel-1",
       });
     });
-    expect(mocks.captureSessionEventTarget).toHaveBeenCalledWith(
-      "molty",
-      "agent:molty:discord:channel:channel-1",
-    );
+    expect(mocks.captureSessionEventTarget).toHaveBeenCalledWith(route.agentId, route.sessionKey);
     expect(mocks.enqueueSessionEvent).toHaveBeenCalledWith(
       expect.any(String),
-      expect.objectContaining({
-        agentId: "molty",
-        sessionKey: "agent:molty:discord:channel:channel-1",
-      }),
+      expect.objectContaining(route),
     );
   });
 
@@ -846,8 +833,7 @@ describe("DiscordPresenceListener", () => {
 
     await listener.handle({ ...presence("online"), guild_id: "guild-2" }, botClient);
     await listener.transition("user-1", botClient);
-    await listener.offline("human-1", presenceClient());
-    await listener.online("human-1", presenceClient());
+    await listener.transition("human-1");
 
     expect(fetchUser).toHaveBeenCalledWith("user-1");
     expectWake("human-1");
