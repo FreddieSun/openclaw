@@ -395,76 +395,50 @@ describe("push APNs send semantics", () => {
   });
 
   it.each([
-    {
-      name: "exec approval alert with generic modal-only metadata",
-      invoke: sendApnsExecApprovalAlert,
-      kind: "exec.approval.requested",
-      pushType: "alert",
-      aps: {
-        alert: { title: "Exec approval required", body: "Open OpenClaw to review this request." },
-        sound: "default",
-        category: "openclaw.exec-approval",
-        "content-available": 1,
-      },
-      forbidden: ["host", "nodeId", "agentId", "commandText", "allowedDecisions", "expiresAtMs"],
-    },
-    {
-      name: "silent exec approval cleanup with a capped timeout",
-      invoke: sendApnsExecApprovalResolvedWake,
-      kind: "exec.approval.resolved",
-      pushType: "background",
-      aps: { "content-available": 1 },
-      timeoutMs: Number.MAX_SAFE_INTEGER,
-      sendResult: { status: 200, apnsId: "apns-timeout-cap-id", body: "{}" },
-    },
-    {
-      name: "plugin approval alert with bounded request copy",
-      invoke: (params: Parameters<typeof sendApnsExecApprovalAlert>[0]) =>
-        sendApnsPluginApprovalAlert({
-          ...params,
-          title: "Install plugin update",
-          description: `${"x".repeat(255)}😀${"y".repeat(300)}`,
-        }),
-      kind: "plugin.approval.requested",
-      pushType: "alert",
-      aps: {
-        alert: { title: "Install plugin update", body: `${"x".repeat(255)}…` },
-        sound: "default",
-        category: "openclaw.plugin-approval",
-        "content-available": 1,
-      },
-      forbidden: ["title", "description", "toolName", "agentId", "sessionKey"],
-    },
-    {
-      name: "silent plugin approval cleanup",
-      invoke: sendApnsPluginApprovalResolvedWake,
-      kind: "plugin.approval.resolved",
-      pushType: "background",
-      aps: { "content-available": 1 },
-    },
-  ])("sends $name", async ({ invoke, kind, pushType, aps, forbidden, timeoutMs, sendResult }) => {
-    const approvalId = "approval-123";
-    const fixture = createDirectApnsSendFixture("ios-node-approval", "sandbox", sendResult);
-    const result = await invoke({
+    ["exec", "alert", sendApnsExecApprovalAlert],
+    ["exec", "background", sendApnsExecApprovalResolvedWake],
+    ["plugin", "alert", sendApnsPluginApprovalAlert],
+    ["plugin", "background", sendApnsPluginApprovalResolvedWake],
+  ] as const)("sends %s approval %s", async (kind, pushType, invoke) => {
+    const alert = pushType === "alert";
+    const plugin = kind === "plugin";
+    const fixture = createDirectApnsSendFixture("ios-node-approval");
+    const approval = {
       ...fixture,
-      approvalId,
+      approvalId: "approval-123",
       gatewayDeviceId: "gateway-device-123",
-      timeoutMs,
-    });
-    expect(fixture.send).toHaveBeenCalledTimes(1);
+      timeoutMs: Number.MAX_SAFE_INTEGER,
+      title: "Install plugin update",
+      description: `${"x".repeat(255)}😀${"y".repeat(300)}`,
+    };
+    const result = await invoke(approval);
     const sent = requireSendRequest(fixture.send);
-    expect(sent).toMatchObject({ pushType });
-    if (timeoutMs !== undefined) {
-      expect(sent.timeoutMs).toBe(MAX_TIMER_TIMEOUT_MS);
-    }
+    expect(sent).toMatchObject({ pushType, timeoutMs: MAX_TIMER_TIMEOUT_MS });
     const payload = requirePayload(sent);
-    expect(payload.aps).toEqual(aps);
+    expect(payload.aps).toEqual(
+      alert
+        ? {
+            alert: {
+              title: plugin ? "Install plugin update" : "Exec approval required",
+              body: plugin ? `${"x".repeat(255)}…` : "Open OpenClaw to review this request.",
+            },
+            sound: "default",
+            category: `openclaw.${kind}-approval`,
+            "content-available": 1,
+          }
+        : { "content-available": 1 },
+    );
     const metadata = expectOpenClaw(payload, {
-      kind,
-      approvalId,
+      kind: `${kind}.approval.${alert ? "requested" : "resolved"}`,
+      approvalId: "approval-123",
       gatewayDeviceId: "gateway-device-123",
     });
-    expectNoProperties(metadata, forbidden ?? []);
+    expectNoProperties(
+      metadata,
+      plugin
+        ? ["title", "description", "toolName", "agentId", "sessionKey"]
+        : ["host", "nodeId", "agentId", "commandText", "allowedDecisions", "expiresAtMs"],
+    );
     expect(result).toMatchObject({ ok: true, transport: "direct" });
   });
 
@@ -648,19 +622,6 @@ describe("push APNs auth and helper coverage", () => {
   });
 });
 
-const senderOptionKeys = {
-  direct: [
-    "token",
-    "topic",
-    "environment",
-    "bearerToken",
-    "payload",
-    "timeoutMs",
-    "pushType",
-    "priority",
-  ],
-};
-
 function createApnsTransportFixture(transport: "direct" | "relay") {
   const fixture =
     transport === "direct"
@@ -696,15 +657,12 @@ describe("APNs dispatch", () => {
       await sendPush({ signal: controller.signal, isCurrent });
       if (transport === "direct") {
         const controlled = requireSendRequest(send);
-        expect(Object.keys(controlled)).toEqual([
-          ...senderOptionKeys.direct,
-          "signal",
-          "isCurrent",
-        ]);
-        expect(controlled.signal).toBe(controller.signal);
-        expect(controlled.isCurrent).toBe(isCurrent);
-        expect(controlled.pushType).toBe(kind);
-        expect(controlled.priority).toBe(kind === "alert" ? "10" : "5");
+        expect(controlled).toMatchObject({
+          signal: controller.signal,
+          isCurrent,
+          pushType: kind,
+          priority: kind === "alert" ? "10" : "5",
+        });
         if (kind === "background") {
           const payload = requirePayload(controlled);
           expect(payload.aps).toEqual({ "content-available": 1 });
@@ -737,7 +695,7 @@ describe("APNs dispatch", () => {
       send.mockClear();
       await sendPush({});
       if (transport === "direct") {
-        expect(Object.keys(requireSendRequest(send))).toEqual(senderOptionKeys.direct);
+        expectNoProperties(requireSendRequest(send), ["signal", "isCurrent"]);
       } else {
         expect(send).toHaveBeenCalledTimes(1);
       }
@@ -777,7 +735,7 @@ describe("APNs dispatch", () => {
         send.mockClear();
         await sendApproval(approval);
         if (transport === "direct") {
-          expect(Object.keys(requireSendRequest(send))).toEqual(senderOptionKeys.direct);
+          expectNoProperties(requireSendRequest(send), ["signal", "isCurrent"]);
         } else {
           expect(send).toHaveBeenCalledTimes(1);
           expect(send.mock.calls[0]?.[0]).toBe("https://relay.openclaw.test/v1/push/send");

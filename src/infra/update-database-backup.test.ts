@@ -37,6 +37,39 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+const digest = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
+const readFiles = (files: string[]) => Promise.all(files.map((file) => fs.readFile(file)));
+const maintenanceScope = () =>
+  createOpenClawDatabaseMaintenanceScope({
+    schemaMaintenance: true,
+    assertOwnerCurrent: () => {},
+    assertDatabaseAccess: () => {},
+  });
+
+async function expectSnapshot(
+  entry: { snapshotPath: string; sha256: string; sizeBytes: number },
+  values = ["retained"],
+) {
+  const bytes = await fs.readFile(entry.snapshotPath);
+  expect(entry).toMatchObject({ sha256: digest(bytes), sizeBytes: bytes.length });
+  using db = new DatabaseSync(entry.snapshotPath, { readOnly: true });
+  expect(db.prepare("SELECT rowid,value FROM payload ORDER BY rowid").all()).toEqual(
+    values.map((value, index) => ({ rowid: 42 + index, value })),
+  );
+}
+
+async function retainedWal(file: string, sql: string) {
+  const files = [file, `${file}-wal`, `${file}-shm`];
+  let bytes: Buffer[];
+  {
+    using db = new DatabaseSync(file);
+    db.exec(`PRAGMA journal_mode=WAL; ${sql}`);
+    bytes = await readFiles(files);
+  }
+  await Promise.all(files.map((target, index) => fs.writeFile(target, bytes[index]!)));
+  return { files, bytes };
+}
+
 async function fixture(externalAgents = false) {
   const root = await fs.realpath(dirs.make("update-database-backup-preflight-"));
   const stateDir = path.join(root, "state");
@@ -135,19 +168,7 @@ it.each(["legacy", "current"] as const)(
     expect(backup.databases.map((entry) => entry.path).toSorted()).toEqual(
       [custom, f.shared].toSorted(),
     );
-    const published = await fs.readFile(backup.databases[0]!.snapshotPath);
-    expect(backup.databases[0]).toMatchObject({
-      sha256: createHash("sha256").update(published).digest("hex"),
-      sizeBytes: published.length,
-    });
-    {
-      using snapshot = openNodeSqliteDatabase(backup.databases[0]!.snapshotPath, {
-        readOnly: true,
-      });
-      expect(snapshot.prepare("SELECT rowid,value FROM payload").all()).toEqual([
-        { rowid: 42, value: "retained" },
-      ]);
-    }
+    await expectSnapshot(backup.databases[0]!);
     expect(await fs.readFile(f.shared)).toEqual(before);
   },
 );
@@ -198,7 +219,7 @@ it.each(["auto", "off"] as const)(
         const bytes = await fs.readFile(entry.snapshotPath);
         expect(entry).toMatchObject({
           userVersion: 17,
-          sha256: createHash("sha256").update(bytes).digest("hex"),
+          sha256: digest(bytes),
           sizeBytes: bytes.length,
         });
         const source = new DatabaseSync(entry.path);
@@ -228,7 +249,7 @@ it.each([
     {
       using database = new DatabaseSync(f.shared);
       database.exec("PRAGMA journal_mode=WAL; INSERT INTO payload VALUES ('checkpoint pending');");
-      before = await Promise.all(files.map((file) => fs.readFile(file)));
+      before = await readFiles(files);
     }
     if (activity === "reader-empty-wal") {
       // A fully checkpointed WAL-mode database has no sidecars until a reader opens it.
@@ -304,25 +325,14 @@ it.each(["original-custody", "rollback", "ordinary", "maintenance"] as const)(
   "preserves committed WAL during %s capture without unused generation scans",
   async (mode) => {
     const f = await fixture();
-    const files = [f.shared, `${f.shared}-wal`, `${f.shared}-shm`];
-    let family: Buffer[];
-    {
-      using database = new DatabaseSync(f.shared);
-      database.exec("PRAGMA journal_mode=WAL; INSERT INTO payload VALUES ('checkpoint pending');");
-      family = await Promise.all(files.map((file) => fs.readFile(file)));
-    }
-    await Promise.all(files.map((file, index) => fs.writeFile(file, family[index]!)));
+    const { files, bytes: family } = await retainedWal(
+      f.shared,
+      "INSERT INTO payload VALUES ('checkpoint pending');",
+    );
     const generations = vi.spyOn(databaseGenerations, "readUpdatePhysicalDatabaseGenerations");
     // Observe real parent acquisitions; public discovery and backup still use real workers.
     const parentImages = vi.spyOn(sqliteSource, "prepareSqliteReadOnlyLocationSync");
-    const scope =
-      mode === "ordinary" || mode === "maintenance"
-        ? createOpenClawDatabaseMaintenanceScope({
-            schemaMaintenance: true,
-            assertOwnerCurrent: () => {},
-            assertDatabaseAccess: () => {},
-          })
-        : undefined;
+    const scope = mode === "ordinary" || mode === "maintenance" ? maintenanceScope() : undefined;
     const input = { ...f.input, preserveSourceArtifacts: true };
     try {
       const backup = scope
@@ -345,19 +355,9 @@ it.each(["original-custody", "rollback", "ordinary", "maintenance"] as const)(
       } else {
         expect(generations).toHaveBeenCalledTimes(mode === "rollback" ? 2 : 0);
       }
-      expect(await Promise.all(files.map((file) => fs.readFile(file)))).toEqual(family);
+      expect(await readFiles(files)).toEqual(family);
       expect(backup.databases).toHaveLength(1);
-      const snapshot = backup.databases[0]!;
-      const bytes = await fs.readFile(snapshot.snapshotPath);
-      expect(snapshot).toMatchObject({
-        sha256: createHash("sha256").update(bytes).digest("hex"),
-        sizeBytes: bytes.length,
-      });
-      using retained = new DatabaseSync(snapshot.snapshotPath, { readOnly: true });
-      expect(retained.prepare("SELECT rowid,value FROM payload ORDER BY rowid").all()).toEqual([
-        { rowid: 42, value: "retained" },
-        { rowid: 43, value: "checkpoint pending" },
-      ]);
+      await expectSnapshot(backup.databases[0]!, ["retained", "checkpoint pending"]);
       if (mode === "original-custody") {
         expect(backup.sourceGenerations[f.shared]).toBeUndefined();
       } else {
@@ -394,7 +394,7 @@ it("keeps the verified digest when a snapshot is replaced before backup metadata
   const backup = await f.capture();
   assert(published, "Snapshot publication must complete before the injected change");
   expect(backup.databases[0]).toMatchObject({
-    sha256: createHash("sha256").update(published).digest("hex"),
+    sha256: digest(published),
     sizeBytes: published.length,
   });
   expect(await fs.readFile(backup.databases[0]!.snapshotPath)).not.toEqual(published);
@@ -487,21 +487,10 @@ async function originalCaptureFixture(externalAgents = false) {
 
   // Retain a real committed WAL family after closing its fixture writer. A native
   // source open can alter/remove these sidecars even though it requests read-only.
-  let family: Buffer[];
-  const familyPaths = [f.shared, `${f.shared}-wal`, `${f.shared}-shm`];
-  {
-    using db = new DatabaseSync(f.shared);
-    db.exec(`
-      PRAGMA journal_mode=WAL;
-      PRAGMA wal_autocheckpoint=0;
-      CREATE TABLE state_leases(token TEXT);
-      INSERT INTO state_leases(rowid,token) VALUES(87,'original-lease');
-    `);
-    family = await Promise.all(familyPaths.map((file) => fs.readFile(file)));
-  }
-  for (const [index, file] of familyPaths.entries()) {
-    await fs.writeFile(file, family[index]!);
-  }
+  const { files: familyPaths, bytes: family } = await retainedWal(
+    f.shared,
+    "PRAGMA wal_autocheckpoint=0; CREATE TABLE state_leases(token TEXT); INSERT INTO state_leases(rowid,token) VALUES(87,'original-lease');",
+  );
 
   // Only declaration producers are synthetic; acquisition, copying, revalidation,
   // manifest parsing, and publication all use their production owners.
@@ -558,14 +547,14 @@ async function originalCaptureFixture(externalAgents = false) {
 
 async function expectOriginalDatabase(ref: UpdateRecoveryBaselineRef, sourcePath: string) {
   const raw = await fs.readFile(ref.manifestPath, "utf8");
-  expect(createHash("sha256").update(raw).digest("hex")).toBe(ref.manifestSha256);
+  expect(digest(raw)).toBe(ref.manifestSha256);
   const manifest = parseUpdateRecoveryBackupManifest(raw);
   const entry = manifest.entries.find((candidate) => candidate.sourcePath === sourcePath);
   assert(entry?.kind === "file" && entry.sqlite);
   const payloadPath = path.join(ref.directory, entry.archivePath);
   const bytes = await fs.readFile(payloadPath);
   expect(entry).toMatchObject({
-    sha256: createHash("sha256").update(bytes).digest("hex"),
+    sha256: digest(bytes),
     size: bytes.length,
   });
   using retained = new DatabaseSync(payloadPath, { readOnly: true });
@@ -599,7 +588,7 @@ it("seals equivalent original bytes under isolated and maintenance-owned capture
   const retainedState = path.join(f.stateDir, "voice-calls", "state", "openclaw.sqlite");
   await fs.mkdir(path.dirname(retainedState), { recursive: true });
   await fs.copyFile(f.pluginDatabase, retainedState);
-  const externalBytes = await Promise.all(f.external.map((source) => fs.readFile(source)));
+  const externalBytes = await readFiles(f.external);
   const hashFile = durability.sha256File;
   let hashedBytes = 0;
   vi.spyOn(durability, "sha256File").mockImplementation(async (...args) => {
@@ -614,7 +603,7 @@ it("seals equivalent original bytes under isolated and maintenance-owned capture
   hashedBytes = 0;
   const raw = await fs.readFile(result.ref.manifestPath, "utf8");
   const manifest = parseUpdateRecoveryBackupManifest(raw);
-  expect(createHash("sha256").update(raw).digest("hex")).toBe(result.ref.manifestSha256);
+  expect(digest(raw)).toBe(result.ref.manifestSha256);
   expect(manifest).toMatchObject({ schemaVersion: 2, generation: { kind: "baseline" } });
   expect(manifest.databases?.filter((database) => database.role === "global")).toEqual([
     { path: f.shared, role: "global" },
@@ -649,8 +638,8 @@ it("seals equivalent original bytes under isolated and maintenance-owned capture
       });
     }
   }
-  expect(await Promise.all(f.familyPaths.map((file) => fs.readFile(file)))).toEqual(f.family);
-  expect(await Promise.all(f.external.map((source) => fs.readFile(source)))).toEqual(externalBytes);
+  expect(await readFiles(f.familyPaths)).toEqual(f.family);
+  expect(await readFiles(f.external)).toEqual(externalBytes);
   expect(manifest.databases?.filter((database) => f.external.includes(database.path))).toEqual([]);
   expect(manifest.configPaths).toEqual(
     expect.arrayContaining([f.configPath, f.authoredConfig, f.include]),
@@ -676,11 +665,7 @@ it("seals equivalent original bytes under isolated and maintenance-owned capture
   const worker = vi.spyOn(inspection, "runUpdateStateInspectionWorker");
   const parentDiscovery = vi.spyOn(candidateState, "discoverUpdateStateSchemaInspectionInProcess");
   const isolatedSizes = vi.spyOn(databaseSizes, "readUpdateStateDatabaseSizes");
-  const scope = createOpenClawDatabaseMaintenanceScope({
-    schemaMaintenance: true,
-    assertOwnerCurrent: () => {},
-    assertDatabaseAccess: () => {},
-  });
+  const scope = maintenanceScope();
   try {
     const maintained = await scope.run(() =>
       f.captureOriginal("maintenance-owned", { mode: "maintenance-owner" }),
@@ -739,10 +724,8 @@ it("seals equivalent original bytes under isolated and maintenance-owned capture
       expect.objectContaining({ sourcePath: f.registryOnly, kind: "file", sqlite: true }),
     );
     expect(isolatedSizes).not.toHaveBeenCalled();
-    expect(await Promise.all(f.familyPaths.map((file) => fs.readFile(file)))).toEqual(f.family);
-    expect(await Promise.all(f.external.map((source) => fs.readFile(source)))).toEqual(
-      externalBytes,
-    );
+    expect(await readFiles(f.familyPaths)).toEqual(f.family);
+    expect(await readFiles(f.external)).toEqual(externalBytes);
   } finally {
     await scope.close();
   }
@@ -763,11 +746,7 @@ it.each(["large", "live-reads-admitted"] as const)(
     }
     const worker = vi.spyOn(inspection, "runUpdateStateInspectionWorker");
     const isolatedSizes = vi.spyOn(databaseSizes, "readUpdateStateDatabaseSizes");
-    const scope = createOpenClawDatabaseMaintenanceScope({
-      schemaMaintenance: true,
-      assertOwnerCurrent: () => {},
-      assertDatabaseAccess: () => {},
-    });
+    const scope = maintenanceScope();
     try {
       const captured = await scope.run(() => {
         if (mode === "live-reads-admitted") {
@@ -884,11 +863,7 @@ it.each(["-wal", "-journal"] as const)(
     const sidecar = `${f.missingDatabase}${suffix}`;
     const recoveryBytes = Buffer.from("retained database recovery bytes");
     await fs.writeFile(sidecar, recoveryBytes);
-    const scope = createOpenClawDatabaseMaintenanceScope({
-      schemaMaintenance: true,
-      assertOwnerCurrent: () => {},
-      assertDatabaseAccess: () => {},
-    });
+    const scope = maintenanceScope();
     const runId = `missing${suffix}`;
     try {
       await expect(
@@ -957,7 +932,7 @@ it("seals a verified manual image with its unavailable-generation warnings", asy
   const captured = await f.captureOriginal("unverified");
   await expectOriginalDatabase(captured.ref, f.shared);
   expect(captured.diagnostics.databaseWarnings).toEqual(expect.arrayContaining(producerWarnings));
-  expect(await Promise.all(f.familyPaths.map((file) => fs.readFile(file)))).toEqual(f.family);
+  expect(await readFiles(f.familyPaths)).toEqual(f.family);
 });
 
 it.each(["insufficient", "unknown"] as const)(
@@ -999,7 +974,7 @@ it.each(["insufficient", "unknown"] as const)(
         totalBytes: 2 * 1024 * 1024 * 1024,
       };
     });
-    const originals = await Promise.all([f.shared, ...f.external].map((file) => fs.readFile(file)));
+    const originals = await readFiles([f.shared, ...f.external]);
     if (capacity === "insufficient") {
       await expect(f.capture()).rejects.toThrow(`near ${externalDirectories[0]}`);
       expect(await fs.readdir(f.directory)).toEqual([]);
@@ -1033,8 +1008,6 @@ it.each(["insufficient", "unknown"] as const)(
         }
       }
     }
-    expect(await Promise.all([f.shared, ...f.external].map((file) => fs.readFile(file)))).toEqual(
-      originals,
-    );
+    expect(await readFiles([f.shared, ...f.external])).toEqual(originals);
   },
 );
