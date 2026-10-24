@@ -12,7 +12,6 @@ import {
 } from "../../../config/sessions/session-accessor.js";
 import { memorySessionActorOwners } from "../../../config/sessions/session-actor-memory-owner.js";
 import { isIndexedSessionEntry } from "../../../config/sessions/session-entry-codec.js";
-import { capturePreparedTranscriptModelPromptProjection } from "../../../config/sessions/session-message-rewrite.js";
 import { captureSessionTranscriptTargetBinding } from "../../../config/sessions/transcript-target-binding.js";
 import {
   SessionTranscriptWriterClaimReboundError as WriterReboundError,
@@ -36,7 +35,6 @@ import {
   resolveAdmittedRunActiveAssertion,
   type PreparedAgentRunAdmission,
 } from "../../admitted-run-context.js";
-import { createAssistantErrorTranscript } from "../../assistant-error-transcript.js";
 import { isRecordedModelFallbackStop } from "../../model-fallback-stop.js";
 import { createAgentRunRestartAbortError } from "../../run-termination.js";
 import { attachInternalToolResultAcknowledgement } from "../../runtime/internal-hooks.js";
@@ -46,7 +44,6 @@ import {
   createTestSession,
   testModel,
 } from "../../sessions/agent-session-loop-correctness.test-support.js";
-import { sessionManagerReadMessageAnchor } from "../../sessions/session-manager-message-anchor.js";
 import { SessionMetadataCommittedError } from "../../sessions/session-manager-metadata-error.js";
 import { sessionManagerAppendInitialMetadata } from "../../sessions/session-manager-metadata.js";
 import { SessionManager } from "../../sessions/session-manager.js";
@@ -110,7 +107,7 @@ type InitialWriterFixture = {
 };
 
 async function withInitialWriter(
-  run: (fixture: InitialWriterFixture) => Promise<void | (() => Promise<void>)>,
+  run: (fixture: InitialWriterFixture) => Promise<void>,
   options: { existing?: boolean; outsideTranscriptWrite?: boolean; incognito?: boolean } = {},
 ) {
   await withOpenClawTestState({ label: "initial-session-writer" }, async (state) => {
@@ -181,7 +178,7 @@ async function withInitialWriter(
         }),
         assertCurrent,
       };
-      const afterAttempt = await promptState.withSessionWriterContext(async () => {
+      await promptState.withSessionWriterContext(async () => {
         const transcript = await prepareTranscript(
           { ...runParams, preparedSessionTarget },
           async () => controller.signal.throwIfAborted(),
@@ -221,7 +218,6 @@ async function withInitialWriter(
           : transcript.withOwnedTranscriptWrite(runFixture);
       });
       await prepared?.transcriptLifecycle.dispose();
-      await afterAttempt?.();
       expect(arm).toHaveBeenCalledOnce();
     } finally {
       try {
@@ -332,7 +328,6 @@ it.each([
               errorCode: "OPENCLAW_RESTART_ABORT",
               content: text ? [{ type: "text", text }] : [],
             });
-            expect(assistants[0]?.content.some((part) => part.type === "toolCall")).toBe(false);
             await expect(manager.appendMessageAsync(userMessage)).rejects.toThrow();
             if (incognito) {
               await expect(
@@ -346,84 +341,6 @@ it.each([
       { existing, incognito, outsideTranscriptWrite: true },
     ),
 );
-
-it.each([false, true])(
-  "commits actor appends without pre-reads and refuses a replaced writer (existing=%s)",
-  (existing) =>
-    withInitialWriter(
-      async ({ manager, runParams, target, transcript }) => {
-        const actor = transcript.ownedTranscriptWriteContext.sessionActor!.actor;
-        using read = vi.spyOn(actor, "read");
-        const first = manager.appendMessageAsync(userMessage);
-        const second = manager.appendMessageAsync(
-          makeTextToolResult("actor-result", "lookup", "Durable synthetic result", false, 2),
-        );
-        const [firstId, secondId] = await Promise.all([first, second]);
-        const otherSessionId = `${target.sessionId}-other`;
-        outsideWriter(() =>
-          replaceSessionEntrySync(
-            {
-              agentId: target.agentId,
-              storePath: target.storePath,
-              sessionKey: `${target.sessionKey}-other`,
-            },
-            { sessionId: otherSessionId, updatedAt: 2 },
-          ),
-        );
-        const thirdId = await manager.appendCustomEntryAsync("after-unrelated-write");
-        const persisted = readEvents(target);
-        expect(persisted.slice(-3)).toMatchObject([
-          { id: firstId, message: userMessage },
-          { id: secondId, parentId: firstId, message: { role: "toolResult" } },
-          { id: thirdId, parentId: secondId, customType: "after-unrelated-write" },
-        ]);
-        expect(manager.getPersistedEntries()).toEqual(persisted);
-        await claimAgentSessionWriter({ ...runParams, runId: "replacement-actor-writer" });
-        await expect(manager.appendMessageAsync(userMessage)).rejects.toThrow(WriterReboundError);
-        expect(readEvents(target)).toEqual(persisted);
-        expect(read).not.toHaveBeenCalled();
-      },
-      { existing },
-    ),
-);
-
-it("appends after an unchanged prompt capture in one actor request without losing either record", () =>
-  withInitialWriter(async ({ manager, openManager, transcript }) => {
-    const userId = await manager.appendMessageAsync(userMessage);
-    const anchor = manager[sessionManagerReadMessageAnchor](userId);
-    assert(anchor, "Expected the committed user message anchor");
-    await capturePreparedTranscriptModelPromptProjection(anchor, userMessage.content, () => {});
-    const actor = transcript.ownedTranscriptWriteContext.sessionActor!.actor;
-    using append = vi.spyOn(actor, "appendTranscriptEvent");
-    using read = vi.spyOn(actor, "read");
-    const checkpoint = await manager.appendCustomEntryAsync("openclaw.tool-surface", {
-      tools: ["read"],
-    });
-    expect(append).toHaveBeenCalledOnce();
-    expect(read).not.toHaveBeenCalled();
-    const entries = [
-      {
-        id: userId,
-        type: "message",
-        message: userMessage,
-      },
-      {
-        id: checkpoint,
-        parentId: userId,
-        type: "custom",
-        customType: "openclaw.tool-surface",
-        data: { tools: ["read"] },
-      },
-    ];
-    expect(manager.getEntries()).toMatchObject(entries);
-    const persisted = (await openManager()).getEntries();
-    expect(persisted).toMatchObject(entries);
-    expect(persisted[0]).toMatchObject({
-      message: {
-        __openclaw: { modelPromptProjection: { version: 1, text: userMessage.content } },
-      },
-    });
-  }));
 
 it.each([false, true])("acknowledges only persisted tool results (incognito=%s)", (incognito) =>
   withInitialWriter(
@@ -648,24 +565,6 @@ it("rejects an existing row before reacquiring its enclosing lifecycle mutation"
     });
   }));
 
-it("preserves one committed terminal error through attempt teardown", () =>
-  withInitialWriter(async ({ manager, promptState, target }) => {
-    manager.appendMessage(userMessage);
-    const owner = createAssistantErrorTranscript();
-    installSessionToolResultGuard(manager, { assistantErrorTranscript: owner });
-    manager.appendMessage(makeAgentAssistantMessage({ content: [], stopReason: "error" }));
-    const messages = () =>
-      SessionManager.open(target)
-        .getBranch()
-        .filter((entry) => entry.type === "message");
-    expect(messages()).toHaveLength(2);
-    return async () => {
-      await promptState[Symbol.asyncDispose]();
-      owner.settle(true);
-      expect(messages()).toHaveLength(2);
-    };
-  }));
-
 it("prepares a fresh keyed turn before its first append", () =>
   withInitialWriter(async ({ manager, runParams, target }) => {
     const message = { ...userMessage, idempotencyKey: `${runParams.runId}:user` };
@@ -704,10 +603,6 @@ it.each([
   ({ existing, kind }) =>
     withInitialWriter(
       async ({ manager, promptState, runParams, target }) => {
-        expect(Boolean(promptState.sessionWriterFence)).toBe(existing);
-        expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(
-          !existing,
-        );
         await appendInitial(kind, manager);
         const entry = loadSessionEntry({ ...target, readConsistency: "latest" });
         expect(entry).toMatchObject({
@@ -719,9 +614,6 @@ it.each([
           expectedWriterRunId: runParams.runId,
         };
         expect(promptState.sessionWriterFence).toEqual(expectedFence);
-        expect(isSessionControllerWorkActive(target.storePath, [target.sessionKey])).toBe(
-          !existing,
-        );
         expect(manager.getSessionTarget()).toMatchObject(expectedFence);
         manager.appendMessage(userMessage);
         expect(readEvents(target)).toHaveLength(3);

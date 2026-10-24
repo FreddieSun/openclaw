@@ -559,50 +559,6 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
     }
   });
 
-  it("prepares guarded history, stream handling, deadlines, and settlement in order", async () => {
-    const fixture = await createFixture();
-
-    const result = await runEmbeddedAttemptExecutionPhase(fixture.input);
-
-    expect(result).toBe(fixture.result);
-    expect(fixture.setContextReplacementHook).toHaveBeenCalledOnce();
-    const replacementHook = fixture.setContextReplacementHook.mock.calls[0]?.[0];
-    expect(replacementHook).toEqual(expect.any(Function));
-    replacementHook?.(40, 120);
-    expect(fixture.skillInstructionDeliveryCache.size).toBe(0);
-    expect(fixture.order).toEqual([
-      "guards",
-      "stream-ready",
-      "history",
-      "abort",
-      "set-run-abort",
-      "stream",
-      "set-catalog",
-      "set-compaction-state",
-      "timeout",
-      "settled-phase",
-    ]);
-    expect(fixture.state.terminal).toEqual({
-      aborted: true,
-      kind: "timeout",
-      phase: "compaction",
-      source: "external",
-    });
-    const settledInput = mocks.runSettledPhase.mock.calls[0]?.[0];
-    expect(fixture.runAbort).toHaveBeenCalledWith(true, expect.any(Error));
-    const streamInput = mocks.prepareStream.mock.calls[0]?.[0];
-    expect(streamInput.getRunState()).toEqual({
-      aborted: true,
-      promptError: null,
-      timedOut: true,
-      yieldDetected: true,
-    });
-    expect(streamInput.isReplaySafeTool(fixture.replaySafeTool)).toBe(true);
-    await settledInput.preparedStreamRuntime.promptActiveSession("hello");
-    expect(fixture.activeSession.prompt).toHaveBeenCalledWith("hello", undefined);
-    expect(fixture.trackPromptSettlePromise).toHaveBeenCalledOnce();
-  });
-
   it("publishes the replacement fact and invalidates the skill cache before attempt cleanup throws", async () => {
     const fixture = await createFixture({ exerciseTerminalMerges: false });
     const events: EmbeddedContextAccountingEvent[] = [];

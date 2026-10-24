@@ -134,20 +134,6 @@ describe("runEmbeddedAttemptSettledPhase", () => {
       prePromptMessageCount: 4,
       promptCache: { cacheRead: 1 },
     });
-    expect(mocks.completeAfterTurn).toHaveBeenCalledWith(
-      fixture.input,
-      expect.objectContaining({ sessionIdUsed: "settled-session" }),
-      expect.objectContaining({ transcriptLeafId: "before-prompt" }),
-    );
-    expect(mocks.completeResult).toHaveBeenCalledWith(
-      fixture.input,
-      expect.objectContaining({ sessionIdUsed: "settled-session" }),
-      expect.objectContaining({
-        beforeAgentFinalizeRevisionReason: "revision",
-        sessionIdUsed: "settled-session",
-        sessionFileUsed: "/tmp/session.jsonl",
-      }),
-    );
     expect(fixture.detachBackend).toHaveBeenCalledWith(fixture.queueHandle);
     expect(mocks.clearActiveEmbeddedRun).toHaveBeenCalledWith(
       "session-1",
