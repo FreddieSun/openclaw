@@ -1,9 +1,11 @@
 // Synthetic turn-shaped dispatcher workload; run timing and allocation separately.
 import assert from "node:assert/strict";
-import { writeSync } from "node:fs";
+import { writeFileSync, writeSync } from "node:fs";
 import { Session, type HeapProfiler } from "node:inspector/promises";
+import path from "node:path";
 import { monitorEventLoopDelay, PerformanceObserver, type PerformanceEntry } from "node:perf_hooks";
 import { setImmediate as immediate, setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import {
   emitTrustedDiagnosticEvent,
@@ -12,9 +14,66 @@ import {
   waitForDiagnosticEventsDrained,
   type DiagnosticEventInput,
 } from "../../src/infra/diagnostic-events.js";
-import { registerDiagnosticTracePropagationBridge } from "../../src/infra/diagnostic-trace-propagation.js";
+import {
+  hasDiagnosticTracePropagationConsumer,
+  registerDiagnosticTracePropagationBridge,
+} from "../../src/infra/diagnostic-trace-propagation.js";
 import { GATEWAY_GC_TRACE_MARKER, readGatewayGcTrace } from "../lib/gateway-bench-profile.js";
 import { parseStrictIntegerOption } from "../lib/strict-integer-option.js";
+
+// Also usable as transcript-broadcast-measure's --entry for a counting-only pass.
+if (process.argv[2] === "gateway") {
+  const configPath = process.env.OPENCLAW_CONFIG_PATH;
+  assert(configPath, "Gateway counting requires the isolated harness config");
+  const output = path.join(path.dirname(configPath), "diagnostic-event-clone-counts.json");
+  const deliveries = new Map<string, number>();
+  const clones = new Map<string, number>();
+  let observerReady = false;
+  const clone = globalThis.structuredClone;
+  globalThis.structuredClone = (value, options) => {
+    const snapshot = clone(value, options);
+    if (
+      observerReady &&
+      value &&
+      typeof value === "object" &&
+      "type" in value &&
+      typeof value.type === "string" &&
+      "seq" in value &&
+      typeof value.seq === "number"
+    ) {
+      clones.set(value.type, (clones.get(value.type) ?? 0) + 1);
+    }
+    return snapshot;
+  };
+  const activation = setInterval(() => {
+    if (!hasDiagnosticTracePropagationConsumer()) {
+      return;
+    }
+    clearInterval(activation);
+    // Enable OTel metrics and traces in the fixture: its real filter accepts all events.
+    onTrustedInternalDiagnosticEvent(
+      (event) => deliveries.set(event.type, (deliveries.get(event.type) ?? 0) + 1),
+      undefined,
+      { includePrivateData: false },
+    );
+    observerReady = true;
+  }, 10);
+  activation.unref();
+  const save = () =>
+    writeFileSync(
+      output,
+      JSON.stringify({
+        observerReady,
+        deliveries: Object.fromEntries(deliveries),
+        clones: Object.fromEntries(clones),
+      }),
+    );
+  setInterval(save, 1_000).unref();
+  process.on("exit", save);
+  process.argv[1] = fileURLToPath(new URL("../../src/entry.ts", import.meta.url));
+  await import("../../src/entry.js");
+  process.exit(process.exitCode ?? 0);
+}
 
 const { values } = parseArgs({
   options: {
