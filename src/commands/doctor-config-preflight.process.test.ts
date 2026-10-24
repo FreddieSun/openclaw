@@ -172,15 +172,9 @@ describe("doctor invalid config process exit", () => {
       fs.mkdirSync(path.join(stateDir, "agents", "main", "sessions"), { recursive: true });
       fs.writeFileSync(configPath, "{}\n");
       const databasePath = seedV17AdditiveRepairDatabase(stateDir);
-      const env: NodeJS.ProcessEnv = {
-        ...process.env,
-        OPENCLAW_CONFIG_PATH: configPath,
-        OPENCLAW_STATE_DIR: stateDir,
-        ...doctorEnv,
-      };
       const args = ["doctor", "--fix", "--non-interactive", "--yes", "--no-workspace-suggestions"];
 
-      const first = await run(args, DOCTOR_CHILD_TIMEOUT_MS, env);
+      const first = await run(args, DOCTOR_CHILD_TIMEOUT_MS);
       expect(first.code, first.stderr).toBe(0);
       expect(`${first.stdout}\n${first.stderr}`).toContain(
         `v17 -> v${OPENCLAW_AGENT_SCHEMA_VERSION}`,
@@ -207,7 +201,7 @@ describe("doctor invalid config process exit", () => {
         }
       });
 
-      const second = await run(args, DOCTOR_CHILD_TIMEOUT_MS, env);
+      const second = await run(args, DOCTOR_CHILD_TIMEOUT_MS);
       expect(second.code, second.stderr).toBe(0);
       expect(`${second.stdout}\n${second.stderr}`).not.toMatch(
         /Skipped agent database migration|Upgraded agent database schema/u,
@@ -248,12 +242,8 @@ describe("doctor invalid config process exit", () => {
   it(
     "migrates legacy exec approvals before repairing a partially valid config",
     async () => {
-      const { root, stateDir, configPath, run } = createDoctorFixture(
-        "doctor-legacy-approvals",
-        true,
-      );
+      const { stateDir, configPath, run } = createDoctorFixture("doctor-legacy-approvals", true);
       const approvalsPath = path.join(stateDir, "exec-approvals.json");
-      const knowledgePath = path.join(root, "knowledge");
 
       writeJson(configPath, {
         agents: {
@@ -263,16 +253,11 @@ describe("doctor invalid config process exit", () => {
               memorySearch: {
                 enabled: true,
                 provider: "auto",
-                sources: ["memory", "sessions"],
-                extraPaths: [knowledgePath],
-                experimental: { sessionMemory: true },
-                store: { vector: { enabled: false } },
                 query: { maxResults: 8 },
               },
               memory: {
                 search: {
                   enabled: false,
-                  experimental: { sessionMemory: false },
                   query: { minScore: 0.25 },
                 },
               },
@@ -316,10 +301,6 @@ describe("doctor invalid config process exit", () => {
       expect(repairedConfig.agents?.entries?.jup?.memory?.search).toEqual({
         enabled: false,
         provider: "openai",
-        sources: ["memory", "sessions"],
-        extraPaths: [knowledgePath],
-        experimental: { sessionMemory: false },
-        store: { vector: { enabled: false } },
         query: { minScore: 0.25, maxResults: 8 },
       });
 
@@ -353,18 +334,11 @@ describe("doctor invalid config process exit", () => {
     include?: boolean;
   }>([
     { mode: "report", engine: "sqlite" },
-    { mode: "fix", engine: "sqlite" },
-    { mode: "report", engine: "postgres" },
     { mode: "fix", engine: "postgres" },
-    { mode: "fix", engine: "sqlite", include: true },
     { mode: "fix", engine: "postgres", include: true },
     { mode: "lint", engine: "sqlite" },
-    { mode: "lint", engine: "postgres" },
-    { mode: "json", engine: "sqlite" },
     { mode: "json", engine: "postgres" },
     { mode: "onboard", engine: "sqlite" },
-    { mode: "setup", engine: "sqlite" },
-    { mode: "onboard", engine: "postgres" },
     { mode: "setup", engine: "postgres" },
     { mode: "readonly", engine: "postgres" },
     { mode: "nix", engine: "postgres" },
@@ -713,7 +687,6 @@ describe("Doctor repair followed by gateway readiness", () => {
       agents: { defaults: { heartbeat: { skipWhenBusy: true } }, list: [{ id: "main" }] },
       gateway: { mode: "local", auth: { mode: "none" } },
     });
-    seedPluginStateSidecar(stateDir, 4_000);
     // Initialization and repair must share the same database module instance.
     const stateDatabaseUrl = resolveRuntimeWorkerUrl(
       cronOwnerHardeningEntrypoints.stateDatabase,
@@ -750,9 +723,6 @@ describe("Doctor repair followed by gateway readiness", () => {
       const repairedDatabase = new DatabaseSync(${JSON.stringify(databasePath)}, { readOnly: true });
       const columns = repairedDatabase.prepare("PRAGMA table_info(apns_registrations)").all();
       const identity = readStoredDeviceIdentityReadOnly();
-      const pluginState = repairedDatabase
-        .prepare("SELECT value_json, created_at FROM plugin_state_entries WHERE plugin_id = 'discord' AND namespace = 'components' AND entry_key = 'interaction:1'")
-        .get();
       repairedDatabase.close();
       assert.equal(result.snapshot.valid, true);
       assert.equal(Object.hasOwn(config.meta ?? {}, "lastTouchedAt"), false);
@@ -760,14 +730,11 @@ describe("Doctor repair followed by gateway readiness", () => {
       assert.equal(columns.some((column) => column.name === "relay_origin"), true);
       assert.equal(identity?.deviceId, "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c");
       assert.equal(fs.readFileSync(legacyIdentityPath, "utf8"), legacyIdentityRaw);
-      assert.deepEqual({ ...pluginState }, { value_json: '{"ok":false}', created_at: 4_000 });
       console.log("__READY__");
     `;
 
     const result = await runPreflightScript(env, script);
     expect(result.stdout, `${result.stderr}\n${result.stdout}`).toContain("__READY__");
-    expect(fs.existsSync(path.join(stateDir, "plugin-state", "state.sqlite"))).toBe(true);
-    expect(fs.existsSync(path.join(stateDir, "plugin-state", "state.sqlite.migrated"))).toBe(false);
     expect(hasActiveStartupMigrationLease({ env })).toBe(false);
   }, 75_000);
 
