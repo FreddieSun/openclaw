@@ -2,7 +2,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { DatabaseSync } from "node:sqlite";
-import { text } from "node:stream/consumers";
+import { text as readText } from "node:stream/consumers";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   clearEmbeddingProviders,
@@ -42,7 +42,7 @@ async function startEmbeddingServer(options?: {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        const rawBody = await text(req);
+        const rawBody = await readText(req);
         const body = JSON.parse(rawBody) as Record<string, unknown>;
         requests.push({
           method: req.method,
