@@ -226,6 +226,9 @@ describe("lobster pet element", () => {
     expect(element.querySelector(".lobster-pet__svg")).not.toBeNull();
     expect(spriteClasses(element)).toContain("lobster-pet--idle");
     expect(["top", "floor"]).toContain(element.getAttribute("data-spot"));
+    const palette = createLobsterPetLook(42, summer).palette.id;
+    expect(getLobsterdex().has(palette)).toBe(true);
+    expect(getLobsterdexEntries().get(palette)?.name).toBeTruthy();
   });
 
   it("a shy seed never visits on its own", async () => {
@@ -270,13 +273,6 @@ describe("lobster pet element", () => {
     const twins = await visitingPet(21);
     expect(twins.querySelectorAll(".lobster-pet:not(.lobster-pet--shell)")).toHaveLength(2);
     expect(twins.querySelector(".lobster-pet--twin")?.getAttribute("title")).toMatch(/ Jr\.$/);
-  });
-
-  it("records arrivals in the lobsterdex", async () => {
-    await visitingPet(42);
-    const look = createLobsterPetLook(42, summer);
-    expect(getLobsterdex().has(look.palette.id)).toBe(true);
-    expect(getLobsterdexEntries().get(look.palette.id)?.name).toBeTruthy();
   });
 
   it("anchors the dismiss menu at the raw pointer position and preserves outside focus", async () => {
@@ -341,6 +337,9 @@ describe("lobster pet element", () => {
     selectDismissal(element, "dismiss");
     await element.updateComplete;
     expect(document.activeElement).toBe(composer);
+    expect(
+      JSON.parse(localStorage.getItem("openclaw.control.lobsterpet.familiarity.v1") ?? "{}").shoos,
+    ).toBe(1);
 
     await expectPresenceAfter(element, false, 5_000);
 
@@ -402,17 +401,6 @@ describe("lobster pet element", () => {
     const element = await visitingPet(42);
     await tick(element, 600);
     expect(spriteClasses(element)).toContain("lobster-pet--act-wave");
-  });
-
-  it("shooing is remembered in the familiarity counters", async () => {
-    const element = await visitingPet(42);
-    await openDismissMenu(element, {}, ".lobster-pet:not(.lobster-pet--shell)");
-    selectDismissal(element, "dismiss");
-    await element.updateComplete;
-    const raw = JSON.parse(
-      localStorage.getItem("openclaw.control.lobsterpet.familiarity.v1") ?? "{}",
-    );
-    expect(raw.shoos).toBe(1);
   });
 
   it("cancels a pending pet when the pointer interaction is cancelled", async () => {
