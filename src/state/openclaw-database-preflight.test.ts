@@ -43,6 +43,7 @@ import {
 } from "./openclaw-state-db-additive-columns.js";
 import { repairAuditEventsSchema } from "./openclaw-state-db-audit-migration.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "./openclaw-state-db-contract.js";
+import { createDanglingSkillWorkshopReviewIndex } from "./openclaw-state-db-corruption.test-support.js";
 import { openDoctorStateSchemaReadAdmission } from "./openclaw-state-db-doctor-schema.js";
 import {
   withArtifactPreservingStateReads,
@@ -419,28 +420,7 @@ it("admits a dangling Workshop index only for Doctor without mutating the source
   const fixture = databaseFixture(tempDirs.make("openclaw-preflight-dangling-workshop-"));
   const statePath = fixture.state().path;
   closeOpenClawStateDatabaseForTest();
-  {
-    using database = openRawDatabase(statePath);
-    database.exec(
-      "CREATE TABLE IF NOT EXISTS skill_workshop_collection_reviews (review_id TEXT NOT NULL PRIMARY KEY, owner_agent_id TEXT NOT NULL, backup_id TEXT NOT NULL, create_time INTEGER NOT NULL, kept_names_json TEXT NOT NULL, written_names_json TEXT NOT NULL, dropped_json TEXT NOT NULL) STRICT; CREATE INDEX idx_skill_workshop_collection_reviews_workspace_time ON skill_workshop_collection_reviews(review_id, create_time DESC);",
-    );
-    database.enableDefensive?.(false);
-    database.exec("PRAGMA writable_schema = ON;");
-    database
-      .prepare(
-        `UPDATE sqlite_schema
-            SET sql = 'CREATE INDEX idx_skill_workshop_collection_reviews_workspace_time
-                         ON skill_workshop_collection_reviews(workspace_dir, create_time DESC, review_id DESC)'
-          WHERE type = 'index'
-            AND name = 'idx_skill_workshop_collection_reviews_workspace_time'`,
-      )
-      .run();
-    // SAFETY: PRAGMA schema_version always returns one numeric row for an open database.
-    const { schema_version } = database.prepare("PRAGMA schema_version").get() as {
-      schema_version: number;
-    };
-    database.exec(`PRAGMA writable_schema = OFF; PRAGMA schema_version = ${schema_version + 1};`);
-  }
+  createDanglingSkillWorkshopReviewIndex(statePath);
   const sourceDir = path.dirname(statePath);
   const snapshot = () =>
     fs
