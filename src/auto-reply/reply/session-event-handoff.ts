@@ -612,11 +612,6 @@ export function enqueueSessionEventForHost(
                   automation: options.scheduledAutomation,
                   runId,
                   deliveryEvidence,
-                  cfg,
-                  scope: preparedBinding
-                    ? { agentId, sessionKey, storePath, ...preparedBinding }
-                    : undefined,
-                  assertCurrent,
                   prepareCurrent,
                   outcome,
                 });

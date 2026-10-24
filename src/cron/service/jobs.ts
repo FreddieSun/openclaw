@@ -215,6 +215,7 @@ export function createJob(
   delete initialState.scheduleActivatedAtMs;
   delete initialState.runningScheduleChangeId;
   delete initialState.autoDisabled;
+  delete initialState.lastMeaningfulResult;
   delete initialState.sourceIdentity;
   delete initialState.streamSourceIdentity;
   assertCronJobStateTimestamps(initialState);
@@ -440,6 +441,7 @@ export function applyJobPatch(
     delete statePatch.scheduleActivatedAtMs;
     delete statePatch.runningScheduleChangeId;
     delete statePatch.autoDisabled;
+    delete statePatch.lastMeaningfulResult;
     delete statePatch.sourceIdentity;
     delete statePatch.streamSourceIdentity;
     assertCronJobStateTimestamps(statePatch);

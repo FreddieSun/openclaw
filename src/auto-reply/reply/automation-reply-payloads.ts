@@ -1,4 +1,5 @@
 import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
+import { hasPendingAutomationContinuation } from "../../cron/automation-result.js";
 import {
   isHostNoticePayload,
   isReplyPayloadTerminalContent,
@@ -28,10 +29,7 @@ export function resolveAutomationReplyState(
     !terminalFailurePayload;
   const authoredSilence =
     successfulTerminal && result.meta?.terminalReply?.disposition === "silent";
-  const pendingContinuation =
-    result.meta?.yielded === true ||
-    result.meta?.continuationPending === true ||
-    (result.meta?.pendingToolCalls?.length ?? 0) > 0;
+  const pendingContinuation = hasPendingAutomationContinuation(result.meta);
   const automationNoChange =
     successfulTerminal &&
     !pendingContinuation &&

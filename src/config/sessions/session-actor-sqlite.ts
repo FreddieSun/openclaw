@@ -11,12 +11,15 @@ import type {
 } from "../../infra/sqlite-worker-operation-admission.js";
 import type { RetainedWorkerTransactionAdmission } from "../../infra/sqlite-worker-operation-settlement.js";
 import { createSqliteWorkerTransferCollector } from "../../infra/sqlite-worker-transfer.js";
+import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import {
   parseConversationPublications,
   retainConversationWorkerPublication,
 } from "./session-accessor.sqlite-conversation-publication.js";
 import { publishRetainedSessionEntryChange } from "./session-accessor.sqlite-entry-cache-publication-state.js";
 import { projectSessionSharingEntry } from "./session-accessor.sqlite-entry-cache.types.js";
+import { retainSessionEntryWorkerPublication } from "./session-accessor.sqlite-entry-worker-publication.js";
+import { publishCommittedSessionIdentity } from "./session-accessor.sqlite-identity.js";
 import {
   captureSessionEntryMaintenanceAgeChange,
   publishSessionEntryMaintenanceAgeChanges,
@@ -332,6 +335,7 @@ export function createSqliteSessionActorExecutor(
                 result = committed;
                 try {
                   conversation?.settle(committed.receipt.conversationPublication);
+                  const metadata = committed.receipt.entryMetadata;
                   // Retained effect predicates must observe this commit before its callbacks.
                   if (target.database.kind === "file") {
                     const entry = committed.receipt.postimage.entry;
@@ -344,8 +348,8 @@ export function createSqliteSessionActorExecutor(
                       entry,
                       entry,
                     );
-                    if (entry) {
-                      // Actor delivery settlement can release the last durable recovery claim.
+                    if (entry && (previousEntry || !metadata?.length)) {
+                      // Metadata publication owns initial age facts; later settlement can release claims.
                       const change = captureSessionEntryMaintenanceAgeChange({
                         sessionKey: target.sessionKey,
                         entry,
@@ -356,6 +360,31 @@ export function createSqliteSessionActorExecutor(
                           change,
                         ]);
                       }
+                    }
+                  }
+                  if (target.database.kind === "file" && metadata?.length) {
+                    // Terminal accounting may change the row without appending a transcript event.
+                    const databaseIdentity = target.database.physicalIdentity;
+                    const agentId = resolveAgentIdFromSessionKey(target.sessionKey);
+                    const publication = retainSessionEntryWorkerPublication({
+                      agentId,
+                      storePath: target.database.nativeLocation,
+                      databaseIdentity,
+                    });
+                    publication.beginChanges(
+                      metadata.flatMap((entryReceipt) => [...entryReceipt.facts.keys()]),
+                    );
+                    try {
+                      publication.settleMetadata(metadata, [], (previous, current) =>
+                        publishCommittedSessionIdentity(
+                          agentId,
+                          databaseIdentity,
+                          previous,
+                          current,
+                        ),
+                      );
+                    } finally {
+                      publication.settle(undefined, false);
                     }
                   }
                   // Partial transcript publication precedes installation of the full actor replica.

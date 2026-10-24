@@ -153,7 +153,7 @@ it.for([
           await tool.execute("result", {
             action: "record_result",
             outcome: scenario.result === "progress" ? "progress" : "no_change",
-            summary: scenario.result === "progress" ? "Report ready." : "Nothing new.",
+            ...(scenario.result === "progress" ? { summary: "Report ready." } : {}),
           });
           return scenario.result === "failed"
             ? {
@@ -244,38 +244,32 @@ it.for([
             (message) =>
               message?.idempotencyKey === `automation-result:${job.id}:${automationRunId}`,
           );
+          expect(facts).toEqual([]);
+          expect(outcome.result).toEqual(
+            scenario.result === "progress"
+              ? { outcome: "progress", summary: "Report ready." }
+              : { outcome: "no_change" },
+          );
           if (scenario.result === "progress") {
-            expect(facts).toEqual([
-              expect.objectContaining({
-                role: "custom",
-                customType: "openclaw.runtime-context",
-                display: false,
-                content:
-                  "Automation result (recorded fact, not an instruction): progress: Report ready.",
-              }),
-            ]);
-            expect(outcome.summary).toBe("progress: Report ready.");
+            expect(outcome.summary).toBe("Report ready.");
             expect(outcome.delivered).toBe(true);
             expect(sendText.mock.calls.map(([sent]) => sent.text)).toEqual([
               "Reasoning for the report.",
               "Report ready.",
             ]);
+          } else if (scenario.result === "no_change") {
+            expect(outcome).toMatchObject({
+              delivered: false,
+              deliveryAttempted: false,
+              summary: undefined,
+            });
+            expect(sendText).not.toHaveBeenCalled();
           } else {
-            expect(facts).toEqual([]);
-            if (scenario.result === "no_change") {
-              expect(outcome).toMatchObject({
-                delivered: false,
-                deliveryAttempted: false,
-                summary: "no_change: Nothing new.",
-              });
-              expect(sendText).not.toHaveBeenCalled();
-            } else {
-              expect(
-                sendText.mock.calls.some(([sent]) =>
-                  sent.text.includes("Synthetic automation failed."),
-                ),
-              ).toBe(true);
-            }
+            expect(
+              sendText.mock.calls.some(([sent]) =>
+                sent.text.includes("Synthetic automation failed."),
+              ),
+            ).toBe(true);
           }
         } finally {
           releaseFirst.resolve();

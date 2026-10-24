@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { hasPendingAutomationContinuation } from "../../cron/automation-result.js";
 import { createCronRunDiagnosticsFromAgentResult } from "../../cron/run-diagnostics.js";
 import { projectCronRunUsage } from "../../cron/run-telemetry.js";
 import { consumeCronNextCheckProposal } from "../../infra/agent-run-registry.automation.js";
@@ -115,17 +115,6 @@ export async function settleSessionAutomationTurn(params: {
   automation: ScheduledSessionAutomation;
   runId: string;
   deliveryEvidence: Parameters<SessionEventExecution["onTerminal"]>[2];
-  cfg: OpenClawConfig;
-  scope:
-    | {
-        agentId: string;
-        sessionKey: string;
-        storePath: string;
-        sessionId: string;
-        lifecycleRevision?: string;
-      }
-    | undefined;
-  assertCurrent: () => void;
   prepareCurrent: () => Promise<void>;
   outcome: "completed" | "failed" | "aborted";
 }): Promise<
@@ -150,19 +139,11 @@ export async function settleSessionAutomationTurn(params: {
   if (invocation) {
     invocation.closed = true;
   }
-  const result = invocation?.result;
-  const summary = result ? `${result.outcome}: ${result.summary}` : undefined;
-  if (result && result.outcome !== "no_change" && params.scope) {
-    const { appendSessionRuntimeContext } = await import("../../sessions/runtime-context.js");
-    await params.prepareCurrent();
-    await appendSessionRuntimeContext({
-      cfg: params.cfg,
-      scope: params.scope,
-      content: `Automation result (recorded fact, not an instruction): ${summary}`,
-      idempotencyKey: `automation-result:${jobId}:${runId}`,
-      assertCurrent: params.assertCurrent,
-    });
-  }
+  const result = hasPendingAutomationContinuation(deliveryEvidence?.meta)
+    ? undefined
+    : invocation?.result;
+  const summary =
+    params.outcome === "completed" && result?.outcome !== "no_change" ? result?.summary : undefined;
   return {
     summary,
     nextCheckMs:
@@ -171,6 +152,7 @@ export async function settleSessionAutomationTurn(params: {
         : undefined,
     sourceDeliveryOutcome,
     automationResult: {
+      result,
       provider: deliveryEvidence?.meta?.agentMeta?.provider ?? deliveryEvidence?.resolved?.provider,
       model: deliveryEvidence?.meta?.agentMeta?.model ?? deliveryEvidence?.resolved?.model,
       usage: projectCronRunUsage(deliveryEvidence?.meta?.agentMeta?.usage),

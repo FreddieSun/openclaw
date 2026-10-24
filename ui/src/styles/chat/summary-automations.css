@@ -209,3 +209,39 @@ openclaw-chat-summary-automations button:disabled {
   opacity: 0.6;
   cursor: default;
 }
+
+.chat-summary__automation-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-summary__automation-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-automation-result {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  line-height: 16px;
+}
+
+.session-automation-result__summary {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+
+.session-automation-result__checked {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.session-automation-result__error {
+  color: var(--danger);
+}
