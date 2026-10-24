@@ -393,19 +393,22 @@ describe("web_fetch extraction fallbacks", () => {
     },
   );
 
-  it("falls back to a configured provider when readability returns no content", async () => {
-    installHtml(EMPTY_HTML);
+  it.each([200, 403])("uses the provider fallback after direct status %s", async (status) => {
+    installResponse(EMPTY_HTML, "text/html", status);
     mockProvider(async () => ({ extractor: "test-fetch", text: "provider content" }));
-
-    const { details } = await fetchPage("empty", {});
-    expect(details.extractor).toBe("test-fetch");
-    expect(details.text).toContain("provider content");
-    expect(extractReadableContentMock).toHaveBeenCalledWith({
-      html: EMPTY_HTML,
-      url: "https://example.com/empty",
-      extractMode: "markdown",
-      config: expect.any(Object),
+    const { details } = await fetchPage(`fallback-${status}`, {});
+    expect(details).toMatchObject({
+      extractor: "test-fetch",
+      text: expect.stringContaining("provider content"),
     });
+    if (status === 200) {
+      expect(extractReadableContentMock).toHaveBeenCalledWith({
+        html: EMPTY_HTML,
+        url: "https://example.com/fallback-200",
+        extractMode: "markdown",
+        config: expect.any(Object),
+      });
+    }
   });
 
   it("throws when readability is disabled and firecrawl is unavailable", async () => {
@@ -427,15 +430,6 @@ describe("web_fetch extraction fallbacks", () => {
     );
   });
 
-  it("uses the provider fallback when direct fetch fails", async () => {
-    installResponse("blocked", "text/html", 403);
-    mockProvider(async () => ({ extractor: "test-fetch", text: "provider fallback" }));
-
-    const { details } = await fetchPage("blocked", {});
-    expect(details.extractor).toBe("test-fetch");
-    expect(details.text).toContain("provider fallback");
-  });
-
   it("bounds oversized Readability titles alongside body content", async () => {
     const title = "Page title ".repeat(6_000);
     const body = "Useful page content.";
@@ -443,21 +437,7 @@ describe("web_fetch extraction fallbacks", () => {
     extractReadableContentMock.mockResolvedValue({ title, text: body, extractor: "readability" });
 
     const { result, details } = await fetchPage("title-budget", {}, { maxChars: 1_000 });
-    try {
-      expect(details.extractor).toBe("readability");
-      expect(details.text).toContain(body);
-      expect(details.title).toContain("Page title");
-      expect(details.title?.length).toBeLessThanOrEqual(400);
-      expect(details.text.length + (details.title?.length ?? 0)).toBeLessThanOrEqual(1_000);
-      expect(details.truncated).toBe(true);
-      expect(details.spill).toBeUndefined();
-      const serialized = result?.content.find((block) => block.type === "text");
-      expect(serialized?.text.length).toBeLessThan(2_000);
-    } finally {
-      if (details.spill) {
-        await rm(details.spill.path, { force: true });
-      }
-    }
+    await expectBoundedTitle(result, details, "readability", "Page title", body);
   });
 
   it("omits an empty HTML title", async () => {
@@ -492,15 +472,7 @@ describe("web_fetch extraction fallbacks", () => {
         maxChars: 1_000,
       });
       const details = result?.details as FetchDetails;
-      expect(details.extractor).toBe("raw-html");
-      expect(details.text).toContain("Live HTTP body.");
-      expect(details.title).toContain("title");
-      expect(details.spill).toBeUndefined();
-      const serialized = result?.content.find((block) => block.type === "text");
-      expect(serialized?.text.length).toBeLessThan(2_000);
-      expect(details.title?.length).toBeLessThanOrEqual(400);
-      expect(details.text.length + (details.title?.length ?? 0)).toBeLessThanOrEqual(1_000);
-      expect(details.truncated).toBe(true);
+      await expectBoundedTitle(result, details, "raw-html", "title", "Live HTTP body.");
     } finally {
       await closeHttpServer(server);
     }
@@ -564,6 +536,28 @@ describe("web_fetch extraction fallbacks", () => {
     );
   });
 });
+
+async function expectBoundedTitle(
+  result: Awaited<ReturnType<typeof fetchPage>>["result"],
+  details: FetchDetails,
+  extractor: string,
+  title: string,
+  body: string,
+) {
+  try {
+    expect(details).toMatchObject({ extractor, truncated: true });
+    expect(details.text).toContain(body);
+    expect(details.title).toContain(title);
+    expect(details.title?.length).toBeLessThanOrEqual(400);
+    expect(details.text.length + (details.title?.length ?? 0)).toBeLessThanOrEqual(1_000);
+    expect(details.spill).toBeUndefined();
+    expect(result?.content.find((block) => block.type === "text")?.text.length).toBeLessThan(2_000);
+  } finally {
+    if (details.spill) {
+      await rm(details.spill.path, { force: true });
+    }
+  }
+}
 
 const setResponse = (body: string, contentType = "text/markdown; charset=utf-8") =>
   installResponse(body, contentType);
@@ -941,68 +935,42 @@ describe("web_fetch SSRF protection", () => {
 
   const domainPolicy = { hostnameAllowlist: ["example.com", "*.example.com"] };
   const privateError = /private|internal|blocked/i;
-  it.each([
-    { name: "localhost", url: "http://localhost/test", error: /Blocked hostname/i, noDns: true },
-    { name: "IPv4 loopback", url: "http://127.0.0.1/test", error: privateError, noDns: true },
-    {
-      name: "mapped loopback",
-      url: "http://[::ffff:127.0.0.1]/",
-      error: privateError,
-      noDns: true,
-    },
-    {
-      name: "private DNS answer",
-      url: "https://private.test/resource",
-      address: "10.0.0.5",
-      error: privateError,
-    },
-    {
-      name: "private redirect",
-      url: "https://example.com",
-      redirect: "http://127.0.0.1/secret",
-      error: privateError,
-    },
-    {
-      name: "domain policy",
-      url: "https://www.nytimes.com/",
-      options: domainPolicy,
-      error: /domain policy: blocked hostname.*example\.com.*Try a URL on a permitted domain/i,
-      noDns: true,
-    },
-    {
-      name: "trusted proxy",
-      url: "http://localhost/test",
-      options: { useTrustedEnvProxy: true, cacheTtlMinutes: 1 },
-      error: /Blocked hostname/i,
-      noDns: true,
-      proxy: true,
-    },
-  ] satisfies Array<{
-    name: string;
-    url: string;
-    error: RegExp;
-    noDns?: boolean;
-    address?: string;
-    redirect?: string;
-    proxy?: boolean;
-    options?: Parameters<typeof createWebFetchToolForTest>[0];
-  }>)("blocks $name before a forbidden request", async (test) => {
-    if (test.address) {
-      lookupMock.mockResolvedValue([{ address: test.address, family: 4 }]);
-    }
-    if (test.proxy) {
+  const domainError =
+    /domain policy: blocked hostname.*example\.com.*Try a URL on a permitted domain/i;
+  it.each<[string, RegExp, Parameters<typeof createWebFetchToolForTest>[0]?]>([
+    ["http://localhost/test", /Blocked hostname/i],
+    ["http://127.0.0.1/test", privateError],
+    ["http://[::ffff:127.0.0.1]/", privateError],
+    ["https://www.nytimes.com/", domainError, domainPolicy],
+    [
+      "http://localhost/test",
+      /Blocked hostname/i,
+      { useTrustedEnvProxy: true, cacheTtlMinutes: 1 },
+    ],
+  ])("blocks %s before DNS or fetch with policy %j", async (url, error, options) => {
+    if (options?.useTrustedEnvProxy) {
       vi.stubEnv("HTTP_PROXY", "http://127.0.0.1:7890");
       vi.stubEnv("http_proxy", "http://127.0.0.1:7890");
     }
     const fetchSpy = setMockFetch();
-    if (test.redirect) {
-      fetchSpy.mockResolvedValueOnce(redirectResponse(test.redirect));
+    await expectBlockedUrl(createWebFetchToolForTest(options), url, error);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(lookupMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("blocks private addresses after redirect=%s", async (redirect) => {
+    const fetchSpy = setMockFetch();
+    if (redirect) {
+      fetchSpy.mockResolvedValueOnce(redirectResponse("http://127.0.0.1/secret"));
+    } else {
+      lookupMock.mockResolvedValue([{ address: "10.0.0.5", family: 4 }]);
     }
-    await expectBlockedUrl(createWebFetchToolForTest(test.options), test.url, test.error);
-    expect(fetchSpy).toHaveBeenCalledTimes(test.redirect ? 1 : 0);
-    if (test.noDns) {
-      expect(lookupMock).not.toHaveBeenCalled();
-    }
+    await expectBlockedUrl(
+      createWebFetchToolForTest(),
+      redirect ? "https://example.com" : "https://private.test/resource",
+      privateError,
+    );
+    expect(fetchSpy).toHaveBeenCalledTimes(redirect ? 1 : 0);
   });
 
   it.each([
@@ -1027,11 +995,7 @@ describe("web_fetch SSRF protection", () => {
       cacheTtlMinutes: 1,
     });
 
-    await expectBlockedUrl(
-      restricted,
-      url,
-      /domain policy: blocked hostname.*example\.com.*Try a URL on a permitted domain/i,
-    );
+    await expectBlockedUrl(restricted, url, domainError);
     expect(fetchSpy).toHaveBeenCalledOnce();
   });
 
