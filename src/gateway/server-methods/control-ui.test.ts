@@ -8,7 +8,10 @@ import {
 } from "../../config/runtime-snapshot.js";
 import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../../config/types.js";
-import { setActiveDegradedSecretOwners } from "../../secrets/runtime-degraded-state.js";
+import {
+  SecretSurfaceUnavailableError,
+  setActiveDegradedSecretOwners,
+} from "../../secrets/runtime-degraded-state.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import * as checkDetails from "../control-ui-session-pr-check-details.js";
@@ -109,17 +112,74 @@ describe("controlUi.githubPreview", () => {
     vi.unstubAllEnvs();
   });
 
-  it("rejects invalid detail sections before upstream access", async () => {
-    const fetch = vi.fn<typeof globalThis.fetch>();
-    vi.stubGlobal("fetch", fetch);
+  it("returns a progressive detail overview without loading optional endpoints", async () => {
+    const cfg = configuredGitHub("progressive-service-token");
+    setRuntimeConfigSnapshot(cfg);
+    const revision = "a".repeat(40);
+    const optional = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async (input) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (path.endsWith("/pulls/7")) {
+          return json(
+            issueFields("Early body", {
+              body: "Available before CI",
+              comments: 1,
+              review_comments: 1,
+              changed_files: 1,
+              head: { sha: revision },
+            }),
+          );
+        }
+        if (path.endsWith("/progressive-adapter")) {
+          return Response.json({ id: 771, private: false, visibility: "public" });
+        }
+        optional();
+        return new Response(null, { status: 503 });
+      }),
+    );
     const { respond, send } = fixture("githubDetail");
-    await send({ kind: "issue", owner: "octocat", repo: "repo", number: 1, section: "invalid" });
-    expectError(respond, {
-      code: "INVALID_REQUEST",
-      message: "invalid controlUi.githubDetail params",
-    });
-    expect(fetch).not.toHaveBeenCalled();
+    await send(
+      {
+        kind: "pull",
+        owner: "octocat",
+        repo: "progressive-adapter",
+        number: 7,
+        section: "overview",
+      },
+      runtime(() => cfg),
+    );
+    expectReply(
+      respond,
+      expect.objectContaining({
+        title: "Early body",
+        body: "Available before CI",
+        revision,
+        deferredSections: ["checks", "files", "discussion"],
+        partial: false,
+      }),
+    );
+    expect(optional).not.toHaveBeenCalled();
+    for (const field of ["checks", "comments", "files"]) {
+      expect(respond.mock.calls[0]?.[1]).not.toHaveProperty(field);
+    }
   });
+
+  it.each(["invalid", null, 1])(
+    "rejects invalid detail section %j before upstream access",
+    async (section) => {
+      const fetch = vi.fn<typeof globalThis.fetch>();
+      vi.stubGlobal("fetch", fetch);
+      const { respond, send } = fixture("githubDetail");
+      await send({ kind: "issue", owner: "octocat", repo: "repo", number: 1, section });
+      expectError(respond, {
+        code: "INVALID_REQUEST",
+        message: "invalid controlUi.githubDetail params",
+      });
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(["revoked", "copied", "aborted", "aborted-after-preparation"] as const)(
     "rejects %s requests before GitHub",
@@ -154,49 +214,86 @@ describe("controlUi.githubPreview", () => {
     },
   );
 
-  it.each(["service", "anonymous"])("reads with the %s fallback", async (mode) => {
-    const method = mode === "service" ? "githubDetail" : "githubPreview";
+  it.each([
+    { mode: "managed", method: "controlUi.githubPreview" },
+    { mode: "managed", method: "controlUi.githubDetail" },
+    { mode: "service", method: "controlUi.githubDetail" },
+    { mode: "anonymous", method: "controlUi.githubPreview" },
+  ])("reads $method as $mode", async ({ mode, method }) => {
     vi.stubEnv("GH_TOKEN", mode === "service" ? "different-ambient-token" : "");
     vi.stubEnv("GITHUB_TOKEN", "");
-    const prepare = vi
-      .spyOn(githubIdentity, "prepareGitHubReadIdentity")
-      .mockRejectedValue(new githubIdentity.GitHubIdentityError("rate_limited"));
+    const assertSelected = vi.fn();
+    const identity = {
+      token: "selected-agent-github-token",
+      selection: {
+        source: "agent-override" as const,
+        profileId: `ghp_${"a".repeat(32)}`,
+        accountId: 101,
+      },
+      cacheScope: "selected-agent-preview",
+      assertSelected,
+      revalidate: vi.fn().mockResolvedValue(undefined),
+      start: async <T>(start: () => T): Promise<Awaited<T>> => {
+        assertSelected();
+        return await start();
+      },
+    };
+    const prepare = vi.spyOn(githubIdentity, "prepareGitHubReadIdentity");
+    if (mode === "managed") {
+      prepare.mockResolvedValue(identity);
+    } else {
+      prepare.mockRejectedValue(new githubIdentity.GitHubIdentityError("rate_limited"));
+    }
     const cfg: OpenClawConfig =
       mode === "anonymous"
         ? { agents: { entries: { main: {} } } }
-        : configuredGitHub("configured-reader-token");
+        : configuredGitHub(
+            mode === "managed" ? "old-preview-service-token" : "configured-reader-token",
+          );
+    if (mode === "managed") {
+      cfg.agents = {
+        entries: {
+          main: {},
+          alternate: { tools: { github: { profileId: identity.selection.profileId } } },
+        },
+      };
+    }
     if (mode !== "anonymous") {
       setRuntimeConfigSnapshot(cfg);
     }
-    const title = "Public metadata without a login";
+    const title =
+      mode === "managed" ? "Use the selected GitHub identity" : "Public metadata without a login";
     const anonymousResponse = json(issueFields(title));
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input, init) => {
       if (mode === "anonymous") {
         return anonymousResponse;
       }
       expect(new Headers(init?.headers).get("Authorization")).toBe(
-        "Bearer configured-reader-token",
+        `Bearer ${mode === "managed" ? identity.token : "configured-reader-token"}`,
       );
       const url = input instanceof Request ? input.url : input.toString();
+      const issue = mode === "managed" ? url.endsWith("/issues/88120") : url.includes("/issues/");
       return json(
-        url.includes("/issues/")
-          ? issueFields("Authenticated reader", {
-              body: "Reader body",
+        issue
+          ? issueFields(mode === "service" ? "Authenticated reader" : title, {
+              ...(mode === "managed"
+                ? { repository_url: "https://api.github.com/repos/openclaw/openclaw" }
+                : {}),
+              body: mode === "managed" ? "Authenticated reader body" : "Reader body",
               comments: 0,
             })
-          : { id: 124, private: false, visibility: "public" },
+          : { id: mode === "managed" ? 123 : 124, private: false, visibility: "public" },
       );
     });
     vi.stubGlobal("fetch", fetchMock);
-    const { respond, send } = fixture(method);
+    const { respond, send } = fixture(method.replace("controlUi.", ""));
     await send(
       {
         kind: "issue",
-        number: mode === "service" ? 1 : 88121,
+        number: mode === "managed" ? 88120 : mode === "service" ? 1 : 88121,
         owner: mode === "service" ? "octocat" : "openclaw",
         repo: mode === "service" ? "reader-auth" : "openclaw",
-        agentId: "main",
-        ...(mode === "service" ? { section: "overview" } : {}),
+        agentId: mode === "managed" ? "alternate" : "main",
       },
       runtime(() => cfg),
     );
@@ -204,13 +301,6 @@ describe("controlUi.githubPreview", () => {
       respond,
       expect.objectContaining(mode === "service" ? { body: "Reader body" } : { title }),
     );
-    if (mode === "service") {
-      expectReply(
-        respond,
-        expect.objectContaining({ deferredSections: ["discussion"], partial: false }),
-      );
-      expect(respond.mock.calls[0]?.[1]).not.toHaveProperty("comments");
-    }
     if (mode === "anonymous") {
       expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).has("Authorization")).toBe(false);
       expect(prepare).not.toHaveBeenCalled();
@@ -218,11 +308,19 @@ describe("controlUi.githubPreview", () => {
       expect(
         fetchMock.mock.calls.every(
           ([, options]) =>
-            new Headers(options?.headers).get("Authorization") === "Bearer configured-reader-token",
+            new Headers(options?.headers).get("Authorization") ===
+            `Bearer ${mode === "managed" ? identity.token : "configured-reader-token"}`,
         ),
       ).toBe(true);
+      if (mode === "managed") {
+        expect(prepare).toHaveBeenCalledWith(
+          expect.objectContaining({ agentId: "alternate", config: cfg }),
+        );
+        expect(identity.revalidate).toHaveBeenCalled();
+      } else {
+        expect(prepare).not.toHaveBeenCalled();
+      }
     }
-    expect(prepare).not.toHaveBeenCalled();
   });
 
   it.each(["controlUi.githubPreview", "controlUi.githubDetail"])(
@@ -263,7 +361,7 @@ describe("controlUi.githubPreview", () => {
   it("revalidates cached preview credentials", async () => {
     const cfg = configuredGitHub("configured-preview-token");
     setRuntimeConfigSnapshot(cfg);
-    mockGitHubFetch(
+    const fetchMock = mockGitHubFetch(
       issueFields("Cached preview", {
         repository_url: "https://api.github.com/repos/openclaw/configured-degraded",
       }),
@@ -293,6 +391,7 @@ describe("controlUi.githubPreview", () => {
       message: previewUnavailable,
       retryable: false,
     });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it.each(["agent", "system"])(
@@ -335,7 +434,14 @@ describe("controlUi.githubPreview", () => {
     { name: "malformed owner", owner: "openclaw/evil", refresh: undefined, valid: false },
   ])("validates $name", async ({ owner, refresh, valid }) => {
     const target = githubTarget(99817, "openclaw", owner);
-    const preview = { ...target, title: "Refreshed preview" };
+    const preview = {
+      ...target,
+      login: "octocat",
+      state: "open",
+      title: "Refreshed preview",
+      createdAt: "2026-09-01T08:00:00Z",
+      updatedAt: "2026-09-01T09:00:00Z",
+    };
     const loadPreview = vi.spyOn(gitHubPublicApi, "loadControlUiGitHubPreview");
     if (owner === "openclaw") {
       loadPreview.mockResolvedValue(preview);
@@ -361,20 +467,29 @@ describe("controlUi.githubPreview", () => {
   });
 
   it.each([
-    {
-      failure: "managed identity unavailable",
+    ...(["unavailable", "unverified", "rate_limited"] as const).map((reason) => ({
+      failure: `managed identity ${reason}`,
       managed: true,
-      error: new githubIdentity.GitHubIdentityError("unavailable"),
+      error: new githubIdentity.GitHubIdentityError(reason),
       message:
-        "The selected GitHub credential is unavailable; reconnect the agent's GitHub identity in Settings.",
+        reason === "unavailable"
+          ? "The selected GitHub credential is unavailable; reconnect the agent's GitHub identity in Settings."
+          : new githubIdentity.GitHubIdentityError(reason).message,
       retryable: false,
-    },
+    })),
     {
       failure: "GitHub quota",
       managed: false,
       error: new gitHubPublicApi.ControlUiGitHubError(429, "rate limited"),
       message: "GitHub API rate limit exceeded (HTTP 429). Wait and retry.",
       retryable: true,
+    },
+    {
+      failure: "configured-unavailable preview credential",
+      managed: false,
+      error: new SecretSurfaceUnavailableError(degradedPreview),
+      message: previewUnavailable,
+      retryable: false,
     },
   ])("preserves the $failure diagnostic", async ({ managed, error, message, retryable }) => {
     const loadPreview = vi.spyOn(gitHubPublicApi, "loadControlUiGitHubPreview");
@@ -585,15 +700,22 @@ describe("controlUi.sessionPullRequests.checks", () => {
       });
       const deferred = createDeferred<typeof result>();
       const started = createDeferred();
-      vi.spyOn(checkDetails, "loadControlUiSessionPullRequestChecks").mockImplementation(
-        async () => {
+      const load = vi
+        .spyOn(checkDetails, "loadControlUiSessionPullRequestChecks")
+        .mockImplementation(async () => {
           started.resolve();
           return deferred.promise;
-        },
-      );
+        });
       const { respond, send } = fixture("sessionPullRequests.checks");
       const request = send(params);
       await started.promise;
+      expect(load).toHaveBeenCalledWith(
+        expect.objectContaining({ ...params, agentId: "main" }),
+        expect.objectContaining({
+          assertCurrent: expect.any(Function),
+          sessionScope: expect.stringContaining("ci-generation-one"),
+        }),
+      );
       await replaceSessionEntry(session, {
         sessionId: "ci-generation-two",
         updatedAt: 2,

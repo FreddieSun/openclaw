@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
 import { waitForSignalExitBarriers } from "../cli/signal-exit-barrier.js";
+import { UpdateFinalizationLifecycle } from "../cli/update-cli/update-finalization-lifecycle.js";
 import { GatewayServiceStopUnsafeError } from "../daemon/service-inspection-error.js";
 import { resolveGatewayService } from "../daemon/service.js";
 import { collectNestedErrorCandidates } from "../infra/error-graph-internal.js";
@@ -13,13 +14,18 @@ import { DoctorUnreadableStateDatabaseError } from "../infra/state-repair-messag
 import * as updateState from "../infra/update-candidate-state.js";
 import {
   collectUpdateDoctorFailureFacts,
+  consumeUpdatePostInstallDoctorResult,
+  createUpdatePostInstallDoctorResultPath,
   DoctorMaintenanceRefusalError,
   UpdateDoctorError,
+  writeUpdatePostInstallDoctorResult,
 } from "../infra/update-doctor-result.js";
+import { projectPublicUpdateFailureIdentifiers } from "../infra/update-failure-public-identifiers.js";
 import { readUpdatePhysicalDatabaseGenerations } from "../infra/update-physical-database-generations.js";
 import { redactPublicSupportDiagnosticLine } from "../logging/diagnostic-support-redaction.js";
 import { hasCommandProcessCleanupError } from "../process/exec-result.js";
 import { withCommandProcessScope } from "../process/exec-spawn.js";
+import { defaultRuntime } from "../runtime.js";
 import * as databaseBackup from "../snapshot/database-backup.js";
 import { OpenClawAgentDatabaseLeaseActiveError } from "../state/openclaw-agent-db-lease.js";
 import { beginDoctorMaintenance } from "./doctor-maintenance.js";
@@ -89,16 +95,6 @@ function executeEvidence(pathname: string, sql: string) {
   db.close();
 }
 
-function evidenceDatabase(label: string) {
-  fingerprintReads();
-  const pathname = path.join(tempDirs.make(label), "agent.sqlite");
-  executeEvidence(
-    pathname,
-    "CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)",
-  );
-  return pathname;
-}
-
 function fingerprintReads() {
   // These SQLite fixtures exercise generation settlement without native engine inspection.
   vi.spyOn(databaseBackup, "readBackupEngine").mockReturnValue({ engine: "sqlite" });
@@ -146,8 +142,13 @@ async function settleCleanup(
 }
 
 it("refuses rollback attribution for writes preceding Doctor admission", async () => {
-  const pathname = evidenceDatabase("doctor-write-receipt-");
+  fingerprintReads();
+  const pathname = path.join(settlement.tempDirs.make("doctor-write-receipt-"), "agent.sqlite");
   const missing = `${pathname}.missing`;
+  executeEvidence(
+    pathname,
+    "CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)",
+  );
   const databaseGenerations = await readUpdatePhysicalDatabaseGenerations([pathname, missing]);
   executeEvidence(pathname, "INSERT INTO evidence VALUES (99)");
   const admitted = await readUpdatePhysicalDatabaseGenerations([pathname, missing]);
@@ -170,7 +171,12 @@ it("refuses rollback attribution for writes preceding Doctor admission", async (
 });
 
 it("refuses automatic restore after a NOCOW physical replacement during Doctor maintenance", async () => {
-  const pathname = evidenceDatabase("doctor-nocow-receipt-");
+  fingerprintReads();
+  const pathname = path.join(settlement.tempDirs.make("doctor-nocow-receipt-"), "agent.sqlite");
+  executeEvidence(
+    pathname,
+    "CREATE TABLE evidence(value INTEGER); INSERT INTO evidence VALUES (1)",
+  );
   const generations = await readUpdatePhysicalDatabaseGenerations([pathname]);
   const rewrite = vi.spyOn(nocow, "repairDoctorSqliteNoCow").mockImplementation(async () => {
     expect(boundary.close).toHaveBeenCalled();
@@ -259,25 +265,23 @@ it.each([
   },
 );
 
-it.each([false, true])(
-  "reports settled state-release failure (managed Gateway: %s)",
-  async (managed) => {
-    const failure = new Error("settled state release failed");
-    if (managed) {
-      boundary.release.mockRejectedValueOnce(failure);
-    }
-    const maintenance = managed ? await begin() : await beginWithGenerations();
-    if (!managed) {
-      boundary.release.mockRejectedValueOnce(failure);
-    }
-    await expect(maintenance!.finish(managed ? {} : undefined)).rejects.toBe(failure);
-    expectCalls(1, "close");
-    expectCalls(managed ? 1 : 0, "restart");
-    if (managed) {
-      expectCalls(1, "resume", "health");
-    }
-  },
-);
+it("restores the stopped Gateway before reporting a settled state-owner release failure", async () => {
+  const failure = new Error("settled state-owner release failed");
+  boundary.release.mockRejectedValueOnce(failure);
+  const maintenance = await begin();
+
+  await expect(maintenance!.finish({})).rejects.toBe(failure);
+  expectCalls(1, "close", "resume", "restart", "health");
+});
+
+it("reports a settled state-release failure without a managed Gateway", async () => {
+  const failure = new Error("settled state release failed");
+  const maintenance = await beginWithGenerations();
+  boundary.release.mockRejectedValueOnce(failure);
+  await expect(maintenance!.finish(undefined)).rejects.toBe(failure);
+  expectCalls(1, "close");
+  expectCalls(0, "restart");
+});
 
 it.each(["persistent", "transient"] as const)(
   "settles %s resource close failure before restoration",
@@ -480,6 +484,66 @@ it.each([
   },
 );
 
+it("waits for the stopped Gateway to release lifecycle ownership", async () => {
+  let elapsed = 0;
+  let ticks = 0;
+  let loaded = true;
+  vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+  boundary.owner.mockReturnValue({ state: "live", mode: "supervised" });
+  const acquire = boundary.gatewayAcquire.getMockImplementation()!;
+  boundary.gatewayAcquire.mockImplementation(() => {
+    if (ticks < 3) {
+      throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
+    }
+    return acquire();
+  });
+  boundary.sleep.mockImplementation(async (ms: number) => {
+    expect(loaded).toBe(false);
+    expect(boundary.restart).not.toHaveBeenCalled();
+    elapsed += ms;
+    ticks++;
+  });
+  afterStop(() => {
+    loaded = false;
+  });
+  boundary.restart.mockImplementation(async () => {
+    loaded = true;
+  });
+
+  const maintenance = await begin();
+  expect(ticks).toBe(3);
+  expect(boundary.restart).not.toHaveBeenCalled();
+  await maintenance!.finish({});
+  expect(loaded).toBe(true);
+  expect(boundary.restart).toHaveBeenCalledOnce();
+});
+
+it("restores a service after state ownership fails without retaining a partial maintenance scope", async () => {
+  boundary.owner.mockReturnValue({ state: "live", mode: "supervised" });
+  let heldLeases = 0;
+  const acquire = boundary.gatewayAcquire.getMockImplementation()!;
+  boundary.gatewayAcquire
+    .mockImplementation(() => {
+      heldLeases++;
+      return {
+        ...acquire(),
+        release: () => {
+          heldLeases--;
+        },
+      };
+    })
+    .mockImplementationOnce(() => {
+      throw new GatewayStateOwnerContentionError("/synthetic/doctor-state/state/openclaw.sqlite");
+    });
+  boundary.ownerAssert.mockImplementation(() => {
+    throw new Error("state ownership changed before repair");
+  });
+  await expect(begin()).rejects.toThrow(/state ownership changed before repair/);
+  expect(boundary.restart).toHaveBeenCalledOnce();
+  expect(heldLeases).toBe(0);
+  expect(boundary.sleep).not.toHaveBeenCalled();
+});
+
 it.each(["acquired", "native-revoked", "install-drift"] as const)(
   "refuses changed repair admission and compensates under original service custody (%s)",
   async (phase) => {
@@ -622,6 +686,36 @@ const leaseFact = { check: "doctor", code: leaseCode, message: leaseGuidance };
 const privateCause =
   "private-lease-class /synthetic/private-state/private.db token=fixture-only-token alice@example.invalid";
 
+it("refuses an external active agent lease before serving-Gateway coordinator contention", async () => {
+  boundary.external.mockReturnValue(true);
+  boundary.readLeases.mockReturnValue([
+    {
+      agent_id: "private-agent",
+      lease_id: "private-lease",
+      owner_pid: 4242,
+      owner_start_time: 123,
+      opened_at: 1,
+      provenance: null,
+      path: "/synthetic/private-state/private.db",
+    },
+  ]);
+  boundary.gatewayAcquire.mockImplementation(() => {
+    throw new Error("another OpenClaw process owns gateway-lifecycle");
+  });
+  const refusal: unknown = await begin().catch((error: unknown) => error);
+  expect(refusal).toBeInstanceOf(UpdateDoctorError);
+  expect(refusal).toMatchObject({ message: leaseGuidance });
+  const facts = collectUpdateDoctorFailureFacts(refusal);
+  expect(facts).toEqual([leaseFact]);
+  expect(await projectPublicUpdateFailureIdentifiers(facts[0]!)).toEqual({
+    check: "doctor",
+    code: leaseCode,
+  });
+  expect(JSON.stringify(facts)).not.toContain("private");
+  expectCalls(1, "readLeases");
+  expectCalls(0, "gatewayAcquire", "ownerAssert", "lease", "stop", "restart", "close", "release");
+});
+
 it("does not use an empty external lease observation to bypass coordinator contention", async () => {
   boundary.external.mockReturnValue(true);
   const contention = new Error("another OpenClaw process owns gateway-lifecycle");
@@ -697,20 +791,70 @@ it.each(["unknown", "unreadable"] as const)(
   },
 );
 
-it("publishes a typed lease refusal after releasing state and restoring service", async () => {
+it("carries an actual typed lease refusal through Doctor IPC, finalization and public projection", async () => {
   const cause = new OpenClawAgentDatabaseLeaseActiveError(privateCause);
   fail("lease", cause);
   const refusal: unknown = await begin().catch((error: unknown) => error);
   expect(refusal).toBeInstanceOf(UpdateDoctorError);
   expect(refusal).toMatchObject({ cause, message: leaseGuidance });
-  const facts = collectUpdateDoctorFailureFacts(refusal);
-  expect(facts).toEqual([leaseFact]);
-  expect(JSON.stringify(facts)).not.toContain(privateCause);
   expectCalls(0, "readLeases");
-  expectCalls(1, "close", "release", "resume", "complete", "restart");
+  expectCalls(1, "close", "release");
   expectOrder("close", "release");
+  expectCalls(1, "resume", "complete", "restart");
   expectOrder("release", "resume");
   expectOrder("complete", "restart");
+
+  const facts = collectUpdateDoctorFailureFacts(refusal);
+  expect(facts).toEqual([leaseFact]);
+  vi.stubEnv("OPENCLAW_TMP_DIR", tempDirs.make("openclaw-typed-refusal-"));
+  const resultPath = createUpdatePostInstallDoctorResultPath();
+  await writeUpdatePostInstallDoctorResult({
+    resultPath,
+    result: { status: "error", failureFacts: facts },
+  });
+  const result = await consumeUpdatePostInstallDoctorResult(resultPath);
+  expect(result).toEqual({ status: "error", failureFacts: facts });
+  if (!result?.failureFacts) {
+    throw new Error("Missing Doctor refusal result");
+  }
+  // Model the existing parent conversion after reading the child's error result.
+  const parentError = new UpdateDoctorError(leaseGuidance, result.failureFacts, { exitCode: 1 });
+  vi.spyOn(defaultRuntime, "error").mockImplementation(() => {});
+  const lifecycle = new UpdateFinalizationLifecycle(false, 5_000, () => {});
+  lifecycle.attachLedger();
+  await expect(
+    lifecycle.run("doctor", async () => {
+      throw parentError;
+    }),
+  ).rejects.toBe(parentError);
+  lifecycle.fail();
+  expect(boundary.finish).toHaveBeenCalledWith(
+    "typed-refusal-run",
+    { status: "failed" },
+    expect.anything(),
+  );
+  const failed = boundary.step.mock.calls
+    .map((call) => call[1])
+    .find((step) => step.status === "failed");
+  expect(failed).toMatchObject({
+    step: "finalize:doctor",
+    reason: leaseCode,
+    exitCode: 1,
+    failureFacts: facts,
+  });
+  const fact = failed?.failureFacts?.[0];
+  if (!fact?.message) {
+    throw new Error("Finalization lost the refusal fact");
+  }
+  const publicFact = {
+    ...(await projectPublicUpdateFailureIdentifiers(fact)),
+    message: redactPublicSupportDiagnosticLine(fact.message, {
+      env: {},
+      stateDir: "/synthetic/private-state",
+    }),
+  };
+  expect(publicFact).toEqual(leaseFact);
+  expect(JSON.stringify({ result, failed, publicFact })).not.toContain(privateCause);
 });
 
 it("retains the typed refusal and restoration failure in the aggregate", async () => {

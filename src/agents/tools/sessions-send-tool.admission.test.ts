@@ -22,6 +22,7 @@ import {
 } from "../../gateway/server-plugin-in-process-dispatch.test-support.js";
 import { readSessionSendDeliveryAdmission } from "../../gateway/session-send-delivery.js";
 import { drainSystemEvents, peekSystemEvents } from "../../infra/system-events.js";
+import { createSessionVisibilityChecker } from "../../plugin-sdk/session-visibility.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import {
   getPluginRuntimeGatewayRequestScope,
@@ -79,10 +80,6 @@ const targetIdentity = {
   sessionId: "target-session",
 };
 const runId = "sessions-send-admission-run";
-const acceptedRun = { runId, status: "accepted" };
-const queuedNotification = { status: "queued", durability: "process", runStarted: false };
-const pendingDelivery = { status: "accepted", delivery: { status: "pending" } };
-const terminalReply = { disposition: "visible", text: "Task complete" } as const;
 const config = {
   agents: { ownership: "explicit", entries: { main: {} } },
   session: { mainKey: "main", scope: "per-sender" },
@@ -96,17 +93,15 @@ function unexpectedRequest(request: GatewayRequest): never {
 function mockGateway(
   handle: (request: GatewayRequest) => Promise<unknown> = async (request) =>
     unexpectedRequest(request),
-  list: boolean | Record<string, unknown> = false,
-  key = targetSessionKey,
+  list = false,
 ) {
-  const session = { key, agentId: "main" };
   return vi.fn().mockImplementation((request: GatewayRequest) => {
     if (request.method === "sessions.resolve") {
-      return Promise.resolve(session);
+      return Promise.resolve({ key: targetSessionKey, agentId: "main" });
     }
     if (list && request.method === "sessions.list") {
       return Promise.resolve({
-        sessions: [{ ...session, ...(list === true ? { kind: "direct" } : list) }],
+        sessions: [{ key: targetSessionKey, agentId: "main", kind: "direct" }],
       });
     }
     return handle(request);
@@ -127,17 +122,6 @@ function operatorFixture(name: string) {
     () => true,
   );
   return { context, owner, source };
-}
-function callerContext(
-  context: ReturnType<typeof createContext>,
-  sessionKey = requesterSessionKey,
-) {
-  return {
-    agentId: "main",
-    sessionKey,
-    gatewayContextResolver: () => context,
-    receiptAuthority: () => true,
-  };
 }
 function createTool(options: Parameters<typeof createSessionsSendTool>[0] = {}) {
   return createSessionsSendTool({
@@ -228,7 +212,7 @@ async function completeRun(request: GatewayRequest, sessionKey: string, sessionI
       },
     },
   );
-  return { status: "ok", terminalReply };
+  return { status: "ok", terminalReply: { disposition: "visible", text: "Task complete" } };
 }
 
 async function trackActualReplyFlow() {
@@ -268,57 +252,115 @@ describe("sessions_send dispatch admission", () => {
     await state.cleanup();
   });
 
-  it.each([false, true])(
-    "keeps aged parent notification rights unless explicitly incarnation-bound (%s)",
-    async (bound) => {
+  it("applies peer preferences to new notifications without revoking accepted events", async () => {
+    const callGateway = vi.fn();
+    callGateway.mockResolvedValue({ key: targetSessionKey, agentId: "main" });
+    const tool = createTool({ callGateway });
+    const first = await tool.execute("notify-peer", {
+      sessionKey: targetSessionKey,
+      message: "accepted notice",
+      mode: "notify",
+    });
+    expect(first.details).toMatchObject({
+      status: "queued",
+      durability: "process",
+      runStarted: false,
+    });
+    await putSession(targetSessionKey, {
+      sessionId: "target-session",
+      updatedAt: 2,
+      communication: { receive: "never" },
+    });
+    expect(peekSystemEvents(targetSessionKey)).toHaveLength(1);
+    const second = await tool.execute("notify-denied", {
+      sessionKey: targetSessionKey,
+      message: "unaccepted notice",
+      mode: "notify",
+    });
+    expect(second.details).toMatchObject({ status: "forbidden" });
+    const consumed = drainSystemEvents(targetSessionKey);
+    expect(consumed).toHaveLength(1);
+    expect(consumed[0]).toContain("accepted notice");
+    expect(consumed[0]).not.toContain("unaccepted notice");
+    expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { right: "parent", ageMinutes: 0 },
+    { right: "parent", ageMinutes: 31 },
+    { right: "controller", ageMinutes: 31 },
+    { right: "scoped", ageMinutes: 31 },
+    { right: "bound-parent", ageMinutes: 31 },
+  ] as const)(
+    "keeps $right notification rights for a $ageMinutes-minute child",
+    async ({ right, ageMinutes }) => {
       const parent = "agent:main:dashboard:notify-parent";
       const child = "agent:main:subagent:notify-child";
+      const owner =
+        right === "parent" || right === "bound-parent"
+          ? parent
+          : "agent:main:dashboard:other-parent";
       const sessionId = "notify-child-incarnation";
       const cfg: OpenClawConfig = { ...config, tools: { sessions: { visibility: "tree" } } };
       setRuntimeConfigSnapshot(cfg);
       await putSession(parent, { sessionId: "notify-parent", updatedAt: Date.now() });
-      const endedAt = Date.now() - 31 * 60_000;
       await putSession(child, {
         sessionId,
-        updatedAt: endedAt,
-        endedAt,
+        updatedAt: Date.now() - ageMinutes * 60_000,
+        endedAt: Date.now() - ageMinutes * 60_000,
         status: "done",
-        parentSessionKey: parent,
-        spawnedBy: parent,
+        parentSessionKey: owner,
+        spawnedBy: owner,
         spawnDepth: 1,
       });
-      const callGateway = mockGateway(
-        async (request) => {
-          if (request.method === "sessions.describe") {
-            return {
-              session: {
-                key: child,
-                agentId: "main",
-                sessionId,
-                parentSessionKey: parent,
-                spawnedBy: parent,
-                childOwnerSessionKeys: [parent],
-              },
-            };
-          }
-          return unexpectedRequest(request);
-        },
-        false,
-        child,
-      );
+      const callGateway = vi.fn();
+      callGateway.mockImplementation(async (request: GatewayRequest) => {
+        if (request.method === "sessions.resolve") {
+          return { key: child, agentId: "main" };
+        }
+        if (request.method === "sessions.describe") {
+          return {
+            session: {
+              key: child,
+              agentId: "main",
+              sessionId,
+              parentSessionKey: owner,
+              spawnedBy: owner,
+              childOwnerSessionKeys: [right === "controller" ? parent : owner],
+              ...(right === "controller" ? { controlOwnerSessionKey: parent } : {}),
+            },
+          };
+        }
+        return unexpectedRequest(request);
+      });
       const tool = createTool({
         config: cfg,
         agentSessionKey: parent,
         callGateway,
-        ...(bound ? { expectedTargetSessionId: sessionId } : {}),
+        ...(right === "bound-parent" ? { expectedTargetSessionId: sessionId } : {}),
       });
-      const result = await tool.execute("notify-lineage", {
-        sessionKey: child,
-        message: "retained child context",
-        mode: "notify",
-      });
-      if (!bound) {
-        expect(result.details).toMatchObject(queuedNotification);
+      using _ = {
+        [Symbol.dispose]: createSessionVisibilityChecker.registerScopedAccessProvider((request) =>
+          right === "scoped" &&
+          request.requesterSessionKey === parent &&
+          request.targetSessionKey === child
+            ? { expectedSessionId: sessionId }
+            : undefined,
+        ),
+      };
+      const send = () =>
+        tool.execute("notify-lineage", {
+          sessionKey: child,
+          message: "retained child context",
+          mode: "notify",
+        });
+      const result = await send();
+      if (right === "parent") {
+        expect(result.details).toMatchObject({
+          status: "queued",
+          durability: "process",
+          runStarted: false,
+        });
         expect(drainSystemEvents(child)).toEqual([
           expect.stringContaining("retained child context"),
         ]);
@@ -331,7 +373,7 @@ describe("sessions_send dispatch admission", () => {
         });
         expect(peekSystemEvents(child)).toEqual([]);
       }
-      expect(requestParams(callGateway, "agent")).toEqual([]);
+      expect(callGateway.mock.calls.some(([request]) => request.method === "agent")).toBe(false);
       expect(registerWatch).not.toHaveBeenCalled();
     },
   );
@@ -351,7 +393,7 @@ describe("sessions_send dispatch admission", () => {
         request.assertDispatchCurrent?.();
         request.sessionMutationCommitGuard?.();
         admitted = true;
-        return acceptedRun;
+        return { runId, status: "accepted" };
       });
       const result = await execute(
         createTool({ config: currentConfig, callGateway }),
@@ -469,13 +511,16 @@ describe("sessions_send dispatch admission", () => {
     const restoreGateway = interceptGateway(mockGateway(undefined, true));
     const pending = (async () => {
       await awaitGateBeforeSettlement(nativeReady.promise, native, "Native owner was not prepared");
-      return inOperatorScope(context, owner, source, () =>
+      return await inOperatorScope(context, owner, source, () =>
         withGatewayToolCallerIdentity(
           {
-            ...callerContext(context),
+            agentId: "main",
+            sessionKey: requesterSessionKey,
             requesterOrigin,
             operatorAuthority:
               getPluginRuntimeGatewayRequestScope()?.client?.internal?.operatorRunAuthority,
+            gatewayContextResolver: () => context,
+            receiptAuthority: () => true,
           },
           () => execute(createTool(), "steer-physical-owner", { mode: "steer" }),
         ),
@@ -532,11 +577,15 @@ describe("sessions_send dispatch admission", () => {
         source: { sessionKey: requesterSessionKey, sessionId: "requester-session" },
         target: { sessionKey: targetSessionKey, sessionId: "target-session" },
       });
-      return acceptedRun;
+      return { runId, status: "accepted" };
     });
     try {
       const result = await withGatewayToolCallerIdentity(
-        { ...callerContext(context), ...caller },
+        {
+          ...caller,
+          gatewayContextResolver: () => context,
+          receiptAuthority: () => true,
+        },
         () => execute(createTool({ callGateway }), "durable-steer-fallback", { mode: "steer" }),
       );
       expect(result.details).toMatchObject({ status: "accepted", targetDisposition: "queued" });
@@ -585,11 +634,11 @@ describe("sessions_send dispatch admission", () => {
         await completion.settle(runId, {
           status: "ok",
           replyText: "Task complete",
-          terminalReply,
+          terminalReply: { disposition: "visible", text: "Task complete" },
         });
         completion.finishExecution(runId);
       }
-      return acceptedRun;
+      return { runId, status: "accepted" };
     }, true);
     try {
       const pending = inOperatorScope(context, owner, source, async () => {
@@ -600,8 +649,11 @@ describe("sessions_send dispatch admission", () => {
         try {
           return await withGatewayToolCallerIdentity(
             {
-              ...callerContext(context, sourceKey),
+              agentId: "main",
+              sessionKey: sourceKey,
               personalToolParticipants: participants,
+              gatewayContextResolver: () => context,
+              receiptAuthority: () => true,
             },
             () => {
               invocationStarted = true;
@@ -624,7 +676,10 @@ describe("sessions_send dispatch admission", () => {
       expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
       allowCapture.resolve();
       const result = await pending;
-      expect(result.details).toMatchObject(pendingDelivery);
+      expect(result.details).toMatchObject({
+        status: "accepted",
+        delivery: { status: "pending" },
+      });
       expect(runSessionsSendA2AFlow).toHaveBeenCalledOnce();
       expect(runSessionsSendA2AFlow).toHaveBeenCalledWith(
         expect.objectContaining({ requesterSessionKey: sourceKey, targetSessionKey }),
@@ -670,35 +725,43 @@ describe("sessions_send dispatch admission", () => {
       await putSession(targetKey, { sessionId: targetId, updatedAt: 1, spawnedBy: sourceKey });
     }
     let completion: Record<string, unknown> | undefined;
-    const callGateway = mockGateway(
-      async (request) => {
-        switch (request.method) {
-          case "agent.wait":
-            return completeRun(request, targetKey, targetId);
-          case "agent":
-            if (!isRecord(request.params)) {
-              throw new Error("Expected agent request parameters");
-            }
-            if (request.params.sessionKey === targetKey) {
-              await putSession(sourceKey, {
-                ...entry,
-                updatedAt: 2,
-                delivery: normalizeSessionDeliveryState({ context: laterRoute }),
-              });
-              return { runId };
-            }
-            completion = request.params;
-            return { runId: "completion-run" };
-          case "send":
-            if (self) {
-              return { messageId: "final-reply" };
-            }
-        }
-        return unexpectedRequest(request);
-      },
-      self ? { deliveryContext: laterRoute } : true,
-      targetKey,
-    );
+    const callGateway = vi.fn().mockImplementation(async (request: GatewayRequest) => {
+      switch (request.method) {
+        case "sessions.resolve":
+          return { key: targetKey, agentId: "main" };
+        case "sessions.list":
+          return {
+            sessions: [
+              {
+                key: targetKey,
+                agentId: "main",
+                ...(self ? { deliveryContext: laterRoute } : { kind: "direct" }),
+              },
+            ],
+          };
+        case "agent.wait":
+          return completeRun(request, targetKey, targetId);
+        case "agent":
+          if (!isRecord(request.params)) {
+            throw new Error("Expected agent request parameters");
+          }
+          if (request.params.sessionKey === targetKey) {
+            await putSession(sourceKey, {
+              ...entry,
+              updatedAt: 2,
+              delivery: normalizeSessionDeliveryState({ context: laterRoute }),
+            });
+            return { runId };
+          }
+          completion = request.params;
+          return { runId: "completion-run" };
+        case "send":
+          if (self) {
+            return { messageId: "final-reply" };
+          }
+      }
+      return unexpectedRequest(request);
+    });
     const restoreGateway = interceptGateway(callGateway);
     // Cross-session routing has a transport fixture, not a native custody receipt.
     const prepareFollowup = self
@@ -724,7 +787,7 @@ describe("sessions_send dispatch admission", () => {
       const result = await execute(tool!, self ? "self-followup" : "send-routed-task", {
         sessionKey: targetKey,
       });
-      expect(result.details).toMatchObject(pendingDelivery);
+      expect(result.details).toMatchObject({ status: "accepted", delivery: { status: "pending" } });
       await settled.promise;
       if (!self) {
         expect(completion).toMatchObject({
@@ -737,6 +800,18 @@ describe("sessions_send dispatch admission", () => {
           sourceReplyDeliveryMode: "message_tool_only",
         });
       } else {
+        expect.soft(requestParams(callGateway, "agent")).toEqual([
+          expect.objectContaining({
+            ...originalRoute,
+            sessionKey: sourceKey,
+            deliver: false,
+            sourceReplyDeliveryMode: "message_tool_only",
+            inputProvenance: expect.objectContaining({
+              kind: "inter_session",
+              sourceSessionKey: sourceKey,
+            }),
+          }),
+        ]);
         expect
           .soft(requestParams(callGateway, "send"))
           .toEqual([expect.objectContaining({ ...originalRoute, message: "Task complete" })]);

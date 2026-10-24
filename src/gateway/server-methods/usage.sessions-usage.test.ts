@@ -96,20 +96,6 @@ function discoveredRows(prefix: string, count: number, newestFirst = false) {
     mtime: newestFirst ? count - index : index + 1,
   }));
 }
-function setStoredSessions(
-  store: Record<string, SessionEntry>,
-  agentId = "main",
-  storePath?: string,
-) {
-  projectionFixture = createUsageSessionStoreFixture(
-    store,
-    Object.keys(store).map((key) => [key, agentId] as const),
-    storePath ? () => storePath : undefined,
-  );
-}
-function expectUsageLoad(params: Record<string, unknown>) {
-  expect(summaryLoader).toHaveBeenCalledWith(expect.objectContaining(params));
-}
 function runSessionsUsageMethod(
   method: "sessions.usage" | "sessions.usage.timeseries" | "sessions.usage.logs",
   params: Record<string, unknown>,
@@ -123,11 +109,6 @@ function runSessionsUsageMethod(
 }
 const runSessionsUsage = (params: Record<string, unknown>) =>
   runSessionsUsageMethod("sessions.usage", params);
-const settleUsage = (signal: AbortSignal, respond: ReturnType<typeof vi.fn>) =>
-  runSessionsUsageMethod("sessions.usage", BASE_USAGE_RANGE, { signal, respond }).then(
-    () => undefined,
-    (error: unknown) => error,
-  );
 function readResult(respond: ReturnType<typeof vi.fn>): SessionsUsageResult {
   const [ok, payload] = usageReply(respond);
   expect(ok).toBe(true);
@@ -182,7 +163,13 @@ it.each(["client cancellation", "time budget"] as const)(
       await release.promise;
       return tokenBatch(1);
     });
-    const pending = settleUsage(controller.signal, respond);
+    const pending = runSessionsUsageMethod("sessions.usage", BASE_USAGE_RANGE, {
+      signal: controller.signal,
+      respond,
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
     try {
       const signal = expectDefined(await started.promise, "request-owned usage work signal");
       expect(signal.aborted).toBe(false);
@@ -325,11 +312,23 @@ it("keeps an identical cold usage request alive when the first client disconnect
       signal.removeEventListener("abort", abort);
     }
   });
-  const first = settleUsage(firstClient.signal, firstRespond);
+  const first = runSessionsUsageMethod("sessions.usage", BASE_USAGE_RANGE, {
+    signal: firstClient.signal,
+    respond: firstRespond,
+  }).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
   let second: Promise<unknown> | undefined;
   try {
     const firstSignal = await withinTest(firstStarted.promise, testSignal);
-    second = settleUsage(secondClient.signal, secondRespond);
+    second = runSessionsUsageMethod("sessions.usage", BASE_USAGE_RANGE, {
+      signal: secondClient.signal,
+      respond: secondRespond,
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
     firstClient.abort(new Error("first usage client disconnected"));
     expect(await withinTest(first, testSignal)).toBe(firstSignal.reason);
     expect(firstSignal.aborted).toBe(true);
@@ -450,7 +449,11 @@ it("applies the usage size budget to the selected creator", async () => {
     };
     const storePath = state.statePath("agents", "main", "agent", "openclaw-agent.sqlite");
     replaceSessionEntrySync({ agentId: "main", sessionKey: key, storePath }, entry);
-    setStoredSessions({ [key]: entry }, "main", storePath);
+    projectionFixture = createUsageSessionStoreFixture(
+      { [key]: entry },
+      [[key, "main"]],
+      () => storePath,
+    );
     discovery.mockResolvedValueOnce([...unrelated, selected]);
     summaryLoader.mockImplementationOnce(async ({ sessions }) => tokenBatch(sessions.length, 7));
     const result = await readSessionsUsage({ creatorKey: '["system",null]', limit: 1 });
@@ -478,7 +481,11 @@ it.each(["available", "time budget"])(
           mtime: index + 1,
         };
       });
-      setStoredSessions(store, "main", storePath);
+      projectionFixture = createUsageSessionStoreFixture(
+        store,
+        Object.keys(store).map((key) => [key, "main"] as const),
+        () => storePath,
+      );
       discovery.mockResolvedValueOnce(discovered);
       const projection = createSessionRowProjectionFixture({
         cfg: TEST_RUNTIME_CONFIG,
@@ -572,8 +579,18 @@ it.each([
     await withEnvAsync({ TZ: "America/New_York" }, async () => {
       expect(new Date("2026-03-08T05:00:00Z").getTimezoneOffset()).toBe(300);
       expect(new Date("2026-03-09T04:00:00Z").getTimezoneOffset()).toBe(240);
-      const response = await readSessionsUsage({ ...params, startDate: date, endDate: date });
-      expectUsageLoad({ startMs: Date.parse(start), endMs: Date.parse(end) - 1, dayBucket });
+      const response = await readSessionsUsage({
+        ...params,
+        startDate: date,
+        endDate: date,
+      });
+      expect(loadSessionCostSummariesFromCache).toHaveBeenCalledWith(
+        expect.objectContaining({
+          startMs: Date.parse(start),
+          endMs: Date.parse(end) - 1,
+          dayBucket,
+        }),
+      );
       expect(response).toMatchObject({ startDate: date, endDate: date });
     });
   },
@@ -584,23 +601,31 @@ it("does not resolve specific usage keys through out-of-scope sessionId matches"
     const sessionFile = path.join(state.sessionsDir("opus"), "shared.jsonl");
     fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
     fs.writeFileSync(sessionFile, "");
-    setStoredSessions({
-      "agent:main:shared": {
-        sessionId: "shared",
-        sessionFile: "shared.jsonl",
-        label: "Main shared",
-        updatedAt: 999,
+    projectionFixture = createUsageSessionStoreFixture(
+      {
+        "agent:main:shared": {
+          sessionId: "shared",
+          sessionFile: "shared.jsonl",
+          label: "Main shared",
+          updatedAt: 999,
+        },
       },
-    });
+      [["agent:main:shared", "main"]],
+    );
     expect((await readSessionsUsage({ key: "shared", agentId: "opus" })).sessions).toMatchObject([
       { key: "agent:opus:shared", agentId: "opus" },
     ]);
-    expectUsageLoad({
-      agentId: "opus",
-      sessions: expect.arrayContaining([
-        expect.objectContaining({ sessionFile: fs.realpathSync(sessionFile), sessionId: "shared" }),
-      ]),
-    });
+    expect(loadSessionCostSummariesFromCache).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: "opus",
+        sessions: expect.arrayContaining([
+          expect.objectContaining({
+            sessionFile: fs.realpathSync(sessionFile),
+            sessionId: "shared",
+          }),
+        ]),
+      }),
+    );
     for (const method of ["sessions.usage.timeseries", "sessions.usage.logs"] as const) {
       const respond = await runSessionsUsageMethod(method, { key: "shared", agentId: "opus" });
       expect(respond.mock.calls[0]?.[0]).toBe(true);
@@ -625,20 +650,6 @@ it("rolls up known session family ids when historical usage is requested", async
     uniqueTools: rows.length,
     tools: rows.map(([name, count]) => ({ name, count })),
   });
-  const daily = (date: string, tokens: number, cost: number, missingCostEntries: number) => ({
-    ...usageTotals(tokens, cost),
-    date,
-    tokens,
-    cost,
-    missingCostEntries,
-    missingCostByModel: { "fixture/unpriced": missingCostEntries },
-  });
-  const readFamily = () =>
-    readSessionsUsage({ key: storeKey, groupBy: "family", includeHistorical: true });
-  const models = [
-    { provider: "fixture", model: "bedrock::arn" },
-    { provider: "fixture::bedrock", model: "arn" },
-  ];
 
   const oldSessionFile = "/tmp/old.jsonl.reset.2026-02-01T00-00-00.000Z";
   const oldestSessionFile = "/tmp/oldest.jsonl.reset.2026-01-31T00-00-00.000Z";
@@ -653,7 +664,7 @@ it("rolls up known session family ids when historical usage is requested", async
     { sessionId: "oldest", sessionFile: oldestSessionFile, mtime: 900 },
   ]);
 
-  setStoredSessions({ [storeKey]: entry }, "opus");
+  projectionFixture = createUsageSessionStoreFixture({ [storeKey]: entry }, [[storeKey, "opus"]]);
   summaryLoader.mockImplementation(async ({ sessions }) => {
     const summaries = sessions.map((session) => {
       const historical = session.sessionId === "old";
@@ -661,7 +672,8 @@ it("rolls up known session family ids when historical usage is requested", async
       const totalTokens = oldest ? 30 : historical ? 10 : 20;
       const totalCost = oldest ? 0.03 : historical ? 0.02 : 0.01;
       const date = oldest ? "2026-02-02" : "2026-02-01";
-      const modelIndex = historical ? 1 : 0;
+      const provider = historical ? "fixture::bedrock" : "fixture";
+      const model = historical ? "arn" : "bedrock::arn";
       const messageCounts = {
         total: 1,
         user: 1,
@@ -676,18 +688,40 @@ it("rolls up known session family ids when historical usage is requested", async
           ? { count: 2, avgMs: 25, p95Ms: 30, minMs: 20, maxMs: 30 }
           : { count: 1, avgMs: 10, p95Ms: 10, minMs: 10, maxMs: 10 };
       const totals = usageTotals(totalTokens, totalCost);
+      const daily = {
+        ...totals,
+        date,
+        tokens: totalTokens,
+        cost: totalCost,
+        missingCostEntries: 1,
+        missingCostByModel: { "fixture/unpriced": 1 },
+      };
       const summary: SessionCostSummary = {
         ...totals,
         activityDates: [date],
-        dailyBreakdown: [daily(date, totalTokens, totalCost, 1)],
+        dailyBreakdown: [daily],
         messageCounts,
+        dailyMessageCounts: [{ date, ...messageCounts }],
+        utcQuarterHourMessageCounts: [{ date, quarterIndex: 2, ...messageCounts }],
+        utcQuarterHourTokenUsage: [{ date, quarterIndex: 2, ...totals }],
         latency,
-        modelUsage: [{ ...models[modelIndex], count: 1, totals }],
+        dailyLatency: [{ date, ...latency }],
+        modelUsage: [{ provider, model, count: 1, totals }],
         toolUsage: oldest
           ? tools(["z-first", 1])
           : historical
             ? tools(["a-second", 2])
             : tools(["z-first", 2], ["a-second", 1]),
+        dailyModelUsage: [
+          {
+            date,
+            provider: provider.replace("::", ":"),
+            model: model.replace("::", ":"),
+            tokens: totalTokens,
+            cost: totalCost,
+            count: 1,
+          },
+        ],
       };
       sources.push(summary);
       sourceSnapshots.push(structuredClone(summary));
@@ -696,8 +730,20 @@ it("rolls up known session family ids when historical usage is requested", async
     return freshUsageBatch(summaries);
   });
 
-  const result = await readFamily();
+  const result = await readSessionsUsage({
+    key: storeKey,
+    groupBy: "family",
+    includeHistorical: true,
+  });
 
+  const models = [
+    { provider: "fixture", model: "bedrock::arn" },
+    { provider: "fixture::bedrock", model: "arn" },
+  ];
+  const dailyModels = [
+    { provider: "fixture", model: "bedrock:arn" },
+    { provider: "fixture:bedrock", model: "arn" },
+  ];
   expect(result).toMatchObject({
     sessions: [
       {
@@ -707,24 +753,66 @@ it("rolls up known session family ids when historical usage is requested", async
         usage: {
           totalTokens: 60,
           totalCost: expect.closeTo(0.06),
-          dailyBreakdown: [daily("2026-02-01", 30, 0.03, 2), daily("2026-02-02", 30, 0.03, 1)],
+          dailyBreakdown: [
+            {
+              date: "2026-02-01",
+              tokens: 30,
+              cost: 0.03,
+              totalTokens: 30,
+              totalCost: 0.03,
+              input: 30,
+              inputCost: 0.03,
+              missingCostEntries: 2,
+              missingCostByModel: { "fixture/unpriced": 2 },
+            },
+            {
+              date: "2026-02-02",
+              totalTokens: 30,
+              totalCost: 0.03,
+              missingCostByModel: { "fixture/unpriced": 1 },
+            },
+          ],
           activityDates: ["2026-02-01", "2026-02-02"],
           messageCounts: { total: 3 },
+          dailyMessageCounts: [
+            { date: "2026-02-01", total: 2 },
+            { date: "2026-02-02", total: 1 },
+          ],
+          utcQuarterHourMessageCounts: [
+            { date: "2026-02-01", quarterIndex: 2, total: 2 },
+            { date: "2026-02-02", quarterIndex: 2, total: 1 },
+          ],
+          utcQuarterHourTokenUsage: [
+            { date: "2026-02-01", quarterIndex: 2, totalTokens: 30, totalCost: 0.03 },
+            { date: "2026-02-02", quarterIndex: 2, totalTokens: 30, totalCost: 0.03 },
+          ],
+          dailyLatency: [
+            { date: "2026-02-01", count: 3, avgMs: 20, p95Ms: 30, minMs: 10, maxMs: 30 },
+            { date: "2026-02-02", count: 3, avgMs: 7, p95Ms: 9, minMs: 5, maxMs: 9 },
+          ],
           latency: { count: 6, avgMs: 13.5, p95Ms: 30, minMs: 5, maxMs: 30 },
           // a-second overtakes z-first before their counts tie again.
-          toolUsage: tools(["a-second", 3], ["z-first", 3]),
+          toolUsage: {
+            tools: [
+              { name: "a-second", count: 3 },
+              { name: "z-first", count: 3 },
+            ],
+          },
           modelUsage: models,
+          dailyModelUsage: [dailyModels[0], dailyModels[1], dailyModels[0]],
         },
       },
     ],
-    aggregates: { byModel: models },
+    aggregates: { byModel: models, modelDaily: [dailyModels[1], dailyModels[0], dailyModels[0]] },
     totals: { totalTokens: 60, totalCost: expect.closeTo(0.06) },
   });
   expect(sources).toEqual(sourceSnapshots);
 
   TEST_RUNTIME_CONFIG = { ...TEST_RUNTIME_CONFIG };
   const partialEntry = { ...entry, usageFamilySessionIds: ["current", "old"] };
-  setStoredSessions({ [storeKey]: partialEntry }, "opus");
+  projectionFixture = createUsageSessionStoreFixture({ [storeKey]: partialEntry }, [
+    [storeKey, "opus"],
+  ]);
   discovery.mockResolvedValueOnce([
     { sessionId: "old", sessionFile: oldSessionFile, mtime: 1_000 },
   ]);
@@ -734,7 +822,11 @@ it("rolls up known session family ids when historical usage is requested", async
     ),
     cacheStatus: { status: "partial", cachedFiles: 1, pendingFiles: 1, staleFiles: 0 },
   }));
-  const partial = await readFamily();
+  const partial = await readSessionsUsage({
+    key: storeKey,
+    groupBy: "family",
+    includeHistorical: true,
+  });
   expect(partial.sessions).toMatchObject([
     { key: storeKey, computing: true, usage: { totalTokens: 20 } },
   ]);
@@ -760,12 +852,14 @@ it("prefers the deterministic store key when duplicate sessionIds exist", async 
   expect((await readSessionsUsage({ key: "agent:opus:run-dup" })).sessions).toMatchObject([
     { key: preferredKey },
   ]);
-  expectUsageLoad({
-    agentId: "opus",
-    sessions: expect.arrayContaining([
-      expect.objectContaining({ sessionFile: expect.stringMatching(/^sqlite:/) }),
-    ]),
-  });
+  expect(loadSessionCostSummariesFromCache).toHaveBeenCalledWith(
+    expect.objectContaining({
+      agentId: "opus",
+      sessions: expect.arrayContaining([
+        expect.objectContaining({ sessionFile: expect.stringMatching(/^sqlite:/) }),
+      ]),
+    }),
+  );
 });
 
 it("rejects traversal-style keys in specific session usage lookups", async () => {

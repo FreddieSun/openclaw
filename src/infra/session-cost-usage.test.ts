@@ -754,8 +754,10 @@ it.each<PricingCase>([
   ["top-level usage", 0.0021, flatPricing, undefined, breakdown(0.001, 0.001, 0.0001), "top-level"],
   ["unknown zero", undefined, undefined, { total: 0 }],
   ["zero pricing", 0, zeroPricing, { total: 0 }],
+  ["interrupted placeholder", undefined, zeroPricing, { total: 0 }, undefined, "unavailable"],
   ["interrupted billing", undefined, undefined, interimBill, undefined, "unavailable"],
   // A later catalog cannot recover the recorded call's service tier.
+  ["flat estimate survives tiers", 0.001, tieredPricing, { total: 0.001 }],
   ["priority estimate survives tiers", 0.0084, tieredPricing, priorityBill, priorityParts],
   ["tiered estimate", 0.0042, tieredPricing, undefined, breakdown(0.002, 0.002, 0.0002)],
   ["billed zero survives tiers", 0, tieredPricing, billedZero],
