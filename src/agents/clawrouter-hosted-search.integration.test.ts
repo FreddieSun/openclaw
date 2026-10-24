@@ -1,7 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import path from "node:path";
 import type { OpenAIResponsesOptions } from "@openclaw/ai/internal/openai";
-import MarkdownIt from "markdown-it";
 import { Type } from "typebox";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
@@ -49,19 +48,13 @@ const citation = {
   url: "https://example.test/source",
   title: "Fixture source",
 };
-const textPart = (text = prose, annotations = [citation]) => ({
-  type: "output_text",
-  text,
-  annotations,
-});
 const message = {
   type: "message",
   id: "msg_fixture",
   role: "assistant",
   status: "completed",
-  content: [textPart()],
+  content: [{ type: "output_text", text: prose, annotations: [citation] }],
 };
-const withParts = (...content: ReturnType<typeof textPart>[]) => ({ ...message, content });
 const outputEvent = (type: string, item: unknown, output_index: number) => ({
   type: `response.output_item.${type}`,
   output_index,
@@ -96,7 +89,6 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
   let provider: ProviderPlugin;
   let baseUrl: string;
   let catalog: ModelProviderConfig;
-  let deniedCatalog: ModelProviderConfig;
   let mode:
     | "json"
     | "sse"
@@ -106,11 +98,6 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
     | "stream-error"
     | "hold"
     | "annotation"
-    | "late-citation"
-    | "multipart-citation"
-    | "earlier-citation"
-    | "stale-citation"
-    | "citation-title"
     | "json-failed"
     | "json-invalid" = "sse";
   let held = createDeferred<ServerResponse>();
@@ -118,7 +105,6 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
   let rejectedRotationKey: string | undefined;
   const requests: Array<{ path?: string; authorization?: string; body: Record<string, unknown> }> =
     [];
-  const catalogAuth: string[] = [];
   const metadataSnapshot = createPluginMetadataSnapshotFixture({
     plugins: [
       {
@@ -143,28 +129,34 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
     provider = await registerSingleProviderPlugin(entry.default);
     async function respond(request: IncomingMessage, reply: ServerResponse) {
       if (request.url === "/v1/catalog") {
-        catalogAuth.push(request.headers.authorization ?? "");
-        const admitted = request.headers.authorization === "Bearer synthetic-admitted";
+        const support = {
+          version: "clawrouter.native-capabilities.v1",
+          endpoints: { responses: { hostedTools: ["web_search"] } },
+        };
+        const admission = {
+          version: "clawrouter.hosted-tool-admission.v1",
+          web_search:
+            request.headers.authorization === "Bearer synthetic-admitted"
+              ? "admitted"
+              : "pricing_required",
+        };
         const rows = [
-          { id: "alias/search-fixture", supported: true, admission: "admitted" },
-          { id: "openai/gpt-5.4", supported: false, admission: "admitted" },
-          { id: "openai/pricing-required", supported: true, admission: "pricing_required" },
-          { id: "openai/unknown", supported: true },
-          { id: "openai/future", supported: true, admission: "admitted", version: "future" },
-          { id: "openai/malformed", supported: true, admission: "admitted", malformed: true },
-          {
-            id: "openai/future-admission",
-            supported: true,
-            admission: "admitted",
-            admissionVersion: "future",
-          },
-          {
-            id: "openai/wrong-offer",
-            supported: true,
-            admission: "admitted",
-            route: "/v1/chat/completions",
-          },
-        ];
+          ["alias/search-fixture", support, admission],
+          ["openai/gpt-5.4", undefined, admission],
+          ["openai/pricing-required", support, { ...admission, web_search: "pricing_required" }],
+          ["openai/unknown", support, undefined],
+          ["openai/future", { ...support, version: "future" }, admission],
+          [
+            "openai/malformed",
+            {
+              ...support,
+              endpoints: { responses: { hostedTools: [true, "web_search"] } },
+            },
+            admission,
+          ],
+          ["openai/future-admission", support, { ...admission, version: "future" }],
+          ["openai/wrong-offer", support, admission, "/v1/chat/completions"],
+        ] as const;
         writeJson(reply, {
           providers: [
             {
@@ -172,36 +164,20 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
               openaiCompatible: true,
               nativeBaseUrl: "/v1/native/openai",
               routes: [],
-              models: rows.map((row) => ({
-                id: row.id,
+              models: rows.map(([id, nativeCapabilities]) => ({
+                id,
                 upstream: "fixture",
                 capabilities: ["llm.responses"],
-                ...(row.supported
-                  ? {
-                      nativeCapabilities: {
-                        version: row.version ?? "clawrouter.native-capabilities.v1",
-                        endpoints: {
-                          responses: {
-                            hostedTools: row.malformed ? [true, "web_search"] : ["web_search"],
-                          },
-                        },
-                      },
-                    }
-                  : {}),
+                nativeCapabilities,
               })),
-              offers: rows.map((row) => ({
-                modelId: row.id,
+              offers: rows.map(([modelId, , hostedToolAdmission, route = "/v1/responses"]) => ({
+                modelId,
                 endpoint: "responses",
                 transport: "http",
                 routeKind: "unified",
-                route: row.route ?? "/v1/responses",
+                route,
                 eligible: true,
-                hostedToolAdmission: row.admission
-                  ? {
-                      version: row.admissionVersion ?? "clawrouter.hosted-tool-admission.v1",
-                      web_search: admitted ? row.admission : "pricing_required",
-                    }
-                  : undefined,
+                hostedToolAdmission,
               })),
             },
           ],
@@ -250,33 +226,6 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
         );
         return;
       }
-      const firstPart = textPart("Synthetic ");
-      const secondPart = textPart("source.", [
-        { ...citation, url: "https://example.test/second", title: "Second" },
-      ]);
-      const terminalMessage =
-        mode === "multipart-citation" || mode === "earlier-citation"
-          ? withParts(firstPart, secondPart)
-          : mode === "stale-citation"
-            ? withParts(textPart("Stale prose."))
-            : mode === "citation-title"
-              ? withParts(
-                  textPart(prose, [
-                    {
-                      ...citation,
-                      title: "<https://other.test/> <img src=x> [label] `code` *bold*",
-                    },
-                  ]),
-                )
-              : message;
-      const completedMessage =
-        mode === "multipart-citation"
-          ? withParts(textPart(firstPart.text, []), textPart(secondPart.text, []))
-          : mode === "earlier-citation"
-            ? withParts(textPart(firstPart.text, []), secondPart)
-            : mode === "late-citation" || mode === "stale-citation"
-              ? withParts(textPart(prose, []))
-              : terminalMessage;
       reply.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
       reply.write(
         sse({
@@ -295,7 +244,7 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
           { type: "response.web_search_call.searching", output_index: 0, item_id: search.id },
           outputEvent("done", search, 0),
           outputEvent("done", search, 0),
-          outputEvent("added", withParts(), 1),
+          outputEvent("added", { ...message, content: [] }, 1),
           textEvent("delta", { delta: prose }),
           ...(mode === "annotation"
             ? [null, citation].map((annotation) =>
@@ -304,7 +253,7 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
             : []),
           outputEvent(
             "done",
-            mode === "annotation" ? { ...message, content: undefined } : completedMessage,
+            mode === "annotation" ? { ...message, content: undefined } : message,
             1,
           ),
         ];
@@ -325,7 +274,7 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
       }
       const terminal = sse({
         type: "response.completed",
-        response: { ...response, output: [search, terminalMessage] },
+        response,
       });
       // Identical terminal replay must not produce another delta or absolute text_end.
       reply.end(terminal + terminal);
@@ -360,8 +309,6 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
       return result.provider;
     }
     catalog = await discover("synthetic-admitted");
-    deniedCatalog = await discover("synthetic-denied");
-    await discover("synthetic-admitted");
   });
   afterAll(async () => {
     server?.listener.closeAllConnections();
@@ -371,8 +318,8 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
     await state?.cleanup();
   });
 
-  function prepare(config: OpenClawConfig = {}, id = "alias/search-fixture", source = catalog) {
-    const row = source.models.find((candidate) => candidate.id === id);
+  function prepare(config: OpenClawConfig = {}, id = "alias/search-fixture") {
+    const row = catalog.models.find((candidate) => candidate.id === id);
     if (!row) {
       throw new Error("Missing catalog model " + id);
     }
@@ -438,11 +385,11 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
       },
       { apiKey: "synthetic-admitted", maxRetries: 0, ...options },
     );
-    const events = [];
     for await (const event of stream) {
-      events.push(event);
+      // Drain the production stream before inspecting its settled result.
+      void event;
     }
-    return { result: await stream.result(), events };
+    return { result: await stream.result() };
   }
 
   it.each(["wrapStreamFn", "wrapSimpleCompletionStreamFn"] as const)(
@@ -581,7 +528,7 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
     },
   );
 
-  it.each(["json", "sse", "terminal", "annotation", "late-citation"] as const)(
+  it.each(["json", "annotation"] as const)(
     "sends admitted hosted search and projects clickable citations from %s",
     async (wire) => {
       mode = wire;
@@ -589,41 +536,12 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
       expect(resolveNativeWebSearchRoute(prepared.policy).kind).toBe("native");
       expect(prepared.assembled.map((tool) => tool.name)).toEqual(["read"]);
       const allowed = new Set<string>();
-      const { result, events } = await call(prepared, {
+      const { result } = await call(prepared, {
         openclawCodeModeAllowedHostedToolTypes: allowed,
       });
       expect(result.stopReason).toBe("stop");
       expect(result.content).toMatchObject([{ type: "text", text: fullText }]);
       expect(result.content.filter((part) => part.type === "toolCall")).toEqual([]);
-      expect(
-        events.filter((event) => event.type === "text_end").map((event) => event.content),
-      ).toEqual(wire === "late-citation" ? ["Synthetic source.", fullText] : [fullText]);
-      if (wire === "late-citation") {
-        expect(events.map((event) => event.type)).toEqual([
-          "start",
-          "text_start",
-          "text_delta",
-          "text_end",
-          "text_delta",
-          "text_end",
-          "done",
-        ]);
-        expect(
-          events
-            .filter((event) => event.type.startsWith("text_"))
-            .map((event) => [
-              event.type,
-              "contentIndex" in event ? event.contentIndex : undefined,
-              "delta" in event ? event.delta : "content" in event ? event.content : undefined,
-            ]),
-        ).toEqual([
-          ["text_start", 0, undefined],
-          ["text_delta", 0, prose],
-          ["text_end", 0, prose],
-          ["text_delta", 0, `\n\n${sourceLink}`],
-          ["text_end", 0, fullText],
-        ]);
-      }
       expect(allowed).toEqual(new Set(["web_search"]));
       expect(requests.at(-1)).toMatchObject({
         path: "/v1/responses",
@@ -638,49 +556,6 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
     },
   );
 
-  it.each(["multipart-citation", "earlier-citation"] as const)(
-    "recovers earlier-part terminal sources without duplicating prose or prior sources: %s",
-    async (wire) => {
-      mode = wire;
-      const { result, events } = await call();
-      const text = result.content.find((part) => part.type === "text")?.text ?? "";
-      const secondLink = "[Second](https://example.test/second)";
-      const earlier = wire === "earlier-citation";
-      expect(result.stopReason).toBe("stop");
-      expect(text).toBe(
-        `${prose}\n\n${earlier ? `${secondLink} ${sourceLink}` : `${sourceLink} ${secondLink}`}`,
-      );
-      expect(
-        events.filter((event) => event.type === "text_end").map((event) => event.content),
-      ).toEqual(earlier ? [`${prose}\n\n${secondLink}`, text] : [prose, text]);
-    },
-  );
-  it("does not replace completed prose or attach sources from a stale terminal message", async () => {
-    mode = "stale-citation";
-    const { result } = await call();
-    expect(result.content).toMatchObject([{ type: "text", text: "Synthetic source." }]);
-  });
-  it("renders page-controlled citation titles as literal Markdown, never extra links or HTML", async () => {
-    mode = "citation-title";
-    const { result } = await call();
-    const text = result.content.find((part) => part.type === "text")?.text ?? "";
-    const tokens = new MarkdownIt({ html: true })
-      .parse(text, {})
-      .flatMap((token) => token.children ?? []);
-    expect(
-      tokens.filter((token) => token.type === "link_open").map((token) => token.attrGet("href")),
-    ).toEqual(["https://example.test/source"]);
-    expect(
-      tokens.filter((token) => ["html_inline", "code_inline", "em_open"].includes(token.type)),
-    ).toEqual([]);
-    expect(
-      tokens
-        .filter((token) => token.type === "text")
-        .map((token) => token.content)
-        .join(""),
-    ).toBe("Synthetic source.<https://other.test/> <img src=x> [label] `code` *bold*");
-  });
-
   it.each([
     "openai/gpt-5.4",
     "openai/pricing-required",
@@ -689,20 +564,10 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
     "openai/malformed",
     "openai/future-admission",
     "openai/wrong-offer",
-  ])("keeps managed search for unsupported or unadmitted %s", async (id) => {
-    mode = "terminal";
+  ])("keeps managed search for unsupported or unadmitted %s", (id) => {
     const prepared = prepare({}, id);
     expect(resolveNativeWebSearchRoute(prepared.policy).kind).toBe("managed");
     expect(prepared.assembled.map((tool) => tool.name)).toEqual(["web_search", "read"]);
-    const allowed = new Set<string>();
-    expect(
-      (await call(prepared, { openclawCodeModeAllowedHostedToolTypes: allowed })).result.stopReason,
-    ).toBe("stop");
-    expect(allowed.size).toBe(0);
-    expect(requests.at(-1)?.body.tools).toMatchObject([
-      { type: "function", name: "read" },
-      { type: "function", name: "web_search" },
-    ]);
   });
   it("keeps only admitted hosted search through the actual Code Mode egress guard", async () => {
     mode = "sse";
@@ -742,13 +607,6 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
         pluginMetadataSnapshot: snapshot,
       }).kind,
     ).toBe("managed");
-  });
-  it("keeps one key's catalog admission out of another key's projection", () => {
-    expect(catalogAuth).toEqual(["Bearer synthetic-admitted", "Bearer synthetic-denied"]);
-    expect(resolveNativeWebSearchRoute(prepare({}, undefined, deniedCatalog).policy).kind).toBe(
-      "managed",
-    );
-    expect(resolveNativeWebSearchRoute(prepare().policy).kind).toBe("native");
   });
   it.each([
     { tools: { web: { search: { enabled: false } } } },

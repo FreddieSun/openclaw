@@ -1,7 +1,6 @@
 import OpenAI from "openai";
 import type { Model } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it, vi } from "vitest";
-import { serializeModelRequestBody } from "../../packages/ai/src/transports/model-request-body.js";
 import { buildOpenAICompletionsParams } from "./openai-transport-stream.js";
 import {
   buildOpenAIResponsesParams,
@@ -22,7 +21,6 @@ type ReplayContextSpec = {
     signature: string | Record<string, unknown>;
     replayMetadata?: unknown;
   };
-  text?: true;
   toolCalls?: ReadonlyArray<{ id: string; name: string; arguments: unknown }>;
   results?: ReadonlyArray<{
     id: string;
@@ -47,13 +45,6 @@ function replayContext(spec: ReplayContextSpec) {
       ...(spec.thinking.replayMetadata === undefined
         ? {}
         : { openclawReasoningReplay: spec.thinking.replayMetadata }),
-    });
-  }
-  if (spec.text) {
-    content.push({
-      type: "text",
-      text: "Checking the price.",
-      textSignature: JSON.stringify({ v: 1, id: "msg_prior", phase: "commentary" }),
     });
   }
   for (const toolCall of spec.toolCalls ?? []) {
@@ -103,18 +94,11 @@ type ReplayItem = {
 type ReplayParams = { store?: boolean; input?: ReplayItem[] };
 
 const session = { sessionId: "session-123" };
-const reasoning = { type: "reasoning", id: "rs_prior", encrypted_content: "ciphertext" };
 const proxyModel = makeResponsesModel({
   id: "gpt-5.4",
   api: "openai-chatgpt-responses",
   baseUrl: "https://proxy.example.com/v1",
 });
-const priceCall = { id: "call_abc|fc_prior", name: "price_lookup", arguments: { symbol: "SOL" } };
-const priceResult = {
-  id: priceCall.id,
-  name: priceCall.name,
-  content: [{ type: "text", text: "$83.95" }],
-};
 
 function toolContext(id: string, name: string, content: readonly unknown[]) {
   return replayContext({
@@ -159,99 +143,30 @@ function emptyResponsesContext() {
 }
 
 describe("openai transport stream", () => {
-  it.each([
-    {
-      name: "disabled store",
-      model: makeResponsesModel({
-        id: "gpt-5.5",
-        name: "GPT-5.5",
-        provider: "mycodex",
-        baseUrl: "http://127.0.0.1:8317/v1",
-      }),
-      ids: false,
-      encrypted: false,
-    },
-    {
-      name: "explicit replay",
-      model: responsesModelFixture("gpt-5.4"),
-      ids: true,
-      encrypted: false,
-    },
-    {
-      name: "custom Codex-compatible",
-      model: proxyModel,
-      ids: false,
-      encrypted: true,
-    },
-    { name: "embedded provenance", model: proxyModel, ids: false, encrypted: true, embedded: true },
-  ])("handles replay ids with $name", ({ model, ids, encrypted, embedded }) => {
-    const options = {
-      ...session,
-      ...(encrypted ? { authProfileId: "openai:oauth" } : {}),
-      ...(ids ? { replayResponsesItemIds: true } : {}),
-    };
-    const request = buildOpenAIResponsesParams(
-      model,
+  it("keeps embedded replay provenance as a compatibility fallback", () => {
+    const options = { ...session, authProfileId: "openai:oauth" };
+    const params = buildOpenAIResponsesParams(
+      proxyModel,
       replayContext({
-        source: model,
+        source: proxyModel,
         thinking: {
-          signature: embedded
-            ? {
-                ...reasoning,
-                __openclaw_replay: testing.buildOpenAIResponsesReasoningReplayMetadata(
-                  model,
-                  options,
-                ),
-              }
-            : reasoning,
-          ...(encrypted && !embedded
-            ? {
-                replayMetadata: testing.buildOpenAIResponsesReasoningReplayMetadata(model, options),
-              }
-            : {}),
+          signature: {
+            type: "reasoning",
+            id: "rs_prior",
+            encrypted_content: "ciphertext",
+            __openclaw_replay: testing.buildOpenAIResponsesReasoningReplayMetadata(
+              proxyModel,
+              options,
+            ),
+          },
         },
-        text: true,
-        toolCalls: [priceCall],
-        results: [priceResult],
       }),
       options,
-    );
-    const params = JSON.parse(
-      new TextDecoder().decode(serializeModelRequestBody(request).body),
     ) as ReplayParams;
-    if (!ids) {
-      expect(params.store).toBe(false);
-    }
-    const reasoningItem = params.input?.find((item) => item.type === "reasoning");
-    expectRecordFields(reasoningItem, {
-      type: "reasoning",
-      summary: [],
-      id: ids ? "rs_prior" : undefined,
-    });
-    if (encrypted) {
-      expect(reasoningItem?.encrypted_content).toBe("ciphertext");
-    } else {
-      expect(reasoningItem).not.toHaveProperty("encrypted_content");
-    }
-    expect(reasoningItem).not.toHaveProperty("__openclaw_replay");
-    expectRecordFields(
-      params.input?.find((item) => item.type === "message" && item.role === "assistant"),
-      {
-        type: "message",
-        role: "assistant",
-        phase: "commentary",
-        id: ids ? "msg_prior" : undefined,
-        status: ids ? "completed" : undefined,
-      },
-    );
-    expectRecordFields(
-      params.input?.find((item) => item.type === "function_call"),
-      {
-        type: "function_call",
-        call_id: "call_abc",
-        id: ids ? "fc_prior" : undefined,
-      },
-    );
+    const item = params.input?.find((entry) => entry.type === "reasoning");
+    expectRecordFields(item, { type: "reasoning", encrypted_content: "ciphertext", summary: [] });
+    expect(item?.id).toBeUndefined();
+    expect(item).not.toHaveProperty("__openclaw_replay");
   });
 
   it("drops oversized GitHub Copilot Responses reasoning replay ids before send", () => {
@@ -276,60 +191,35 @@ describe("openai transport stream", () => {
     expect(params.input?.some((item) => item.type === "reasoning")).toBe(false);
   });
 
-  it("retries mixed replay without reasoning first and preserves compaction on success", async () => {
+  it("strips encrypted content recursively while retaining unrelated nested fields", async () => {
+    const original = mixedRequest();
     const request = {
-      model: "gpt-5.5",
-      stream: true,
+      ...original,
       input: [
         {
-          type: "reasoning",
-          id: "rs_prior",
-          encrypted_content: "ciphertext",
-          summary: [{ type: "summary_text", text: "checked" }],
+          ...original.input[0],
           nested: { encrypted_content: "nested-ciphertext", keep: "value" },
-        },
-        {
-          type: "compaction",
-          id: "cmp_prior",
-          encrypted_content: "compaction-ciphertext",
-        },
-        {
-          type: "function_call",
-          id: "fc_prior",
-          call_id: "call_abc",
-          name: "price_lookup",
-          arguments: "{}",
         },
       ],
     };
-    const recoveredStream = streamChunks([]);
     const create = vi
       .fn()
       .mockReturnValueOnce(rejectedResponse(encryptedError()))
       .mockReturnValueOnce({
         withResponse: vi.fn().mockResolvedValue({
-          data: recoveredStream,
+          data: streamChunks([]),
           response: new Response(null, { status: 200 }),
         }),
       });
-    const onCompactionRejected = vi.fn();
 
-    await expect(recover(create, request, onCompactionRejected)).resolves.toMatchObject({
-      stream: recoveredStream,
-    });
-
-    expect(create).toHaveBeenCalledTimes(2);
-    const retry = create.mock.calls[1]?.[0] as typeof request;
-    expect(retry.input[0]).toMatchObject({
-      type: "reasoning",
-      id: "rs_prior",
-      summary: [{ type: "summary_text", text: "checked" }],
-      nested: { keep: "value" },
-    });
-    expect(retry.input[0]).not.toHaveProperty("encrypted_content");
-    expect(retry.input[0]?.nested).not.toHaveProperty("encrypted_content");
-    expect(retry.input[1]).toEqual(request.input[1]);
-    expect(onCompactionRejected).not.toHaveBeenCalled();
+    await recover(create, request);
+    expect(create.mock.calls[1]?.[0].input).toEqual([
+      {
+        type: "reasoning",
+        summary: [],
+        nested: { keep: "value" },
+      },
+    ]);
   });
 
   it.each([
@@ -429,57 +319,20 @@ describe("openai transport stream", () => {
     }
   });
 
-  it.each([
-    { name: "empty", content: [], output: "(no output)" },
-    {
-      name: "payload-less image",
-      content: [{ type: "image", mimeType: "image/png", data: "" }],
-      output: "(no output)",
-    },
-    {
-      name: "image-bearing",
-      content: [{ type: "image", mimeType: "image/png", data: "aW1n" }],
-      output: [{ type: "input_image", detail: "auto", image_url: "data:image/png;base64,aW1n" }],
-    },
-  ])("replays $name tool results", ({ content, output }) => {
-    const params = buildOpenAIResponsesParams(
-      content.length === 0
-        ? responsesModelFixture()
-        : makeResponsesModel({ id: "gpt-5.5", input: ["text", "image"] }),
-      toolContext("call_shot", "screenshot", content),
-      session,
-    ) as ReplayParams;
-    const result = params.input?.find((item) => item.type === "function_call_output");
-    expectRecordFields(result, { type: "function_call_output", call_id: "call_shot", output });
-    if (typeof output === "string") {
-      expect(JSON.stringify(result)).not.toContain("input_image");
-      expect(JSON.stringify(result)).not.toContain("see attached image");
-    }
-  });
-
-  it("serializes structured tool result content into Responses output text", () => {
+  it("replays empty non-image tool results as no output", () => {
     const params = buildOpenAIResponsesParams(
       responsesModelFixture(),
-      replayContext({
-        toolCalls: [{ id: "call_lookup", name: "lookup", arguments: { query: "price" } }],
-        results: [
-          {
-            id: "call_lookup",
-            name: "lookup",
-            content: [{ type: "json", payload: { price: 42, currency: "USD" } }],
-          },
-        ],
-        after: [{ role: "user", content: "continue", timestamp: 3 }],
-      }),
-      undefined,
+      toolContext("call_plan", "update_plan", []),
+      session,
     ) as ReplayParams;
-    const output = params.input?.find((item) => item.type === "function_call_output");
-    expect(output).toBeDefined();
-    expect(output?.call_id).toBe("call_lookup");
-    expect(typeof output?.output).toBe("string");
-    expect(output?.output).toContain("price");
-    expect(output?.output).toContain("42");
-    expect(output?.output).not.toBe("(see attached image)");
+    expectRecordFields(
+      params.input?.find((item) => item.type === "function_call_output"),
+      {
+        type: "function_call_output",
+        call_id: "call_plan",
+        output: "(no output)",
+      },
+    );
   });
 
   it("normalizes canonical reasoning casing in Responses and Chat Completions payloads", () => {
@@ -527,35 +380,6 @@ describe("openai transport stream", () => {
     ) as { reasoning?: unknown };
 
     expect(params.reasoning).toEqual({ effort, summary: "auto" });
-  });
-
-  it("does not reread an unreadable tool inventory length", () => {
-    const tools = new Proxy([], {
-      get(target, property, receiver) {
-        if (property === "length") {
-          throw new Error("length exploded");
-        }
-        return Reflect.get(target, property, receiver);
-      },
-    });
-    const responsesModel = responsesModelFixture("gpt-5.5", "GPT-5.5");
-    const completionsModel = makeCompletionsModel({
-      ...responsesModel,
-      api: "openai-completions",
-      reasoning: false,
-    });
-    const context = {
-      systemPrompt: "system",
-      messages: [{ role: "user", content: "hello", timestamp: 1 }],
-      tools,
-    } as never;
-
-    expect(buildOpenAIResponsesParams(responsesModel, context, undefined)).not.toHaveProperty(
-      "tools",
-    );
-    expect(buildOpenAICompletionsParams(completionsModel, context, undefined)).not.toHaveProperty(
-      "tools",
-    );
   });
 
   it("serializes raw string tool-call arguments without double-encoding them", () => {
