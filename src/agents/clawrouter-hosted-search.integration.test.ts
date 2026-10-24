@@ -1,4 +1,4 @@
-import { createServer, type Server, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import path from "node:path";
 import type { OpenAIResponsesOptions } from "@openclaw/ai/internal/openai";
 import MarkdownIt from "markdown-it";
@@ -29,6 +29,13 @@ import { resolveNativeWebSearchRoute } from "./native-web-search.js";
 import type { StreamFn } from "./runtime/index.js";
 
 const sse = (value: unknown) => "data: " + JSON.stringify(value) + "\n\n";
+const prose = "Synthetic source.";
+const sourceLink = "[Fixture source](https://example.test/source)";
+const fullText = `${prose}\n\n${sourceLink}`;
+const writeJson = (reply: ServerResponse, value: unknown, status = 200) => {
+  reply.writeHead(status, { "content-type": "application/json" });
+  reply.end(JSON.stringify(value));
+};
 const search = {
   type: "web_search_call",
   id: "search_fixture",
@@ -42,19 +49,31 @@ const citation = {
   url: "https://example.test/source",
   title: "Fixture source",
 };
+const textPart = (text = prose, annotations = [citation]) => ({
+  type: "output_text",
+  text,
+  annotations,
+});
 const message = {
   type: "message",
   id: "msg_fixture",
   role: "assistant",
   status: "completed",
-  content: [
-    {
-      type: "output_text",
-      text: "Synthetic source.",
-      annotations: [citation],
-    },
-  ],
+  content: [textPart()],
 };
+const withParts = (...content: ReturnType<typeof textPart>[]) => ({ ...message, content });
+const outputEvent = (type: string, item: unknown, output_index: number) => ({
+  type: `response.output_item.${type}`,
+  output_index,
+  item,
+});
+const textEvent = (type: string, extra: Record<string, unknown>) => ({
+  type: `response.output_text.${type}`,
+  output_index: 1,
+  item_id: message.id,
+  content_index: 0,
+  ...extra,
+});
 const response = {
   id: "resp_search_fixture",
   object: "response",
@@ -122,255 +141,200 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
       default: Parameters<typeof registerSingleProviderPlugin>[0];
     }>({ pluginId: "clawrouter", artifactBasename: "index.ts" });
     provider = await registerSingleProviderPlugin(entry.default);
+    async function respond(request: IncomingMessage, reply: ServerResponse) {
+      if (request.url === "/v1/catalog") {
+        catalogAuth.push(request.headers.authorization ?? "");
+        const admitted = request.headers.authorization === "Bearer synthetic-admitted";
+        const rows = [
+          { id: "alias/search-fixture", supported: true, admission: "admitted" },
+          { id: "openai/gpt-5.4", supported: false, admission: "admitted" },
+          { id: "openai/pricing-required", supported: true, admission: "pricing_required" },
+          { id: "openai/unknown", supported: true },
+          { id: "openai/future", supported: true, admission: "admitted", version: "future" },
+          { id: "openai/malformed", supported: true, admission: "admitted", malformed: true },
+          {
+            id: "openai/future-admission",
+            supported: true,
+            admission: "admitted",
+            admissionVersion: "future",
+          },
+          {
+            id: "openai/wrong-offer",
+            supported: true,
+            admission: "admitted",
+            route: "/v1/chat/completions",
+          },
+        ];
+        writeJson(reply, {
+          providers: [
+            {
+              id: "openai",
+              openaiCompatible: true,
+              nativeBaseUrl: "/v1/native/openai",
+              routes: [],
+              models: rows.map((row) => ({
+                id: row.id,
+                upstream: "fixture",
+                capabilities: ["llm.responses"],
+                ...(row.supported
+                  ? {
+                      nativeCapabilities: {
+                        version: row.version ?? "clawrouter.native-capabilities.v1",
+                        endpoints: {
+                          responses: {
+                            hostedTools: row.malformed ? [true, "web_search"] : ["web_search"],
+                          },
+                        },
+                      },
+                    }
+                  : {}),
+              })),
+              offers: rows.map((row) => ({
+                modelId: row.id,
+                endpoint: "responses",
+                transport: "http",
+                routeKind: "unified",
+                route: row.route ?? "/v1/responses",
+                eligible: true,
+                hostedToolAdmission: row.admission
+                  ? {
+                      version: row.admissionVersion ?? "clawrouter.hosted-tool-admission.v1",
+                      web_search: admitted ? row.admission : "pricing_required",
+                    }
+                  : undefined,
+              })),
+            },
+          ],
+        });
+        return;
+      }
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) {
+        chunks.push(Buffer.from(chunk));
+      }
+      requests.push({
+        path: request.url,
+        authorization: request.headers.authorization,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      });
+      if (mode === "rotate" && request.headers.authorization === rejectedRotationKey) {
+        writeJson(reply, { error: { message: "Synthetic profile rate limit" } }, 429);
+        return;
+      }
+      if (mode === "reject") {
+        writeJson(
+          reply,
+          {
+            error: {
+              code: "pricing_required",
+              message:
+                "Hosted web_search is not admitted for this key; ask your ClawRouter administrator to qualify this route.",
+            },
+          },
+          400,
+        );
+        return;
+      }
+      if (mode === "json" || mode === "json-failed" || mode === "json-invalid") {
+        writeJson(
+          reply,
+          mode === "json-failed"
+            ? {
+                ...response,
+                status: "failed",
+                error: { code: "search_failed", message: "Synthetic hosted search failed" },
+              }
+            : mode === "json-invalid"
+              ? { object: "not-a-response", status: "completed" }
+              : response,
+        );
+        return;
+      }
+      const firstPart = textPart("Synthetic ");
+      const secondPart = textPart("source.", [
+        { ...citation, url: "https://example.test/second", title: "Second" },
+      ]);
+      const terminalMessage =
+        mode === "multipart-citation" || mode === "earlier-citation"
+          ? withParts(firstPart, secondPart)
+          : mode === "stale-citation"
+            ? withParts(textPart("Stale prose."))
+            : mode === "citation-title"
+              ? withParts(
+                  textPart(prose, [
+                    {
+                      ...citation,
+                      title: "<https://other.test/> <img src=x> [label] `code` *bold*",
+                    },
+                  ]),
+                )
+              : message;
+      const completedMessage =
+        mode === "multipart-citation"
+          ? withParts(textPart(firstPart.text, []), textPart(secondPart.text, []))
+          : mode === "earlier-citation"
+            ? withParts(textPart(firstPart.text, []), secondPart)
+            : mode === "late-citation" || mode === "stale-citation"
+              ? withParts(textPart(prose, []))
+              : terminalMessage;
+      reply.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
+      reply.write(
+        sse({
+          type: "response.created",
+          response: { ...response, status: "in_progress", output: [] },
+        }),
+      );
+      if (mode === "hold") {
+        reply.once("close", () => closed.resolve());
+        held.resolve(reply);
+        return;
+      }
+      if (mode !== "terminal") {
+        const events = [
+          outputEvent("added", { ...search, status: "in_progress" }, 0),
+          { type: "response.web_search_call.searching", output_index: 0, item_id: search.id },
+          outputEvent("done", search, 0),
+          outputEvent("done", search, 0),
+          outputEvent("added", withParts(), 1),
+          textEvent("delta", { delta: prose }),
+          ...(mode === "annotation"
+            ? [null, citation].map((annotation) =>
+                textEvent("annotation.added", { annotation_index: 0, annotation }),
+              )
+            : []),
+          outputEvent(
+            "done",
+            mode === "annotation" ? { ...message, content: undefined } : completedMessage,
+            1,
+          ),
+        ];
+        const bytes = Buffer.from(events.map(sse).join(""));
+        for (let offset = 0; offset < bytes.length; offset += 17) {
+          reply.write(bytes.subarray(offset, offset + 17));
+        }
+      }
+      if (mode === "stream-error") {
+        reply.end(
+          sse({
+            type: "error",
+            code: "search_failed",
+            message: "Synthetic hosted search failed",
+          }),
+        );
+        return;
+      }
+      const terminal = sse({
+        type: "response.completed",
+        response: { ...response, output: [search, terminalMessage] },
+      });
+      // Identical terminal replay must not produce another delta or absolute text_end.
+      reply.end(terminal + terminal);
+    }
     server = await reserveTestPortListener({
       offsets: [0],
       createListener: () =>
         createServer((request, reply) => {
-          void (async () => {
-            if (request.url === "/v1/catalog") {
-              catalogAuth.push(request.headers.authorization ?? "");
-              const admitted = request.headers.authorization === "Bearer synthetic-admitted";
-              const rows = [
-                { id: "alias/search-fixture", supported: true, admission: "admitted" },
-                { id: "openai/gpt-5.4", supported: false, admission: "admitted" },
-                { id: "openai/pricing-required", supported: true, admission: "pricing_required" },
-                { id: "openai/unknown", supported: true },
-                { id: "openai/future", supported: true, admission: "admitted", version: "future" },
-                { id: "openai/malformed", supported: true, admission: "admitted", malformed: true },
-                {
-                  id: "openai/future-admission",
-                  supported: true,
-                  admission: "admitted",
-                  admissionVersion: "future",
-                },
-                {
-                  id: "openai/wrong-offer",
-                  supported: true,
-                  admission: "admitted",
-                  route: "/v1/chat/completions",
-                },
-              ];
-              reply.writeHead(200, { "content-type": "application/json" });
-              reply.end(
-                JSON.stringify({
-                  providers: [
-                    {
-                      id: "openai",
-                      openaiCompatible: true,
-                      nativeBaseUrl: "/v1/native/openai",
-                      routes: [],
-                      models: rows.map((row) => ({
-                        id: row.id,
-                        upstream: "fixture",
-                        capabilities: ["llm.responses"],
-                        ...(row.supported
-                          ? {
-                              nativeCapabilities: {
-                                version: row.version ?? "clawrouter.native-capabilities.v1",
-                                endpoints: {
-                                  responses: {
-                                    hostedTools: row.malformed
-                                      ? [true, "web_search"]
-                                      : ["web_search"],
-                                  },
-                                },
-                              },
-                            }
-                          : {}),
-                      })),
-                      offers: rows.map((row) => ({
-                        modelId: row.id,
-                        endpoint: "responses",
-                        transport: "http",
-                        routeKind: "unified",
-                        route: row.route ?? "/v1/responses",
-                        eligible: true,
-                        hostedToolAdmission: row.admission
-                          ? {
-                              version:
-                                row.admissionVersion ?? "clawrouter.hosted-tool-admission.v1",
-                              web_search: admitted ? row.admission : "pricing_required",
-                            }
-                          : undefined,
-                      })),
-                    },
-                  ],
-                }),
-              );
-              return;
-            }
-            const chunks: Buffer[] = [];
-            for await (const chunk of request) {
-              chunks.push(Buffer.from(chunk));
-            }
-            requests.push({
-              path: request.url,
-              authorization: request.headers.authorization,
-              body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
-            });
-            if (mode === "rotate" && request.headers.authorization === rejectedRotationKey) {
-              reply.writeHead(429, { "content-type": "application/json" });
-              reply.end(JSON.stringify({ error: { message: "Synthetic profile rate limit" } }));
-              return;
-            }
-            if (mode === "reject") {
-              reply.writeHead(400, { "content-type": "application/json" });
-              reply.end(
-                JSON.stringify({
-                  error: {
-                    code: "pricing_required",
-                    message:
-                      "Hosted web_search is not admitted for this key; ask your ClawRouter administrator to qualify this route.",
-                  },
-                }),
-              );
-              return;
-            }
-            if (mode === "json" || mode === "json-failed" || mode === "json-invalid") {
-              reply.writeHead(200, { "content-type": "application/json" });
-              reply.end(
-                JSON.stringify(
-                  mode === "json-failed"
-                    ? {
-                        ...response,
-                        status: "failed",
-                        error: { code: "search_failed", message: "Synthetic hosted search failed" },
-                      }
-                    : mode === "json-invalid"
-                      ? { object: "not-a-response", status: "completed" }
-                      : response,
-                ),
-              );
-              return;
-            }
-            const firstPart = {
-              ...message.content[0],
-              text: "Synthetic ",
-              annotations: [citation],
-            };
-            const secondPart = {
-              ...message.content[0],
-              text: "source.",
-              annotations: [{ ...citation, url: "https://example.test/second", title: "Second" }],
-            };
-            const terminalMessage =
-              mode === "multipart-citation" || mode === "earlier-citation"
-                ? { ...message, content: [firstPart, secondPart] }
-                : mode === "stale-citation"
-                  ? { ...message, content: [{ ...message.content[0], text: "Stale prose." }] }
-                  : mode === "citation-title"
-                    ? {
-                        ...message,
-                        content: [
-                          {
-                            ...message.content[0],
-                            annotations: [
-                              {
-                                ...citation,
-                                title: "<https://other.test/> <img src=x> [label] `code` *bold*",
-                              },
-                            ],
-                          },
-                        ],
-                      }
-                    : message;
-            const completedMessage =
-              mode === "multipart-citation"
-                ? {
-                    ...message,
-                    content: [
-                      { ...firstPart, annotations: [] },
-                      { ...secondPart, annotations: [] },
-                    ],
-                  }
-                : mode === "earlier-citation"
-                  ? { ...message, content: [{ ...firstPart, annotations: [] }, secondPart] }
-                  : mode === "late-citation" || mode === "stale-citation"
-                    ? { ...message, content: [{ ...message.content[0], annotations: [] }] }
-                    : terminalMessage;
-            reply.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
-            reply.write(
-              sse({
-                type: "response.created",
-                response: { ...response, status: "in_progress", output: [] },
-              }),
-            );
-            if (mode === "hold") {
-              reply.once("close", () => closed.resolve());
-              held.resolve(reply);
-              return;
-            }
-            if (mode !== "terminal") {
-              const events = [
-                {
-                  type: "response.output_item.added",
-                  output_index: 0,
-                  item: { ...search, status: "in_progress" },
-                },
-                { type: "response.web_search_call.searching", output_index: 0, item_id: search.id },
-                { type: "response.output_item.done", output_index: 0, item: search },
-                { type: "response.output_item.done", output_index: 0, item: search },
-                {
-                  type: "response.output_item.added",
-                  output_index: 1,
-                  item: { ...message, content: [] },
-                },
-                {
-                  type: "response.output_text.delta",
-                  output_index: 1,
-                  item_id: message.id,
-                  content_index: 0,
-                  delta: "Synthetic source.",
-                },
-                ...(mode === "annotation"
-                  ? [
-                      {
-                        type: "response.output_text.annotation.added",
-                        output_index: 1,
-                        item_id: message.id,
-                        content_index: 0,
-                        annotation_index: 0,
-                        annotation: null,
-                      },
-                      {
-                        type: "response.output_text.annotation.added",
-                        output_index: 1,
-                        item_id: message.id,
-                        content_index: 0,
-                        annotation_index: 0,
-                        annotation: citation,
-                      },
-                    ]
-                  : []),
-                {
-                  type: "response.output_item.done",
-                  output_index: 1,
-                  item:
-                    mode === "annotation" ? { ...message, content: undefined } : completedMessage,
-                },
-              ];
-              const bytes = Buffer.from(events.map(sse).join(""));
-              for (let offset = 0; offset < bytes.length; offset += 17) {
-                reply.write(bytes.subarray(offset, offset + 17));
-              }
-            }
-            if (mode === "stream-error") {
-              reply.end(
-                sse({
-                  type: "error",
-                  code: "search_failed",
-                  message: "Synthetic hosted search failed",
-                }),
-              );
-              return;
-            }
-            const terminal = sse({
-              type: "response.completed",
-              response: { ...response, output: [search, terminalMessage] },
-            });
-            // Identical terminal replay must not produce another delta or absolute text_end.
-            reply.end(terminal + terminal);
-          })().catch((error: unknown) =>
+          void respond(request, reply).catch((error: unknown) =>
             reply.destroy(error instanceof Error ? error : new Error(String(error))),
           );
         }),
@@ -629,14 +593,8 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
         openclawCodeModeAllowedHostedToolTypes: allowed,
       });
       expect(result.stopReason).toBe("stop");
-      expect(result.content).toMatchObject([
-        {
-          type: "text",
-          text: "Synthetic source.\n\n[Fixture source](https://example.test/source)",
-        },
-      ]);
+      expect(result.content).toMatchObject([{ type: "text", text: fullText }]);
       expect(result.content.filter((part) => part.type === "toolCall")).toEqual([]);
-      const fullText = "Synthetic source.\n\n[Fixture source](https://example.test/source)";
       expect(
         events.filter((event) => event.type === "text_end").map((event) => event.content),
       ).toEqual(wire === "late-citation" ? ["Synthetic source.", fullText] : [fullText]);
@@ -653,21 +611,17 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
         expect(
           events
             .filter((event) => event.type.startsWith("text_"))
-            .map((event) => ({
-              type: event.type,
-              index: "contentIndex" in event ? event.contentIndex : undefined,
-              text: "delta" in event ? event.delta : "content" in event ? event.content : undefined,
-            })),
+            .map((event) => [
+              event.type,
+              "contentIndex" in event ? event.contentIndex : undefined,
+              "delta" in event ? event.delta : "content" in event ? event.content : undefined,
+            ]),
         ).toEqual([
-          { type: "text_start", index: 0, text: undefined },
-          { type: "text_delta", index: 0, text: "Synthetic source." },
-          { type: "text_end", index: 0, text: "Synthetic source." },
-          {
-            type: "text_delta",
-            index: 0,
-            text: "\n\n[Fixture source](https://example.test/source)",
-          },
-          { type: "text_end", index: 0, text: fullText },
+          ["text_start", 0, undefined],
+          ["text_delta", 0, prose],
+          ["text_end", 0, prose],
+          ["text_delta", 0, `\n\n${sourceLink}`],
+          ["text_end", 0, fullText],
         ]);
       }
       expect(allowed).toEqual(new Set(["web_search"]));
@@ -690,36 +644,15 @@ describe("ClawRouter admitted hosted search HTTP composition", () => {
       mode = wire;
       const { result, events } = await call();
       const text = result.content.find((part) => part.type === "text")?.text ?? "";
-      const paragraphs = new MarkdownIt()
-        .parse(text, {})
-        .filter((token) => token.type === "inline");
-      const parsed = paragraphs.flatMap((token) => token.children ?? []);
+      const secondLink = "[Second](https://example.test/second)";
+      const earlier = wire === "earlier-citation";
       expect(result.stopReason).toBe("stop");
-      expect(
-        paragraphs.map((paragraph) =>
-          (paragraph.children ?? [])
-            .filter((token) => token.type === "text")
-            .map((token) => token.content)
-            .join(""),
-        ),
-      ).toEqual([
-        "Synthetic source.",
-        wire === "earlier-citation" ? "Second Fixture source" : "Fixture source Second",
-      ]);
-      expect(
-        parsed.filter((token) => token.type === "link_open").map((token) => token.attrGet("href")),
-      ).toEqual(
-        wire === "earlier-citation"
-          ? ["https://example.test/second", "https://example.test/source"]
-          : ["https://example.test/source", "https://example.test/second"],
+      expect(text).toBe(
+        `${prose}\n\n${earlier ? `${secondLink} ${sourceLink}` : `${sourceLink} ${secondLink}`}`,
       );
       expect(
         events.filter((event) => event.type === "text_end").map((event) => event.content),
-      ).toEqual(
-        wire === "earlier-citation"
-          ? ["Synthetic source.\n\n[Second](https://example.test/second)", text]
-          : ["Synthetic source.", text],
-      );
+      ).toEqual(earlier ? [`${prose}\n\n${secondLink}`, text] : [prose, text]);
     },
   );
   it("does not replace completed prose or attach sources from a stale terminal message", async () => {
