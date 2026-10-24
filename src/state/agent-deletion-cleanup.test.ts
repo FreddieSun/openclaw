@@ -88,32 +88,42 @@ function expectPublishedArchive(databasePath: string, sessionId: string, content
 }
 
 describe("agent deletion database cleanup authority", () => {
-  it("purges through the live deletion owner without host SQLite with a warm survivor", async () => {
-    const f = fixture();
-    const { shared, sharedOptions: target, workerScope } = f.sharedStore();
-    appendTranscriptEventSync(
-      { ...workerScope, sessionId: "remove" },
-      { type: "proof", data: "retirement archive proof" },
-    );
-    await f.withDeletion(async (deletion) => {
-      const sql = observeHostDataSql();
-      try {
-        await deletion.runDatabaseCleanup(target, () => f.purge(target));
-        expect(
-          sql.queries.filter((query) =>
-            /\b(?:agent_deletion_journal|state_leases|session_nodes|session_windows|transcript_events|session_transcript_archives)\b/i.test(
-              query,
-            ),
-          ),
-        ).toEqual([]);
-      } finally {
-        sql.restore();
+  it.each([false, true])(
+    "purges through the live deletion owner without host SQLite (cold: %s)",
+    async (cold) => {
+      const f = fixture();
+      const { shared, sharedOptions: target, workerScope, keptScope } = f.sharedStore();
+      appendTranscriptEventSync(
+        { ...workerScope, sessionId: "remove" },
+        { type: "proof", data: "retirement archive proof" },
+      );
+      if (cold) {
+        closeAgentDb(shared.path);
       }
-    });
-    expect(readEntry(workerScope)).toBeUndefined();
-    expectPublishedArchive(target.path, "remove", "retirement archive proof");
-    expect(shared.db.isOpen).toBe(true);
-  });
+      await f.withDeletion(async (deletion) => {
+        const sql = observeHostDataSql();
+        try {
+          await deletion.runDatabaseCleanup(target, () => f.purge(target));
+          expect(
+            sql.queries.filter((query) =>
+              /\b(?:agent_deletion_journal|state_leases|session_nodes|session_windows|transcript_events|session_transcript_archives)\b/i.test(
+                query,
+              ),
+            ),
+          ).toEqual([]);
+        } finally {
+          sql.restore();
+        }
+      });
+      expect(readEntry(workerScope)).toBeUndefined();
+      expect(readEntry(keptScope)?.sessionId).toBe("keep");
+      expectPublishedArchive(target.path, "remove", "retirement archive proof");
+      expect(shared.db.isOpen).toBe(!cold);
+      if (cold) {
+        expect(getAgentDb(target)).toBeUndefined();
+      }
+    },
+  );
 
   it("retains an accepted archive export when journal takeover refuses its publication receipt", async () => {
     const f = fixture();
@@ -669,27 +679,6 @@ describe("agent deletion database cleanup authority", () => {
       expect(other.read()).toBe("before");
     });
   });
-
-  it.each([false, true])(
-    "purges only target rows in a surviving shared store (cold: %s)",
-    async (cold) => {
-      const f = fixture();
-      const { sharedOptions, shared, workerScope, keptScope, purge } = f.sharedStore();
-      const storePath = shared.path;
-      if (cold) {
-        closeAgentDb(storePath);
-      }
-      await f.withDeletion(async (deletion) => {
-        await expect(purge(deletion)).resolves.toBe(false);
-        expect(readEntry(workerScope)).toBeUndefined();
-        expect(readEntry(keptScope)?.sessionId).toBe("keep");
-        expect(shared.db.isOpen).toBe(!cold);
-        if (cold) {
-          expect(getAgentDb(sharedOptions)).toBeUndefined();
-        }
-      });
-    },
-  );
 
   it("retains close ownership when cleanup and close both fail", async () => {
     const f = fixture();

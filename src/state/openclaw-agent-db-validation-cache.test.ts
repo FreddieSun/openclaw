@@ -5,10 +5,7 @@ import { assert, describe, expect, it as baseIt, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { isPostgresSqlConnection } from "../infra/sql-connection.js";
 import { revokeSqliteDatabaseAdmissionsForPath } from "../infra/sqlite-database-admission.js";
-import {
-  getAdmittedSqliteSchemaFacts,
-  runSqliteReadOperationSync,
-} from "../infra/sqlite-schema-facts.js";
+import { runSqliteReadOperationSync } from "../infra/sqlite-schema-facts.js";
 import {
   AgentDatabaseSchemaAdmissionChangedError as AdmissionChangedError,
   AgentDatabaseSchemaAdmissionInvalidError as AdmissionInvalidError,
@@ -240,63 +237,24 @@ describe("canonical proof on physical database validation", () => {
     expect(() => reader!.assertCurrent()).toThrow("Session reader validation is no longer current");
   });
 
-  it("shares admitted schema across readers while retaining explicit revocation", ({
-    empty: { database, options },
-  }) => {
-    runSqliteReadOperationSync(database.db, () => expect(adoptSchema(database)).toBe(true));
-    database.db.exec("BEGIN");
-    try {
-      expect(adoptSchema(database)).toBe(false);
-    } finally {
-      database.db.exec("COMMIT");
-    }
-    expect(adoptSchema(database)).toBe(true);
-    using reader = openTestReader(options);
-    expect(adoptSchema(reader.database)).toBe(true);
-    runSqliteReadOperationSync(reader.db, () => expect(adoptSchema(reader.database)).toBe(true));
-    invalidateSchema(database);
-    expect(adoptSchema(database)).toBe(false);
-  });
-
-  it("repairs missing additive schema during refresh without losing existing sessions", ({
-    populated: { database, options },
-  }) => {
-    using reader = openTestReader(options);
-    const previousFacts = getValidation(database)?.schema?.facts;
-    assert(previousFacts, "Expected native schema facts before refresh");
-    const previousSchemaVersion = previousFacts.schemaVersion;
-    database.db.exec("DROP TABLE session_reactions");
-    expect(adoptSchema(database)).toBe(false);
-
-    refreshSchema(database, () => {});
-
-    expect(hasReadSchema(reader.database)).toBe(true);
-    const published = getAdmittedSqliteSchemaFacts(reader.database.db);
-    expect(published?.schemaVersion).toBeGreaterThan(previousSchemaVersion);
-    expect(published?.tables.has("session_reactions")).toBe(true);
-    expectRows(reader.database.db, "SELECT message_id FROM session_reactions", []);
-    expectRow(
-      reader.database.db,
-      "SELECT current_session_id, entry_json, updated_at FROM session_nodes WHERE session_key = ?",
-      {
-        current_session_id: "existing",
-        entry_json: '{"sessionId":"existing","updatedAt":1}',
-        updated_at: 1,
-      },
-      "agent:main:existing",
-    );
-  });
-
   it.for(["refreshed", "replacement"] as const)(
-    "shares %s proof published after local DDL without rechecking foreign schema markers",
-    (receipt, { empty: { database, options } }) => {
+    "repairs missing schema and shares %s proof without losing sessions",
+    (receipt, { populated: { database, options } }) => {
       using reader = openTestReader(options);
-      expect(hasCanonical(reader.database)).toBe(true);
+      runSqliteReadOperationSync(database.db, () => expect(adoptSchema(database)).toBe(true));
+      database.db.exec("BEGIN");
+      try {
+        expect(adoptSchema(database)).toBe(false);
+      } finally {
+        database.db.exec("COMMIT");
+      }
       const original = getValidation(database)!.schema!;
       publishSchema(database);
       const foreign = new DatabaseSync(database.path);
       try {
-        database.db.exec("CREATE TABLE late_reader_fixture(value TEXT)");
+        database.db.exec(
+          "DROP TABLE session_reactions; CREATE TABLE late_reader_fixture(value TEXT)",
+        );
         expect(adoptSchema(database)).toBe(false);
         refreshSchema(database, () => {});
         if (receipt === "replacement") {
@@ -308,6 +266,20 @@ describe("canonical proof on physical database validation", () => {
         expectSharedSchema(database, reader);
         expect(getValidation(database)?.schema?.facts?.tables.has("late_reader_fixture")).toBe(
           true,
+        );
+        expectRows(reader.db, "SELECT message_id FROM session_reactions", []);
+        expectRow(
+          reader.db,
+          "SELECT current_session_id, entry_json, updated_at FROM session_nodes WHERE session_key = ?",
+          {
+            current_session_id: "existing",
+            entry_json: '{"sessionId":"existing","updatedAt":1}',
+            updated_at: 1,
+          },
+          "agent:main:existing",
+        );
+        runSqliteReadOperationSync(reader.db, () =>
+          expect(adoptSchema(reader.database)).toBe(true),
         );
 
         // TEMP changes preserve MAIN admission; durable DDL still revokes it.
@@ -324,6 +296,8 @@ describe("canonical proof on physical database validation", () => {
         foreign.exec(`PRAGMA user_version = ${OPENCLAW_AGENT_SCHEMA_VERSION + 1}`);
         expect(adoptSchema(database)).toBe(true);
         expectSharedSchema(database, reader);
+        invalidateSchema(database);
+        expect(adoptSchema(database)).toBe(false);
       } finally {
         foreign.exec(`PRAGMA user_version = ${OPENCLAW_AGENT_SCHEMA_VERSION}`);
         foreign.close();

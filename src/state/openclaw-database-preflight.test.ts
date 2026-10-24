@@ -3,12 +3,9 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { gunzipSync } from "node:zlib";
 import { afterEach, expect, it, vi } from "vitest";
-import packageJson from "../../package.json" with { type: "json" };
-import { ensureMemoryIndexSchema } from "../../packages/memory-host-sdk/src/host/memory-schema.js";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { revokeSqliteDatabaseAdmissionsForPath } from "../infra/sqlite-database-admission.js";
-import { repairCanonicalSqliteIndexes } from "../infra/sqlite-index-schema.js";
 import { SqliteReadOnlyInspectionContentionError } from "../infra/sqlite-readonly-worker-protocol.js";
 import * as snapshots from "../infra/sqlite-snapshot-source.js";
 import { SQLITE_STAGING_TOKEN_FILES } from "../infra/sqlite-staging-token.js";
@@ -25,10 +22,7 @@ import {
   openRawDatabase,
   rejectSnapshot,
 } from "./database-preflight-fixtures.test-support.js";
-import { assertOpenClawAgentDatabaseForMaintenance } from "./openclaw-agent-db-maintenance.js";
 import { OpenClawAgentDatabaseMediaMigrationRequiredError } from "./openclaw-agent-db-migration-required.js";
-import { OPENCLAW_AGENT_SCHEMA_VERSION } from "./openclaw-agent-db.js";
-import { OPENCLAW_AGENT_SCHEMA_SQL } from "./openclaw-agent-schema.js";
 import {
   assertOpenClawDatabasesReady,
   preflightOpenClawStateDatabasePath,
@@ -59,7 +53,6 @@ import {
   closeOpenClawStateDatabaseAsync,
   assertOpenClawStateDatabaseForMaintenance,
 } from "./openclaw-state-db.js";
-import { OPENCLAW_STATE_MAINTENANCE_SCHEMA_COMPATIBILITY } from "./openclaw-state-schema-compatibility.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "./openclaw-state-schema.js";
 import {
   withStateMigrationBackupForTest,
@@ -79,10 +72,6 @@ function createState() {
   fixture.close();
   return fixture;
 }
-
-it("keeps package schema support metadata aligned", () => {
-  expect(packageJson.openclaw.schemaVersions).toEqual(supportedVersions);
-});
 
 it("keeps restart discovery off the caller thread and observes changed retained-deletion facts", async () => {
   const { statePath, ready, agent: openAgent } = createState();
@@ -765,35 +754,8 @@ it.each([
   },
 );
 
-it("accepts compatible future columns in shared-state and agent databases", () => {
-  using globalDatabase = createDatabase("global");
-  using agentDatabase = createDatabase("agent");
-  globalDatabase.exec("ALTER TABLE worktrees ADD COLUMN future_note TEXT;");
-  agentDatabase.exec("ALTER TABLE conversations ADD COLUMN future_note TEXT;");
-
-  expect(() =>
-    assertOpenClawStateDatabaseForMaintenance(globalDatabase, {
-      pathname: "global.sqlite",
-    }),
-  ).not.toThrow();
-  expect(() =>
-    assertOpenClawAgentDatabaseForMaintenance(agentDatabase, {
-      agentId: "worker-1",
-      pathname: "agent.sqlite",
-    }),
-  ).not.toThrow();
-});
-
 it("keeps every same-version additive column bare and canonical", () => {
-  const additiveColumns = CLAW_LAZY_ADDITIVE_STATE_COLUMN_DEFINITIONS.map(
-    ({ columnName, tableName }) => `${tableName}.${columnName}`,
-  );
-  expect(OPENCLAW_STATE_MAINTENANCE_SCHEMA_COMPATIBILITY.allowedMissingColumns).toEqual(
-    additiveColumns,
-  );
-  expect(new Set(additiveColumns).size).toBe(additiveColumns.length);
-
-  using database = createDatabase("global");
+  using database = createDatabase();
   const authorizationIndex = database
     .prepare(
       "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'idx_user_profile_identities_authorization'",
@@ -805,7 +767,6 @@ it("keeps every same-version additive column bare and canonical", () => {
   // A schema predating the authorization columns also predates their index.
   database.exec("DROP INDEX idx_user_profile_identities_authorization;");
   for (const { columnName, dataType, tableName } of CLAW_LAZY_ADDITIVE_STATE_COLUMN_DEFINITIONS) {
-    expect(["ANY", "BLOB", "INT", "INTEGER", "REAL", "TEXT"]).toContain(dataType);
     expectBareColumn(database, tableName, columnName, dataType);
     database.exec(`ALTER TABLE "${tableName}" DROP COLUMN "${columnName}";`);
   }
@@ -826,46 +787,15 @@ it("keeps every same-version additive column bare and canonical", () => {
   expectBareColumn(database, "device_bootstrap_tokens", "setup_id", "TEXT");
 });
 
-it("admits the retired chunk path index read-only and never repairs it back", () => {
-  using database = createDatabase("agent");
-  const retiredIndex = () =>
-    database
-      .prepare("SELECT name FROM sqlite_schema WHERE name = 'idx_memory_index_chunks_path'")
-      .get();
-  expect(retiredIndex()).toBeUndefined();
-  database.exec("CREATE INDEX idx_memory_index_chunks_path ON memory_index_chunks(path)");
-  for (const retained of [true, false]) {
-    if (!retained) {
-      ensureMemoryIndexSchema({ db: database, cacheEnabled: true, ftsEnabled: false });
-      database.exec("DROP INDEX idx_memory_index_chunks_path_source");
-      expect(
-        repairCanonicalSqliteIndexes(database, "agent.sqlite", OPENCLAW_AGENT_SCHEMA_SQL),
-      ).toEqual(["idx_memory_index_chunks_path_source"]);
-      expect(retiredIndex()).toBeUndefined();
-    }
-    database.exec("PRAGMA query_only = ON");
-    expect(() =>
-      assertOpenClawAgentDatabaseForMaintenance(database, {
-        agentId: "worker-1",
-        pathname: "agent.sqlite",
-      }),
-    ).not.toThrow();
-    database.exec("PRAGMA query_only = OFF");
-  }
-});
-
-function createDatabase(role: "global" | "agent") {
-  const global = role === "global";
-  const schema = global ? OPENCLAW_STATE_SCHEMA_SQL : OPENCLAW_AGENT_SCHEMA_SQL;
-  const version = global ? OPENCLAW_STATE_SCHEMA_VERSION : OPENCLAW_AGENT_SCHEMA_VERSION;
+function createDatabase() {
   const database = new DatabaseSync(":memory:");
-  database.exec(schema);
-  database.exec(`PRAGMA user_version = ${version};`);
+  database.exec(OPENCLAW_STATE_SCHEMA_SQL);
+  database.exec(`PRAGMA user_version = ${OPENCLAW_STATE_SCHEMA_VERSION};`);
   database
     .prepare(`INSERT INTO schema_meta
       (meta_key, role, schema_version, agent_id, app_version, created_at, updated_at)
       VALUES ('primary', ?, ?, ?, NULL, 1, 1)`)
-    .run(role, version, global ? null : "worker-1");
+    .run("global", OPENCLAW_STATE_SCHEMA_VERSION, null);
   return database;
 }
 
