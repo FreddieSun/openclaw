@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { steerActiveSessionWithOptionalDeliveryWait } from "../embedded-agent-runner/run/attempt-queue-message.js";
 import { createStubTool } from "../test-helpers/agent-tool-stubs.js";
+import { createZeroUsageFixture } from "../test-helpers/usage-fixtures.js";
 import { agentSessionAutomaticCompaction } from "./agent-session-compaction.js";
 import {
   appendHistory,
@@ -99,18 +100,14 @@ function mockSummaryRecovery(
   return observed;
 }
 
-function invalidSummary(model: Model, kind: string, attempt?: number) {
+function invalidSummary(model: Model, kind: string) {
+  const truncated = kind === "truncated";
   return createAssistant(
     model,
-    kind === "truncated"
-      ? [{ type: "text", text: "## Next Steps\n- verify the backfi" }]
-      : [
-          {
-            type: "thinking",
-            thinking: `internal summary reasoning${attempt === undefined ? "" : ` ${attempt}`}`,
-          },
-        ],
-    kind === "truncated" ? "length" : "stop",
+    truncated
+      ? "## Next Steps\n- verify the backfi"
+      : [{ type: "thinking", thinking: "summary reasoning" }],
+    truncated ? "length" : "stop",
   );
 }
 
@@ -399,13 +396,8 @@ describe("AgentSession loop correctness", () => {
     sessionManager.appendMessage({
       ...createAssistant(model, "usage unavailable"),
       usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
+        ...createZeroUsageFixture(),
         contextUsage: { state: "unavailable" },
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
     });
     const settingsManager = createAutoCompactionSettings({
@@ -486,7 +478,7 @@ describe("AgentSession loop correctness", () => {
       return createAssistantResultStream(
         outcome === "recover" && attempt === 2
           ? createAssistant(model, "recovered default summary")
-          : invalidSummary(model, kind, attempt),
+          : invalidSummary(model, kind),
       );
     }, outcome === "recover");
     const events = collectCompactionEnds(session);

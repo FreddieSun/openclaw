@@ -627,8 +627,9 @@ describe("handleManagedOutgoingImageHttpRequest", () => {
   it("serves compressed bounded 1600×800 renditions through local reads and the artifact ticket", async () => {
     const source = createSolidPngBuffer(1600, 800, { r: 24, g: 64, b: 128 });
     const { attachmentId, sessionKey } = await createFixture(stateDir, { body: source });
+    const transcriptMessages = [mediaMessage({ sessionKey, attachmentId })];
     mockSessionEntry(path.join(stateDir, "sessions.sqlite"));
-    readSessionMessagesMock.mockResolvedValue([mediaMessage({ sessionKey, attachmentId })]);
+    readSessionMessagesMock.mockResolvedValue(transcriptMessages);
     const preparedSource = await resolveManagedOutgoingImageArtifactDownload({
       sessionKey,
       artifactId: `${MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX}${attachmentId}`,

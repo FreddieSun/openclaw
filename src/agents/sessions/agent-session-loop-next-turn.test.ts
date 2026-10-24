@@ -153,13 +153,10 @@ function queuedState(session: AgentSession) {
   };
 }
 
-function mockAbortableQueuedRun() {
-  const executeTool = vi.fn();
+async function startAbortableQueuedRun() {
+  const executeTool = vi.fn(async () => toolResult("action completed"));
   const requests: Array<{ context: Context; signal: AbortSignal | undefined }> = [];
-  const tool = makeTool("queued_action", async () => {
-    executeTool();
-    return toolResult("action completed");
-  });
+  const tool = makeTool("queued_action", executeTool);
 
   streamMocks.streamSimple.mockImplementation(
     (activeModel: Model, context: Context, options?: SimpleStreamOptions) => {
@@ -175,7 +172,10 @@ function mockAbortableQueuedRun() {
     },
   );
 
-  return { executeTool, requests, tool };
+  const { session } = await createTestSession({ customTools: [tool] });
+  const prompt = session.prompt("wait for operator cancellation");
+  await vi.waitFor(() => expect(requests).toHaveLength(1));
+  return { executeTool, requests, session, prompt };
 }
 
 describe("AgentSession queue and next-turn lifecycle correctness", () => {
@@ -460,17 +460,13 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
       await initialPrompt;
 
       expect(requests).toHaveLength(2);
-      expect(requests[1]?.messages).toContainEqual(
-        expect.objectContaining({ role: "user", content: [{ type: "text", text: "" }, image] }),
-      );
+      const queuedImage = expect.objectContaining({
+        role: "user",
+        content: [{ type: "text", text: "" }, image],
+      });
+      expect(requests[1]?.messages).toContainEqual(queuedImage);
       expect(sessionManager.getEntries()).toContainEqual(
-        expect.objectContaining({
-          type: "message",
-          message: expect.objectContaining({
-            role: "user",
-            content: [{ type: "text", text: "" }, image],
-          }),
-        }),
+        expect.objectContaining({ type: "message", message: queuedImage }),
       );
       expect(session.pendingMessageCount).toBe(0);
       expect(session.getSteeringMessages()).toEqual([]);
@@ -587,10 +583,7 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
   it.each(imageQueues)(
     "keeps queued image-only $kind dormant after its active run is aborted",
     async (scenario) => {
-      const { executeTool, requests, tool } = mockAbortableQueuedRun();
-      const { session } = await createTestSession({ customTools: [tool] });
-      const prompt = session.prompt("wait for operator cancellation");
-      await vi.waitFor(() => expect(requests).toHaveLength(1));
+      const { executeTool, requests, session, prompt } = await startAbortableQueuedRun();
 
       await scenario.queue(session);
       expect(session.agent.hasQueuedMessages()).toBe(true);
@@ -608,10 +601,7 @@ describe("AgentSession queue and next-turn lifecycle correctness", () => {
   it.each([true, false])(
     "cancels only an uncommitted steer after an aborted turn (wait: %s)",
     async (waitForTranscriptCommit) => {
-      const { executeTool, requests, tool } = mockAbortableQueuedRun();
-      const { session } = await createTestSession({ customTools: [tool] });
-      const prompt = session.prompt("wait for operator cancellation");
-      await vi.waitFor(() => expect(requests).toHaveLength(1));
+      const { executeTool, requests, session, prompt } = await startAbortableQueuedRun();
 
       await session.steer("keep unrelated steering");
       await session.followUp("keep unrelated follow-up");

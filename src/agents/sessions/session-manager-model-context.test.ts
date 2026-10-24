@@ -432,59 +432,34 @@ it("releases aborted durable context reads before the next read", async () => {
   });
 });
 
-it.each(["rewrite", "append"] as const)(
-  "validates durable admission before accepting context (mutation=%s)",
-  async (mutation) => {
-    await withSessionState("worker-fence", async ({ scope }) => {
-      const source = SessionManager.open(scope);
-      source.appendMessage(makeUserMessage("previous", 1));
-      await waitForSessionTranscriptProjection(scope);
-      const admitted = source.appendMessageWithTranscriptAnchor(makeUserMessage("current", 2));
-      assert(admitted.anchor, "missing admission");
-      const admission = {
-        ...admitted.anchor,
-        role: "user" as const,
-        logicalTurnId: "worker-fence",
-      };
-      const expected = readModel(scope, { admission });
-      const mutate = () => {
-        if (mutation === "rewrite") {
-          expect(
-            source.removeTrailingEntries(
-              (entry) =>
-                entry.type === "message" &&
-                entry.message.role === "user" &&
-                entry.message.content === "current",
-            ),
-          ).toBe(1);
-        }
-        source.appendMessage(makeUserMessage("replacement", 3));
-      };
-      const spy = afterModelRead(mutate, true);
-      try {
-        const pending = SessionManager.openModelContextAsync(scope, { admission });
-        if (mutation === "rewrite") {
-          await expect(pending).rejects.toThrow("Current-turn transcript admission");
-        } else {
-          expect((await pending).buildSessionContext()).toEqual(expected);
-        }
-      } finally {
-        spy.mockRestore();
-      }
-    });
-  },
-);
-
-it.each(["append", "rewrite", "delete", "branch", "compaction", "reset", "other-session"] as const)(
-  "validates unadmitted durable context before acceptance (mutation=%s)",
-  async (mutation) => {
-    await withSessionState("unadmitted-context", async ({ scope }) => {
+it.each([
+  { mutation: "rewrite", admitted: true },
+  { mutation: "append", admitted: true },
+  { mutation: "append", admitted: false },
+  { mutation: "rewrite", admitted: false },
+  { mutation: "delete", admitted: false },
+  { mutation: "branch", admitted: false },
+  { mutation: "compaction", admitted: false },
+  { mutation: "reset", admitted: false },
+  { mutation: "other-session", admitted: false },
+])(
+  "validates durable context before acceptance ($mutation, admitted=$admitted)",
+  async ({ mutation, admitted }) => {
+    await withSessionState("context-mutation", async ({ scope }) => {
       const source = SessionManager.open(scope);
       const first = source.appendMessage(makeUserMessage("before", 1));
       if (mutation === "branch") {
         source.appendMessage(makeUserMessage("branch tip", 2));
       }
-      const expected = source.buildSessionContext();
+      let admission: NonNullable<Parameters<typeof readModel>[1]>["admission"];
+      if (admitted) {
+        await waitForSessionTranscriptProjection(scope);
+        const current = source.appendMessageWithTranscriptAnchor(makeUserMessage("current", 2));
+        assert(current.anchor, "missing admission");
+        admission = { ...current.anchor, role: "user" as const, logicalTurnId: "context-mutation" };
+      }
+      const options = { admission };
+      const expected = admitted ? readModel(scope, options) : source.buildSessionContext();
       let mutationSource = source;
       if (mutation === "other-session") {
         const otherScope = {
@@ -492,55 +467,48 @@ it.each(["append", "rewrite", "delete", "branch", "compaction", "reset", "other-
           sessionId: "other-context",
           sessionKey: `${scope.sessionKey}-other`,
         };
-        await upsertSessionEntryCore(otherScope, {
-          sessionId: otherScope.sessionId,
-          updatedAt: 1,
-        });
+        await upsertSessionEntryCore(otherScope, { sessionId: otherScope.sessionId, updatedAt: 1 });
         mutationSource = SessionManager.open(otherScope);
       }
-      const mutate = () => {
-        if (mutation === "rewrite") {
+      const spy = afterModelRead(() => {
+        if (mutation === "rewrite" && !admitted) {
+          const original = source.getEntry(first);
+          assert(original?.type === "message", "missing first message");
           expect(
             replaceTranscriptEventsSync(scope, [
               source.getHeader(),
-              ...source.getEntries().map((entry) =>
-                entry.type === "message"
-                  ? Object.assign({}, entry, {
-                      message: makeUserMessage("rewritten prefix", 1),
-                    })
-                  : entry,
-              ),
+              { ...original, message: makeUserMessage("rewritten prefix", 1) },
             ]),
           ).toBe(true);
           return;
         }
-        if (mutation === "delete") {
-          expect(
-            source.removeTrailingEntries(
-              (entry) =>
-                entry.type === "message" &&
-                entry.message.role === "user" &&
-                entry.message.content === "before",
-            ),
-          ).toBe(1);
-          return;
-        }
-        if (mutation === "branch") {
+        if (mutation === "delete" || (mutation === "rewrite" && admitted)) {
+          const removedId = admission?.entryId ?? first;
+          expect(source.removeTrailingEntries((entry) => entry.id === removedId)).toBe(1);
+          if (!admitted) {
+            return;
+          }
+        } else if (mutation === "branch") {
           source.branch(first);
         } else if (mutation === "compaction") {
           source.appendCompaction("summary", first, 1);
         } else if (mutation === "reset") {
           source.resetLeaf();
         }
-        mutationSource.appendMessage(makeUserMessage("after", 2));
-      };
-      const spy = afterModelRead(mutate, true);
+        mutationSource.appendMessage(
+          makeUserMessage(admitted ? "replacement" : "after", admitted ? 3 : 2),
+        );
+      }, true);
       try {
-        const pending = SessionManager.openModelContextAsync(scope);
-        if (mutation === "other-session" || mutation === "append") {
+        const pending = SessionManager.openModelContextAsync(scope, options);
+        if (mutation === "append" || mutation === "other-session") {
           expect((await pending).buildSessionContext()).toEqual(expected);
         } else {
-          await expect(pending).rejects.toThrow("Session transcript changed during context read");
+          await expect(pending).rejects.toThrow(
+            admitted
+              ? "Current-turn transcript admission"
+              : "Session transcript changed during context read",
+          );
         }
       } finally {
         spy.mockRestore();
