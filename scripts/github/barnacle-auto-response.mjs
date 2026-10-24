@@ -1120,7 +1120,8 @@ export async function runBarnacleAutoResponse({ github, context, core = console,
     }
     await runAdmittedAutoResponse({
       github: guarded,
-      context: { ...context, payload, barnacleAppId: expectedAppId },
+      // Actions' Context exposes `repo` as a prototype getter, which spread drops.
+      context: { ...context, repo: context.repo, payload, barnacleAppId: expectedAppId },
       core,
     });
   } catch (error) {

@@ -34,6 +34,13 @@ function file(filename: string, status = "modified", previousFilename?: string) 
 }
 
 const repo = { owner: "openclaw", repo: "openclaw" };
+// Mirrors @actions/github's Context: `repo` is a prototype getter, not an own property.
+class ActionsContext<Payload> {
+  constructor(readonly payload: Payload) {}
+  get repo() {
+    return repo;
+  }
+}
 const broadFiles = () => [
   file("ui/src/app.ts"),
   file("src/gateway/server.ts"),
@@ -52,23 +59,20 @@ function barnacleContext(
   labels: string[] = [],
   options: Record<string, unknown> = {},
 ) {
-  return {
-    repo,
-    payload: {
-      action: options.action ?? "opened",
-      label: options.label,
-      sender: options.sender,
-      pull_request: {
-        number: 123,
-        title: "Cleanup plugin docs",
-        body: blankTemplateBody,
-        author_association: "CONTRIBUTOR",
-        user: { login: "contributor" },
-        labels: labels.map((name) => ({ name })),
-        ...pullRequest,
-      },
+  return new ActionsContext({
+    action: options.action ?? "opened",
+    label: options.label,
+    sender: options.sender,
+    pull_request: {
+      number: 123,
+      title: "Cleanup plugin docs",
+      body: blankTemplateBody,
+      author_association: "CONTRIBUTOR",
+      user: { login: "contributor" },
+      labels: labels.map((name) => ({ name })),
+      ...pullRequest,
     },
-  };
+  });
 }
 
 function barnacleIssueContext(
@@ -78,20 +82,17 @@ function barnacleIssueContext(
 ) {
   const { payload } = barnacleContext(issue, labels, options);
   const { pull_request, ...event } = payload;
-  return {
-    repo,
-    payload: {
-      ...event,
-      issue: {
-        ...pull_request,
-        number: 456,
-        title: "OpenClaw issue",
-        body: "",
-        ...issue,
-      },
-      comment: options.comment,
+  return new ActionsContext({
+    ...event,
+    issue: {
+      ...pull_request,
+      number: 456,
+      title: "OpenClaw issue",
+      body: "",
+      ...issue,
     },
-  };
+    comment: options.comment,
+  });
 }
 
 function barnacleGithub(
