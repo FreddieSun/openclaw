@@ -18,6 +18,8 @@ import type { WorkerTunnelManager } from "./tunnel.js";
 
 type WorkerEnvironmentServiceError = support.WorkerEnvironmentServiceError;
 type WorkerLifecycleLease = support.WorkerLifecycleLease;
+const createRequest = (idempotencyKey: string) => ({ profileId: "development", idempotencyKey });
+const invalidState = { code: "invalid_state" } satisfies Partial<WorkerEnvironmentServiceError>;
 
 function holdBootstrap() {
   const pending = createDeferred();
@@ -212,54 +214,48 @@ describe("worker environment service", () => {
         return { status: "active", ...(sharedHost === undefined ? {} : { sharedHost }) };
       },
     });
-    const service = support.createService(provider);
-    expect(Boolean(service.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(false);
-    await service.reconcileOnce();
+    let service = support.createService(provider);
+    const qualification = () => service.getDedicatedNodeLeaseSignal(node.environmentId);
+    const inspect = async (next: boolean | undefined, qualified: boolean) => {
+      sharedHost = next;
+      await service.reconcileOnce();
+      expect(Boolean(qualification())).toBe(qualified);
+    };
+    expect(qualification()).toBeUndefined();
+    await inspect(undefined, false);
     expect(service.get(node.environmentId)?.sharedHost).toBe(false);
-    expect(Boolean(service.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(false);
-    sharedHost = false;
-    await service.reconcileOnce();
-    expect(Boolean(service.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(true);
-    const firstQualification = service.getDedicatedNodeLeaseSignal(node.environmentId)!;
-    await service.reconcileOnce();
-    expect(service.getDedicatedNodeLeaseSignal(node.environmentId)).toBe(firstQualification);
-    expect(firstQualification.aborted).toBe(false);
+    await inspect(false, true);
+    const first = qualification()!;
+    await inspect(false, true);
+    expect(qualification()).toBe(first);
+    expect(first.aborted).toBe(false);
     inspectionFails = true;
-    await service.reconcileOnce();
-    expect(service.getDedicatedNodeLeaseSignal(node.environmentId)).toBe(firstQualification);
-    expect(firstQualification.aborted).toBe(false);
+    await inspect(false, true);
+    expect(qualification()).toBe(first);
+    expect(first.aborted).toBe(false);
     inspectionFails = false;
-    sharedHost = undefined;
-    await service.reconcileOnce();
+    await inspect(undefined, false);
     expect(service.get(node.environmentId)?.sharedHost).toBe(false);
-    expect(Boolean(service.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(false);
-    expect(firstQualification.aborted).toBe(true);
-    sharedHost = false;
-    await service.reconcileOnce();
-    expect(Boolean(service.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(true);
-    sharedHost = true;
-    await service.reconcileOnce();
-    expect(Boolean(service.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(false);
-    sharedHost = false;
-    await service.reconcileOnce();
-    expect(Boolean(service.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(true);
+    expect(first.aborted).toBe(true);
+    await inspect(false, true);
+    await inspect(true, false);
+    await inspect(false, true);
     await service.stop();
-    expect(Boolean(service.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(false);
-    const restarted = support.createService(provider);
-    expect(Boolean(restarted.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(false);
-    await restarted.reconcileOnce();
-    expect(Boolean(restarted.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(true);
-    const epoch = restarted.get(node.environmentId)!.ownerEpoch;
-    const restartedQualification = restarted.getDedicatedNodeLeaseSignal(node.environmentId)!;
+    expect(qualification()).toBeUndefined();
+    service = support.createService(provider);
+    expect(qualification()).toBeUndefined();
+    await inspect(false, true);
+    const epoch = service.get(node.environmentId)!.ownerEpoch;
+    const restarted = qualification()!;
     await support.testState.store.revokeEnvironmentCredential(node.environmentId);
-    expect(restarted.getDedicatedNodeLeaseSignal(node.environmentId)).toBe(restartedQualification);
-    expect(restartedQualification.aborted).toBe(false);
+    expect(qualification()).toBe(restarted);
+    expect(restarted.aborted).toBe(false);
     await support.testState.store.revokeEnvironmentCredential(node.environmentId, {
       expectedOwnerEpoch: epoch,
       fenceWorkspaceTransfers: true,
     });
-    expect(Boolean(restarted.getDedicatedNodeLeaseSignal(node.environmentId))).toBe(false);
-    expect(restartedQualification.aborted).toBe(true);
+    expect(qualification()).toBeUndefined();
+    expect(restarted.aborted).toBe(true);
   });
 
   it("warms machine catalogs at startup only for nonterminal environment profiles", async () => {
@@ -366,10 +362,7 @@ describe("worker environment service", () => {
       await siblingStarted.promise;
       expect(inspect).toHaveBeenCalledTimes(2);
       await expect(
-        workerService.createWithRequest({
-          profileId: "development",
-          idempotencyKey: "during-maintenance",
-        }),
+        workerService.createWithRequest(createRequest("during-maintenance")),
       ).resolves.toMatchObject({ state: "ready" });
     } finally {
       finishTarget.resolve();
@@ -382,7 +375,7 @@ describe("worker environment service", () => {
     expect(prune).toHaveBeenCalledOnce();
   });
 
-  it("skips terminal retention reads for empty inventory and resumes after a committed create", async () => {
+  it("runs retention only after a committed create and propagates its failures", async () => {
     const prune = vi.spyOn(support.testState.store, "pruneTerminalEnvironments");
     const workerService = support.createService(support.createProvider());
 
@@ -393,21 +386,12 @@ describe("worker environment service", () => {
     await support.seedReady("retention-created-worker");
     await workerService.reconcileOnce();
     expect(prune).toHaveBeenCalledOnce();
-  });
-
-  it("propagates terminal cleanup failures", async () => {
-    await support.seedReady("retention-failure-worker");
     const error = Object.assign(new Error("disk I/O error"), { code: "SQLITE_IOERR" });
-    const prune = vi
-      .spyOn(support.testState.store, "pruneTerminalEnvironments")
-      .mockImplementation(() => {
-        throw error;
-      });
-
-    await expect(support.createService(support.createProvider()).reconcileOnce()).rejects.toBe(
-      error,
-    );
-    expect(prune).toHaveBeenCalledOnce();
+    prune.mockImplementationOnce(() => {
+      throw error;
+    });
+    await expect(workerService.reconcileOnce()).rejects.toBe(error);
+    expect(prune).toHaveBeenCalledTimes(2);
   });
 
   it.each([false, true])(
@@ -422,29 +406,18 @@ describe("worker environment service", () => {
         if (input.from !== "requested" || input.to !== "provisioning") {
           return transition(input);
         }
-        if (committed) {
-          const record = await transition(input);
-          transitionEntered.resolve();
-          await releaseTransition.promise;
-          return record;
-        }
+        const record = committed ? await transition(input) : undefined;
         transitionEntered.resolve();
         await releaseTransition.promise;
-        return transition(input);
+        return record ?? transition(input);
       });
       const provision = vi.fn(support.createProvider().provision);
       const workerService = support.createService(support.createProvider({ provision }), {
         providerCallTimeoutMs: 5,
       });
       const creationResult = workerService
-        .createWithRequest({
-          profileId: "development",
-          idempotencyKey: "request-provision-transition-timeout",
-        })
-        .then(
-          (value) => ({ ok: true as const, value }),
-          (error: unknown) => ({ ok: false as const, error }),
-        );
+        .createWithRequest(createRequest("request-provision-transition-timeout"))
+        .catch((error: unknown) => ({ error }));
       try {
         await Promise.race([
           transitionEntered.promise,
@@ -459,7 +432,6 @@ describe("worker environment service", () => {
       }
 
       expect(await creationResult).toMatchObject({
-        ok: false,
         error: { code: "provider_failure" } satisfies Partial<WorkerEnvironmentServiceError>,
       });
       expect(provision).not.toHaveBeenCalled();
@@ -491,19 +463,12 @@ describe("worker environment service", () => {
     const inspect = vi.fn(async () => ({ status: "active" as const }));
     const liveEvents = support.createLiveEvents();
     const unsubscribeTurnClaimClosed = vi.fn();
-    const placementStore = {
-      fenceWorkerTurnForRecovery: vi.fn(),
-      prepareWorkerRuntimeRefresh: vi.fn(async () => {
-        throw new Error("Runtime refresh is outside this timer fixture");
-      }),
-      readWorkerTurnClaim: vi.fn(),
-      readWorkerTurnLiveAckCursor: vi.fn(() => 0),
-      validateWorkerTurn: vi.fn(() => false),
-      isWorkerTurnToolAuthorized: vi.fn(() => false),
-      updateAckCursors: vi.fn(async () => {}),
-      prepareWorkspaceResultOwnerRevocation: vi.fn(async () => {}),
-      registerTurnClaimClosedHandler: vi.fn(() => unsubscribeTurnClaimClosed),
-    };
+    const placementStore = createWorkerSessionPlacementStore({
+      database: support.testState.stateDb,
+    });
+    vi.spyOn(placementStore, "registerTurnClaimClosedHandler").mockReturnValue(
+      unsubscribeTurnClaimClosed,
+    );
     const workerService = support.createService(support.createProvider({ inspect }), {
       liveEvents,
       placementStore,
@@ -587,14 +552,14 @@ describe("worker environment service", () => {
       const provision = vi.fn(support.createProvider().provision);
       const destroy = vi.fn(async () => {});
       const service = support.createService(support.createProvider({ provision, destroy }));
-      const request = { profileId: "development", idempotencyKey: "queued-before-stop" };
+      const request = createRequest("queued-before-stop");
       const first = service.createWithRequest(request);
       await bootstrap.entered;
       let queuedResult: Promise<unknown>;
       if (operation === "create") {
-        queuedResult = expect(service.createWithRequest(request)).rejects.toMatchObject({
-          code: "invalid_state",
-        } satisfies Partial<WorkerEnvironmentServiceError>);
+        queuedResult = expect(service.createWithRequest(request)).rejects.toMatchObject(
+          invalidState,
+        );
       } else {
         const environmentId = support.testState.store.list()[0]?.environmentId;
         expect(environmentId).toBeTruthy();
@@ -633,10 +598,9 @@ describe("worker environment service", () => {
     const durableStore = support.testState.store;
     const bootstrap = holdBootstrap();
     const workerService = support.createService(support.createProvider());
-    const creation = workerService.createWithRequest({
-      profileId: "development",
-      idempotencyKey: "request-stop-after-reconcile-failure",
-    });
+    const creation = workerService.createWithRequest(
+      createRequest("request-stop-after-reconcile-failure"),
+    );
     await bootstrap.entered;
     try {
       vi.spyOn(durableStore, "ready").mockRejectedValueOnce(
@@ -783,16 +747,9 @@ describe("worker environment service", () => {
         lastError: initial.lastError,
       });
       await expect(
-        workerService.createWithRequest({
-          profileId: "development",
-          idempotencyKey: "request-after-stop",
-        }),
-      ).rejects.toMatchObject({
-        code: "invalid_state",
-      } satisfies Partial<WorkerEnvironmentServiceError>);
-      await expect(workerService.destroy(environmentId)).rejects.toMatchObject({
-        code: "invalid_state",
-      } satisfies Partial<WorkerEnvironmentServiceError>);
+        workerService.createWithRequest(createRequest("request-after-stop")),
+      ).rejects.toMatchObject(invalidState);
+      await expect(workerService.destroy(environmentId)).rejects.toMatchObject(invalidState);
     },
   );
 });

@@ -15,6 +15,7 @@ import type { SandboxBackendHandle } from "../../agents/sandbox/backend-handle.t
 import { requireGit } from "../../agents/worktrees/git.js";
 import { deleteRegistryWorktree } from "../../agents/worktrees/registry.js";
 import { getRegistryWorktree } from "../../agents/worktrees/registry.test-support.js";
+import { makeWorktreeRecord } from "../../agents/worktrees/service.test-support.js";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
@@ -128,19 +129,12 @@ beforeEach(async () => {
         throw new Error("revoked");
       }
     },
-    worktree: {
-      id: randomUUID(),
-      name: "guest",
-      repoFingerprint: "test",
-      repoRoot: repo,
+    worktree: makeWorktreeRecord(repo, randomUUID(), {
       path: canonical,
       branch: "openclaw/guest",
       baseRef: "main",
-      ownerKind: "session",
       ownerId: sessionKey,
-      createdAt: 0,
-      lastActiveAt: 0,
-    },
+    }),
   };
 });
 
