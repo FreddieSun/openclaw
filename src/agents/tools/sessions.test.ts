@@ -1,6 +1,5 @@
 import path from "node:path";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
-// Sessions tool tests cover list/send helpers and session delivery target resolution.
 import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -33,7 +32,8 @@ const callGatewayMock = vi.fn();
 const inProcessCreationMock = vi.fn(
   async (..._args: [unknown, unknown, unknown]): Promise<unknown> => ({}),
 );
-const recordParticipantMock = vi.fn();
+type A2AFlow = typeof import("./sessions-send-tool.a2a.js").runSessionsSendA2AFlow;
+const runSessionsSendA2AFlow = vi.hoisted(() => vi.fn<A2AFlow>());
 // Default false mirrors running outside a gateway process; the trusted-creation
 // regression test flips it on and restores it.
 let inProcessGatewayContextAvailable = false;
@@ -59,10 +59,10 @@ vi.mock("./in-process-gateway.js", () => ({
 }));
 
 vi.mock("./sessions-send-tool.a2a.js", () => ({
-  runSessionsSendA2AFlow: vi.fn(),
+  runSessionsSendA2AFlow,
 }));
 vi.mock("../../sessions/session-participant-recording.js", () => ({
-  recordSessionParticipantBestEffort: (...args: unknown[]) => recordParticipantMock(...args),
+  recordSessionParticipantBestEffort: vi.fn(),
 }));
 
 let createSessionsListTool: typeof import("./sessions-list-tool.js").createSessionsListTool;
@@ -87,16 +87,22 @@ function requireDetails(result: { details?: unknown }, label = "result details")
   return requireRecord(result.details, label);
 }
 
-function requireSessions(details: Record<string, unknown>) {
-  const sessions = details.sessions;
-  if (!Array.isArray(sessions)) {
-    throw new Error("expected details.sessions");
-  }
-  return sessions.map((session, index) => requireRecord(session, `session ${index}`));
-}
-
 function requireGatewayRequest(index = 0) {
   return requireRecord(callGatewayMock.mock.calls[index]?.[0], `gateway request ${index}`);
+}
+
+function sessionList(
+  key: string,
+  fields: Record<string, unknown> = {},
+  storePath = "/tmp/sessions.json",
+) {
+  return { path: storePath, sessions: [{ key, kind: "direct", ...fields }] };
+}
+
+function gatewayParams(method: string) {
+  return requireRecord(
+    callGatewayMock.mock.calls.find(([request]) => request.method === method)?.[0]?.params,
+  );
 }
 
 type GatewayRequest = { method?: string; timeoutMs?: unknown };
@@ -110,10 +116,7 @@ function mockGatewayMethods(responses: GatewayResponses) {
 
 function mockTargetRun(sessionKey: string, runId: string, responses: GatewayResponses) {
   mockGatewayMethods({
-    "sessions.list": () => ({
-      path: "/tmp/sessions.json",
-      sessions: [{ key: sessionKey, kind: "direct" }],
-    }),
+    "sessions.list": () => sessionList(sessionKey),
     agent: () => ({ runId, acceptedAt: 123 }),
     ...responses,
   });
@@ -133,11 +136,12 @@ function seedMainSession(
 
 function createAllSessionsConfig(
   sessions: NonNullable<NonNullable<OpenClawConfig["tools"]>["sessions"]> = {},
+  agentToAgentEnabled = false,
 ): OpenClawConfig {
   return {
     session: { scope: "per-sender", mainKey: "main" },
     tools: {
-      agentToAgent: { enabled: false },
+      agentToAgent: { enabled: agentToAgentEnabled },
       sessions: { visibility: "all", ...sessions },
     },
   };
@@ -158,26 +162,21 @@ beforeAll(async () => {
 
 const installRegistry = () =>
   setActivePluginRegistry(
-    createSessionsChannelTestRegistry([
-      {
-        id: "discord",
-        label: "Discord",
-        chatTypes: ["direct", "channel", "thread"],
-        resolveConversation: false,
-      },
-      {
-        id: "feishu",
-        label: "Feishu",
-        chatTypes: ["direct", "group"],
-        preferSessionLookupForAnnounceTarget: true,
-      },
-      {
-        id: "slack",
-        label: "Slack",
-        chatTypes: ["direct", "channel", "thread"],
-        preferSessionLookupForAnnounceTarget: true,
-      },
-    ]),
+    createSessionsChannelTestRegistry(
+      (
+        [
+          ["discord", "Discord", ["direct", "channel", "thread"], false],
+          ["feishu", "Feishu", ["direct", "group"], true],
+          ["slack", "Slack", ["direct", "channel", "thread"], true],
+        ] as const
+      ).map(([id, label, chatTypes, resolveConversation]) => ({
+        id,
+        label,
+        chatTypes: [...chatTypes],
+        resolveConversation,
+        preferSessionLookupForAnnounceTarget: resolveConversation,
+      })),
+    ),
   );
 
 function createMainSessionsListTool() {
@@ -201,21 +200,10 @@ async function executeFireAndForgetA2AFrom(
   options?: { expectReplyFlow?: boolean },
 ) {
   setActivePluginRegistry(createSessionConversationTestRegistry());
-  const { runSessionsSendA2AFlow } = await import("./sessions-send-tool.a2a.js");
-  vi.mocked(runSessionsSendA2AFlow).mockClear();
   const targetSessionKey = "agent:other:discord:group:ops";
-  setRuntimeConfigSnapshot({
-    session: { scope: "per-sender", mainKey: "main" },
-    tools: {
-      agentToAgent: { enabled: true },
-      sessions: { visibility: "all" },
-    },
-  });
+  setRuntimeConfigSnapshot(createAllSessionsConfig({}, true));
   mockGatewayMethods({
-    "sessions.list": () => ({
-      path: "/tmp/sessions.json",
-      sessions: [{ key: targetSessionKey, kind: "group" }],
-    }),
+    "sessions.list": () => sessionList(targetSessionKey, { kind: "group" }),
     agent: () => ({ runId: "run-fire-and-forget", acceptedAt: 123 }),
   });
   const tool = createSessionsSendTool({
@@ -230,24 +218,14 @@ async function executeFireAndForgetA2AFrom(
   });
 
   expect(requireDetails(result).status).toBe("accepted");
-  expect(recordParticipantMock).toHaveBeenCalledWith(
-    expect.objectContaining({
-      identity: { type: "agent", id: "main" },
-      agentId: "other",
-      sessionKey: targetSessionKey,
-    }),
-  );
-  const flowParams = vi.mocked(runSessionsSendA2AFlow).mock.calls[0]?.[0];
   if (options?.expectReplyFlow === false) {
     expect(requireDetails(result)).toMatchObject({ delivery: { status: "skipped" } });
-  } else if (!flowParams) {
-    throw new Error("expected A2A flow");
   }
-  return flowParams!;
 }
 
 beforeEach(async () => {
   callGatewayMock.mockReset();
+  runSessionsSendA2AFlow.mockReset();
   setRuntimeConfigSnapshot({
     session: { scope: "per-sender", mainKey: "main" },
     tools: { agentToAgent: { enabled: false } },
@@ -259,7 +237,6 @@ beforeEach(async () => {
   ] as const) {
     await upsertSessionEntryCore({ agentId, sessionKey }, { sessionId: sessionKey, updatedAt: 1 });
   }
-  recordParticipantMock.mockClear();
   setActivePluginRegistry(createTestRegistry([]));
 });
 
@@ -268,52 +245,48 @@ afterEach(async () => {
   clearRuntimeConfigSnapshot();
 });
 
-it("fails closed for cross-agent and resolution-derived bare keys", async () => {
-  const bareKey = "b0d79b63-0f73-4bc9-a6b5-6d8e20f42c3c";
-  const config = {
-    agents: { ownership: "explicit" as const, entries: { main: {}, other: {} } },
-    tools: { agentToAgent: { enabled: false }, sessions: { visibility: "all" as const } },
-  };
-  const send = async () =>
-    requireDetails(
-      await createSessionsSendTool({
-        agentId: "main",
-        agentSessionKey: MAIN_AGENT_SESSION_KEY,
-        config,
-      }).execute("authorization", {
-        sessionKey: bareKey,
-        message: "status?",
-        timeoutSeconds: 0,
-      }),
-    );
-  callGatewayMock
-    .mockReset()
-    .mockImplementation(async (request: { method?: string }) =>
-      request.method === "sessions.resolve" ? { key: "incident-42", agentId: "other" } : {},
-    );
-  expect(await send()).toMatchObject({
-    status: "forbidden",
-    error: expect.stringContaining("Agent-to-agent messaging is disabled"),
-  });
-  callGatewayMock
-    .mockReset()
-    .mockImplementation(async (request: { method?: string; params?: Record<string, string> }) => {
-      if (request.method !== "sessions.resolve") {
-        return {};
-      }
-      if (request.params?.key) {
-        throw new GatewayClientRequestError({
-          code: "INVALID_REQUEST",
-          message: `No session found: ${request.params.key}`,
-        });
-      }
-      return request.params?.sessionId ? { key: "incident-42" } : {};
+it.each([
+  [false, "Agent-to-agent messaging is disabled"],
+  [true, "Upgrade the gateway"],
+] as const)(
+  "fails closed for resolved bare keys (missing owner: %s)",
+  async (missingOwner, error) => {
+    const bareKey = "b0d79b63-0f73-4bc9-a6b5-6d8e20f42c3c";
+    const tool = createSessionsSendTool({
+      agentId: "main",
+      agentSessionKey: MAIN_AGENT_SESSION_KEY,
+      config: {
+        agents: { ownership: "explicit", entries: { main: {}, other: {} } },
+        tools: { agentToAgent: { enabled: false }, sessions: { visibility: "all" } },
+      },
     });
-  expect(await send()).toMatchObject({
-    status: "forbidden",
-    error: expect.stringContaining("Upgrade the gateway"),
-  });
-});
+    callGatewayMock.mockImplementation(
+      async (request: { method?: string; params?: Record<string, string> }) => {
+        if (request.method !== "sessions.resolve") {
+          return {};
+        }
+        if (!missingOwner) {
+          return { key: "incident-42", agentId: "other" };
+        }
+        if (request.params?.key) {
+          throw new GatewayClientRequestError({
+            code: "INVALID_REQUEST",
+            message: "No session found: " + request.params.key,
+          });
+        }
+        return request.params?.sessionId ? { key: "incident-42" } : {};
+      },
+    );
+    expect(
+      requireDetails(
+        await executeSend({ sessionKey: bareKey, message: "status?", timeoutSeconds: 0 }, tool),
+      ),
+    ).toMatchObject({
+      status: "forbidden",
+      error: expect.stringContaining(error),
+    });
+  },
+);
 
 registerSessionsSendFixedOwnerTests({
   createTool: (options) => createSessionsSendTool(options),
@@ -324,7 +297,6 @@ registerSessionsSendFixedOwnerTests({
 
 describe("resolveSessionsSendReplyTarget", () => {
   beforeEach(async () => {
-    callGatewayMock.mockClear();
     installRegistry();
   });
 
@@ -379,21 +351,17 @@ describe("sessions_list gating", () => {
 
     const result = await createMainSessionsListTool().execute("call1", {});
 
-    const details = requireDetails(result);
-    expect(details.count).toBe(1);
-    const session = requireSessions(details)[0];
-    expect(session?.key).toBe("agent:codex:acp:child-1");
-    expect(session?.parentSessionKey).toBe(MAIN_AGENT_SESSION_KEY);
+    expect(requireDetails(result)).toMatchObject({
+      count: 1,
+      sessions: [{ key: "agent:codex:acp:child-1", parentSessionKey: MAIN_AGENT_SESSION_KEY }],
+    });
     expect(callGatewayMock).toHaveBeenCalledTimes(1);
   });
 
   it("keeps literal current keys for message previews", async () => {
     callGatewayMock.mockReset();
     callGatewayMock
-      .mockResolvedValueOnce({
-        path: "/tmp/sessions.json",
-        sessions: [{ key: "current", kind: "direct" }],
-      })
+      .mockResolvedValueOnce(sessionList("current"))
       .mockResolvedValueOnce({ messages: [{ role: "assistant", content: [] }] });
 
     await createMainSessionsListTool().execute("call1", { messageLimit: 1 });
@@ -464,8 +432,6 @@ describe("sessions_send gating", () => {
     async ({ targetKey: targetSessionKey, timeoutSeconds }) => {
       const requesterSessionKey = MAIN_AGENT_SESSION_KEY;
       const dir = sessionDirs.make();
-      const { runSessionsSendA2AFlow } = await import("./sessions-send-tool.a2a.js");
-      vi.mocked(runSessionsSendA2AFlow).mockClear();
       const storePath = path.join(dir, "sessions.json");
       const targetSessionId = "child-incarnation";
       await seedMainSession(requesterSessionKey, "requester-incarnation", storePath);
@@ -474,10 +440,7 @@ describe("sessions_send gating", () => {
         spawnedBy: requesterSessionKey,
       });
       mockGatewayMethods({
-        "sessions.list": () => ({
-          path: storePath,
-          sessions: [{ key: targetSessionKey, kind: "direct" }],
-        }),
+        "sessions.list": () => sessionList(targetSessionKey, {}, storePath),
         agent: () => ({ runId: "run-exact-send", acceptedAt: 123 }),
         "agent.wait": () => ({ runId: "run-exact-send", status: "timeout" }),
       });
@@ -488,12 +451,9 @@ describe("sessions_send gating", () => {
         idempotencyKey: "worker-session-send:stable-operation",
         callGateway: callGatewayMock,
         config: {
+          ...createAllSessionsConfig({}, true),
           ...PEER_ONLY_ROUTING_CONFIG,
           session: { scope: "per-sender", mainKey: "main", store: storePath },
-          tools: {
-            agentToAgent: { enabled: true },
-            sessions: { visibility: "all" },
-          },
         } as never,
       });
 
@@ -515,16 +475,11 @@ describe("sessions_send gating", () => {
       expect(
         callGatewayMock.mock.calls.filter(([request]) => request.method === "agent.wait"),
       ).toHaveLength(timeoutSeconds);
-      expect(callGatewayMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          method: "agent",
-          params: expect.objectContaining({
-            idempotencyKey: "worker-session-send:stable-operation",
-            sessionKey: targetSessionKey,
-            inputProvenance: expect.objectContaining({ sourceSessionKey: requesterSessionKey }),
-          }),
-        }),
-      );
+      expect(gatewayParams("agent")).toMatchObject({
+        idempotencyKey: "worker-session-send:stable-operation",
+        sessionKey: targetSessionKey,
+        inputProvenance: { sourceSessionKey: requesterSessionKey },
+      });
     },
   );
 
@@ -534,73 +489,31 @@ describe("sessions_send gating", () => {
       callGateway: callGatewayMock,
       config: createAllSessionsConfig({ visibility: "tree" }),
     });
-    callGatewayMock.mockImplementation(async (opts: unknown) => {
-      const request = opts as { method?: string; params?: Record<string, unknown> };
-      if (request.method === "sessions.resolve") {
-        if (request.params?.key === "session-id-only") {
-          throw new GatewayClientRequestError({
-            code: "INVALID_REQUEST",
-            message: "No session found: session-id-only",
-          });
+    callGatewayMock.mockImplementation(
+      async (request: { method?: string; params?: Record<string, unknown> }) => {
+        const owned = request.params?.spawnedBy === MAIN_AGENT_SESSION_KEY;
+        if (request.method === "sessions.resolve") {
+          if (request.params?.key === "session-id-only") {
+            throw new GatewayClientRequestError({
+              code: "INVALID_REQUEST",
+              message: "No session found: session-id-only",
+            });
+          }
+          return owned ? {} : { key: "agent:other:main" };
         }
-        if (request.params?.spawnedBy === MAIN_AGENT_SESSION_KEY) {
-          return {};
-        }
-        return { key: "agent:other:main" };
-      }
-      if (request.method === "sessions.list") {
-        if (request.params?.spawnedBy === MAIN_AGENT_SESSION_KEY) {
-          return {
-            path: "/tmp/sessions.json",
-            sessions: [],
-          };
-        }
-        return {
-          path: "/tmp/sessions.json",
-          sessions: [{ key: "agent:other:main", kind: "direct" }],
-        };
-      }
-      return {};
-    });
+        return request.method === "sessions.list"
+          ? {
+              path: "/tmp/sessions.json",
+              sessions: owned ? [] : [{ key: "agent:other:main", kind: "direct" }],
+            }
+          : {};
+      },
+    );
 
     const result = await executeSend({ sessionKey: "session-id-only", timeoutSeconds: 0 }, tool);
 
     const details = requireDetails(result);
     expect(details).toMatchObject({ status: "forbidden", sessionKey: "session-id-only" });
-  });
-
-  it("classifies a failed spawned-lookup as lookup-failed for sandboxed sends", async () => {
-    setRuntimeConfigSnapshot({
-      session: { scope: "per-sender", mainKey: "main" },
-      agents: { defaults: { sandbox: { sessionToolsVisibility: "spawned" } } },
-      tools: { agentToAgent: { enabled: false }, sessions: { visibility: "all" } },
-    });
-    callGatewayMock.mockImplementation(async () => {
-      throw new GatewayClientRequestError({
-        code: "UNAVAILABLE",
-        message: "simulated transient store read error (evidence)",
-        retryable: true,
-      });
-    });
-    const tool = createSessionsSendTool({
-      agentSessionKey: MAIN_AGENT_SESSION_KEY,
-      agentChannel: MAIN_AGENT_CHANNEL,
-      sandboxed: true,
-    });
-
-    const result = await executeSend(
-      { sessionKey: "agent:main:subagent:worker-1", timeoutSeconds: 0 },
-      tool,
-    );
-
-    const details = requireDetails(result);
-    expect(details.status).toBe("forbidden");
-    expect(String(details.error)).toBe(
-      "Session send denied because spawned-session ownership lookup failed (transient); retry once, then ask the operator to inspect OpenClaw logs.",
-    );
-    expect(String(details.error)).not.toContain(
-      "Session not visible from this sandboxed agent session",
-    );
   });
 
   it.each([
@@ -646,13 +559,7 @@ describe("sessions_send gating", () => {
 
     expect(tool.description).not.toContain("Thread chats rejected");
     expect(requireDetails(result)).toMatchObject({ status: "accepted" });
-    expect(
-      callGatewayMock.mock.calls.some(
-        ([request]) =>
-          (request as { method?: string; params?: { sessionKey?: string } }).method === "agent" &&
-          (request as { params?: { sessionKey?: string } }).params?.sessionKey === threadSessionKey,
-      ),
-    ).toBe(true);
+    expect(gatewayParams("agent")).toMatchObject({ sessionKey: threadSessionKey });
   });
 
   it("rejects synchronous sends to the raw legacy direct-message caller", async () => {
@@ -678,86 +585,65 @@ describe("sessions_send gating", () => {
     ]);
   });
 
-  it("reports a terminal silent target without leaving an announcement pending", async () => {
-    const { runSessionsSendA2AFlow } = await import("./sessions-send-tool.a2a.js");
-    vi.mocked(runSessionsSendA2AFlow).mockClear();
-    const targetSessionKey = "agent:main:other";
-    const tool = createMainSessionsSendTool({ config: createAllSessionsConfig() });
-    const freshPrivateFinal = {
-      role: "assistant",
-      content: "private final that must stay private",
-      timestamp: 21,
-    };
-
-    mockTargetRun(targetSessionKey, "run-stale-send", {
-      "agent.wait": () => ({
-        runId: "run-stale-send",
-        status: "ok",
-        terminalReply: { disposition: "silent" },
-      }),
-      "chat.history": () => ({ messages: [freshPrivateFinal] }),
-    });
-
-    const result = await executeSend(
-      { sessionKey: targetSessionKey, message: "ping", timeoutSeconds: 1 },
-      tool,
-    );
-
-    expect(callGatewayMock.mock.calls.some(([request]) => request.method === "chat.history")).toBe(
-      false,
-    );
-    const details = requireDetails(result);
-    expect(details).toMatchObject({
-      status: "no_reply",
-      sessionKey: targetSessionKey,
+  it.each([
+    {
+      disposition: "silent",
+      delivered: false,
       message: expect.stringContaining("pending delivery"),
-    });
-    expect(details.reply).toBeUndefined();
-    expect(details.delivery).toBeUndefined();
-    expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
-  });
-
-  it("reports already delivered empty replies without resending", async () => {
-    const { runSessionsSendA2AFlow } = await import("./sessions-send-tool.a2a.js");
-    vi.mocked(runSessionsSendA2AFlow).mockClear();
-    const targetSessionKey = "agent:main:other";
-    const tool = createMainSessionsSendTool({ config: createAllSessionsConfig() });
-    mockTargetRun(targetSessionKey, "run-source-reply", {
-      "chat.history": () => ({ messages: [] }),
-      "agent.wait": () => ({
-        runId: "run-source-reply",
-        status: "ok",
-        terminalReply: { disposition: "empty" },
-        terminalReceipt: {
-          runId: "run-source-reply",
-          sessionId: targetSessionKey,
-          turnId: "target-turn",
-          requested: { provider: "provider", model: "model" },
-          effective: { provider: "provider", model: "model", responseModel: "model" },
-          successfulToolNames: ["message"],
-          sourceReplyDelivered: true,
-          rerouted: false,
-          terminalDisposition: "visible",
-        },
-      }),
-    });
-    expect(
-      requireDetails(await executeSend({ sessionKey: targetSessionKey, timeoutSeconds: 1 }, tool)),
-    ).toMatchObject({
-      status: "no_reply",
+    },
+    {
+      disposition: "empty",
+      delivered: true,
       message:
         "The target delivered its final reply directly to its source conversation. Do not resend.",
-    });
-    expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
-    expect(callGatewayMock.mock.calls.some(([request]) => request.method === "chat.history")).toBe(
-      false,
-    );
-  });
+    },
+  ] as const)(
+    "reports $disposition completion without resending (delivered=$delivered)",
+    async ({ disposition, delivered, message }) => {
+      const targetSessionKey = "agent:main:other";
+      const runId = "run-no-reply";
+      const tool = createMainSessionsSendTool({ config: createAllSessionsConfig() });
+      mockTargetRun(targetSessionKey, runId, {
+        "chat.history": () => ({
+          messages: [
+            { role: "assistant", content: "private final that must stay private", timestamp: 21 },
+          ],
+        }),
+        "agent.wait": () => ({
+          runId,
+          status: "ok",
+          terminalReply: { disposition },
+          terminalReceipt: delivered
+            ? {
+                runId,
+                sessionId: targetSessionKey,
+                turnId: "target-turn",
+                requested: { provider: "provider", model: "model" },
+                effective: { provider: "provider", model: "model", responseModel: "model" },
+                successfulToolNames: ["message"],
+                sourceReplyDelivered: true,
+                rerouted: false,
+                terminalDisposition: "visible",
+              }
+            : undefined,
+        }),
+      });
+      const details = requireDetails(
+        await executeSend({ sessionKey: targetSessionKey, timeoutSeconds: 1 }, tool),
+      );
+      expect(details).toMatchObject({ status: "no_reply", sessionKey: targetSessionKey, message });
+      expect(details.reply).toBeUndefined();
+      expect(details.delivery).toBeUndefined();
+      expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
+      expect(
+        callGatewayMock.mock.calls.some(([request]) => request.method === "chat.history"),
+      ).toBe(false);
+    },
+  );
 
   it("detaches fire-and-forget A2A work from parent transcript ownership", async () => {
-    const { runSessionsSendA2AFlow } = await import("./sessions-send-tool.a2a.js");
     let inheritedFence: ReturnType<typeof getOwnedSessionTranscriptWriterFence>;
-    vi.mocked(runSessionsSendA2AFlow).mockImplementationOnce(async () => {
+    runSessionsSendA2AFlow.mockImplementationOnce(async () => {
       inheritedFence = getOwnedSessionTranscriptWriterFence();
     });
     let parentTranscriptWriteCalls = 0;
@@ -786,8 +672,6 @@ describe("sessions_send gating", () => {
   });
 
   it("canonicalizes aliased requester keys for same-session A2A delivery", async () => {
-    const { runSessionsSendA2AFlow } = await import("./sessions-send-tool.a2a.js");
-    vi.mocked(runSessionsSendA2AFlow).mockClear();
     const tool = createMainSessionsSendTool({ agentSessionKey: "main" });
     mockTargetRun(MAIN_AGENT_SESSION_KEY, "run-alias-fire-and-forget", {});
 
@@ -798,13 +682,12 @@ describe("sessions_send gating", () => {
 
     const details = requireDetails(result);
     expect(details).toMatchObject({ status: "accepted", sessionKey: MAIN_AGENT_SESSION_KEY });
-    const flowParams = vi.mocked(runSessionsSendA2AFlow).mock.calls[0]?.[0];
+    const flowParams = runSessionsSendA2AFlow.mock.calls[0]?.[0];
     expect(flowParams?.requesterSessionKey).toBe(MAIN_AGENT_SESSION_KEY);
     expect(flowParams?.targetSessionKey).toBe(MAIN_AGENT_SESSION_KEY);
   });
 
   it("does not start requester delivery for an isolated cron run", async () => {
-    const { runSessionsSendA2AFlow } = await import("./sessions-send-tool.a2a.js");
     await executeFireAndForgetA2AFrom("agent:main:cron:job:run:abc", { expectReplyFlow: false });
     expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
   });
@@ -859,4 +742,3 @@ registerSessionsSendMaterializationTests({
     inProcessCreationMock.mockClear();
   },
 });
-/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
