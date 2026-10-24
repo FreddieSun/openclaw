@@ -8,9 +8,11 @@ import {
   createTempDirTracker,
   useAutoCleanupTempDirTracker,
 } from "../../../test/helpers/temp-dir.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import { createVerifiedSqliteSnapshot } from "../../infra/sqlite-snapshot.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
+import type { DB } from "../../state/openclaw-agent-db.generated.js";
 import {
   closeOpenClawAgentDatabaseByPathAsync,
   closeOpenClawAgentDatabasesAsync,
@@ -22,6 +24,7 @@ import {
 import { buildConversationIdentity } from "./conversation-identity.js";
 import { resolveCurrentConversationSession } from "./conversation-registry.js";
 import {
+  appendTranscriptMessageSync as appendMessage,
   applySessionEntryLifecycleMutation,
   createSessionEntryWithTranscript,
   forkSessionAtMessage,
@@ -36,6 +39,8 @@ import {
   replaceTranscriptSuffixEventsSync as replaceSuffix,
   resetSessionEntryLifecycle,
   resolveSessionParentForkDecision,
+  rewindSessionToMessage,
+  switchSessionBranch,
 } from "./session-accessor.js";
 import * as archiveWorkers from "./session-accessor.sqlite-archive.js";
 import {
@@ -50,6 +55,7 @@ import {
   appendTranscriptMessageSnapshotSync,
 } from "./session-accessor.sqlite-transcript-write.js";
 import {
+  appendTranscriptEventSync,
   replaceTranscriptEvents,
   replaceTranscriptEventsSync,
 } from "./session-accessor.sqlite-transcript-write.test-support.js";
@@ -157,24 +163,36 @@ async function createColdCurrentSession(
     await replaceSessionEntry(scope, entry);
     await replaceTranscriptEvents(scope, [
       { type: "session", id: scope.sessionId, version: 3 },
-      ...[
-        { id: "question", parentId: null, role: "user", content: "Question" },
-        { id: "answer", parentId: "question", role: "assistant", content: "Original answer" },
-        { id: "alternate", parentId: "question", role: "assistant", content: "Alternate answer" },
-      ].map(({ id, parentId, role, content }) => ({
+      {
         type: "message",
-        id,
-        parentId,
-        message: { role, content },
-      })),
+        id: "question",
+        parentId: null,
+        message: { role: "user", content: "Question" },
+      },
+      {
+        type: "message",
+        id: "answer",
+        parentId: "question",
+        message: { role: "assistant", content: "Original answer" },
+      },
+      {
+        type: "message",
+        id: "alternate",
+        parentId: "question",
+        message: { role: "assistant", content: "Alternate answer" },
+      },
       { type: "leaf", id: "selection", parentId: "alternate", targetId: "answer" },
     ]);
     await waitForSessionTranscriptIndexReconcile(options);
     await replaceSessionEntry(scope, { ...loadSessionEntry(scope), ...entry });
     runOpenClawAgentWriteTransaction(({ db }) => {
-      db.prepare(
-        "UPDATE session_windows SET updated_at = 1, transcript_updated_at = 1 WHERE session_id = ?",
-      ).run(scope.sessionId);
+      executeSqliteQuerySync(
+        db,
+        getNodeSqliteKysely<DB>(db)
+          .updateTable("session_windows")
+          .set({ updated_at: 1, transcript_updated_at: 1 })
+          .where("session_id", "=", scope.sessionId),
+      );
     }, options);
     original = loadTranscriptEventsSync(scope);
     await expect(
@@ -236,13 +254,18 @@ function coldDescriptor(fixture: Fixture) {
 }
 
 function observeCommit(beforeCommit = () => {}) {
-  const commit = { requested: false };
+  const commit = { requested: false, inGrant: false };
   interceptRestoration((params) => ({
     ...params,
     onCommitRequest: () => {
       commit.requested = true;
       beforeCommit();
-      params.onCommitRequest();
+      commit.inGrant = true;
+      try {
+        params.onCommitRequest();
+      } finally {
+        commit.inGrant = false;
+      }
     },
   }));
   return commit;
@@ -365,6 +388,8 @@ const actions = [
   "reset",
   "batched reset",
   "fork",
+  "rewind",
+  "branch switch",
   "branch list",
   "parent fork",
   "cross-store parent fork",
@@ -375,62 +400,74 @@ type Action = (typeof actions)[number];
 
 async function runAction(action: Action, fixture: Fixture) {
   const { scope, entry, target } = fixture;
-  const nextEntry = { ...entry, sessionId: "reset-next", updatedAt: 2 };
   const resetBoundary = {
     context: "clear" as const,
     reason: "reset" as const,
     cwd: path.dirname(scope.storePath),
   };
-  const parentFork = (targetStorePath?: string) =>
-    forkSessionFromParentTranscript({
-      ...scope,
-      parentEntry: entry,
-      parentSessionKey: scope.sessionKey,
-      sessionKey: "agent:main:child",
-      targetStorePath,
-    });
-  const run = {
-    reset: async () => {
+  switch (action) {
+    case "reset":
       await resetSessionEntryLifecycle({
         storePath: scope.storePath,
         target,
         resetBoundary,
-        buildNextEntry: () => nextEntry,
+        buildNextEntry: () => ({ ...entry, sessionId: "reset-next", updatedAt: 2 }),
       });
       return loadSessionEntry(scope);
-    },
-    "batched reset": async () => {
+    case "batched reset":
       await applySessionEntryLifecycleMutation({
         storePath: scope.storePath,
         skipMaintenance: true,
-        upserts: [{ sessionKey: scope.sessionKey, entry: nextEntry, resetBoundary }],
+        upserts: [
+          {
+            sessionKey: scope.sessionKey,
+            entry: { ...entry, sessionId: "reset-next", updatedAt: 2 },
+            resetBoundary,
+          },
+        ],
       });
       return loadSessionEntry(scope);
-    },
-    fork: () =>
-      forkSessionAtMessage({ ...scope, entryId: "question", targetKey: "agent:main:forked" }),
-    "branch list": () => listSessionBranches(scope),
-    "parent fork": () => parentFork(),
-    "cross-store parent fork": () => {
-      const targetStorePath = path.join(
-        tempDirs.make("openclaw-cold-parent-target-"),
-        "openclaw-agent.sqlite",
-      );
-      stores.push(targetStorePath);
-      return parentFork(targetStorePath);
-    },
-    "parent entry fork": () =>
-      forkSessionEntryFromParentTarget({
+    case "fork":
+      return forkSessionAtMessage({
+        ...scope,
+        entryId: "question",
+        targetKey: "agent:main:forked",
+      });
+    case "rewind":
+      return rewindSessionToMessage({ ...scope, entryId: "question" });
+    case "branch switch":
+      return switchSessionBranch({ ...scope, leafEntryId: "alternate" });
+    case "branch list":
+      return listSessionBranches(scope);
+    case "parent fork":
+    case "cross-store parent fork": {
+      const targetStorePath =
+        action === "cross-store parent fork"
+          ? path.join(tempDirs.make("openclaw-cold-parent-target-"), "openclaw-agent.sqlite")
+          : undefined;
+      if (targetStorePath) {
+        stores.push(targetStorePath);
+      }
+      return forkSessionFromParentTranscript({
+        ...scope,
+        parentEntry: entry,
+        parentSessionKey: scope.sessionKey,
+        sessionKey: "agent:main:child",
+        targetStorePath,
+      });
+    }
+    case "parent entry fork":
+      return forkSessionEntryFromParentTarget({
         agentId: scope.agentId,
         storePath: scope.storePath,
         parentTarget: target,
         sessionTarget: { canonicalKey: "agent:main:child", storeKeys: ["agent:main:child"] },
         fallbackEntry: { sessionId: "child-initial", updatedAt: 2 },
-      }),
-    "parent decision": () =>
-      resolveSessionParentForkDecision({ parentEntry: entry, storePath: scope.storePath }),
-  };
-  return run[action]();
+      });
+    case "parent decision":
+      return resolveSessionParentForkDecision({ parentEntry: entry, storePath: scope.storePath });
+  }
+  return action satisfies never;
 }
 
 describe("cold current transcript lifecycle", () => {
@@ -446,10 +483,16 @@ describe("cold current transcript lifecycle", () => {
     });
     const archiveBytes = await fs.readFile(archivePath);
     const before = snapshot();
+    expect(fixture.database().prepare("SELECT * FROM transcript_events").all()).toEqual([]);
+    expect(
+      fixture.database().prepare("SELECT current_session_id FROM session_nodes").all(),
+    ).toEqual([{ current_session_id: scope.sessionId }]);
     const event = { type: "custom", id: "sync-custom", customType: "sync-write", data: {} };
     const message = { role: "user", content: "A new synchronous message", timestamp: 20 };
     const mutations = {
+      "append event": () => appendTranscriptEventSync(scope, event),
       "append event snapshot": () => appendTranscriptEventSnapshotSync(scope, event),
+      "append message": () => appendMessage(scope, { message, eventId: "sync-message" }),
       "append message snapshot": () =>
         appendTranscriptMessageSnapshotSync(scope, { message, eventId: "sync-message-snapshot" }),
       "replace transcript": () => replaceTranscriptEventsSync(scope, [event]),
@@ -732,18 +775,24 @@ describe("cold current transcript lifecycle", () => {
         await replaceSessionEntry(sourceScope, sourceEntry);
       }
       const foreign = createCompactAuthority({ scope: sourceScope, entry: sourceEntry });
-      const commit = observeCommit(() => {
-        if (change === "alias path") {
-          unlinkSync(sourceScope.storePath);
-          symlinkSync(seed!.snapshotPath, sourceScope.storePath);
-        } else {
-          replaceSessionEntrySync(sourceScope, { ...sourceEntry, label: "revoked grant" });
-        }
-      });
+      let changed = false;
+      interceptRestoration((params) => ({
+        ...params,
+        onCommitRequest: () => {
+          if (change === "alias path") {
+            unlinkSync(sourceScope.storePath);
+            symlinkSync(seed!.snapshotPath, sourceScope.storePath);
+          } else {
+            replaceSessionEntrySync(sourceScope, { ...sourceEntry, label: "revoked grant" });
+          }
+          changed = true;
+          params.onCommitRequest();
+        },
+      }));
       await expect(createCompactAuthority(fixture).trim(foreign.source)).rejects.toThrow(
         "Compaction source authority revoked",
       );
-      expect(commit.requested).toBe(true);
+      expect(changed).toBe(true);
       expect(fixture.snapshot()).toEqual(before);
       expect(await fs.readFile(fixture.archivePath)).toEqual(archiveBefore);
     },
@@ -777,6 +826,8 @@ describe("cold current transcript lifecycle", () => {
     const result = await runAction(action, fixture);
     if (action === "reset" || action === "batched reset") {
       expect(result).toMatchObject({ sessionId: "reset-next" });
+    } else if (action === "fork" || action === "rewind") {
+      expect(result).toMatchObject({ status: "created", editorText: "Question" });
     } else if (action === "branch list") {
       expect(result).toMatchObject({
         status: "ok",
@@ -793,7 +844,6 @@ describe("cold current transcript lifecycle", () => {
             : action === "parent decision"
               ? "fork"
               : "created",
-        ...(action === "fork" ? { editorText: "Question" } : {}),
       });
     }
     expect(coldDescriptor(fixture)).toBeUndefined();
@@ -832,7 +882,7 @@ describe("cold current transcript lifecycle", () => {
   });
 
   // Message cuts and parent transcript forks restore before dispatching their mutation modes.
-  it.each(actions.filter((action) => action !== "parent fork"))(
+  it.each(actions.filter((action) => !["rewind", "branch switch", "parent fork"].includes(action)))(
     "refuses %s without changing state when its archive is missing",
     async (action) => {
       const fixture = await createColdCurrentSession();

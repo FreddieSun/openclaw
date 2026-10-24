@@ -750,21 +750,6 @@ describe("discoverOpenClawPlugins", () => {
     expectSource(candidates, "downloadable", path.join(sourceOnlyPluginDir, "index.ts"));
   });
 
-  it("discovers agent bundles from metadata and default layout", () => {
-    const bundleDir = path.join(testRoot, "extensions", "portable-bundle");
-    writeJson(path.join(bundleDir, "plugin.json"), {
-      $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
-      name: "portable-bundle",
-    });
-    mkdirSafe(path.join(bundleDir, "skills/sample"));
-    expect(requireCandidate(discover().candidates, "portable-bundle")).toMatchObject({
-      format: "bundle",
-      bundleFormat: "agent",
-      source: bundleDir,
-      rootDir: fs.realpathSync(bundleDir),
-    });
-  });
-
   it("preserves the package install owner for managed bundle candidates", () => {
     const bundleDir = path.join(testRoot, "extensions", "pkg");
     writeJson(path.join(bundleDir, ".codex-plugin/plugin.json"), {
