@@ -399,12 +399,11 @@ it.each([false, true])(
         sessionChanges.emit({ agentId: a.agentId, sessionKey: a.key });
         const readingA = describe(a);
         pending.push(readingA);
-        await Promise.race([
+        await awaitGateBeforeSettlement(
           capturedA.promise,
-          readingA.then(() => {
-            throw new Error("Exact read bypassed its held database facts");
-          }),
-        ]);
+          readingA,
+          "Exact read bypassed its held database facts",
+        );
 
         const failure = new SqliteWorkerError(
           "category reply lost after commit",
@@ -576,12 +575,11 @@ it.each([
         invalidateFacts(projection, { agentId: unrelated.agentId, key: unrelated.sessionKey });
       }
       reading = listSessions({ client, context, request });
-      await Promise.race([
+      await awaitGateBeforeSettlement(
         captured.promise,
-        reading.then(() => {
-          throw new Error("List bypassed pending dirty row facts");
-        }),
-      ]);
+        reading,
+        "List bypassed pending dirty row facts",
+      );
       if (changesSibling) {
         replaceSessionEntrySync(unrelated, {
           sessionId: "unrelated",

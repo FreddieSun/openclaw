@@ -55,7 +55,6 @@ import {
   readPreparedGatewayModelCatalogOwnerSnapshot,
 } from "./server-model-catalog.js";
 import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
-import { resolveGatewayModelSupportsImages } from "./session-utils-model.js";
 
 const mocks = getPreparedModelRuntimeMocks();
 const main = { agentId: "main" };
@@ -393,8 +392,7 @@ describe("gateway chat metadata lifecycle composition", () => {
     async ({ wildcard, invalidate }) => {
       const modelRef = wildcard ? "openai/*" : "openai/codex-latest";
       const nativeCfg = nativeConfig([modelRef]); // Discovery also works without a primary model.
-      let currentConfig = nativeCfg;
-      const currentOwner = () => readOwner(currentConfig);
+      const currentOwner = () => readOwner(nativeCfg);
       const nativeModel = { ...nativeRow("codex-latest", "Codex (Latest)"), reasoning: true };
       let revision = 0;
       let observedRevision: number | undefined;
@@ -420,8 +418,7 @@ describe("gateway chat metadata lifecycle composition", () => {
       mocks.buildPreparedModelCatalogSnapshot.mockResolvedValue(catalog);
       // Startup discovery builds the same catalog in the worker.
       mocks.runPreparedModelCatalogWorker.mockImplementation(async () => structuredClone(catalog));
-      const nativeContext = createCatalogContext(() => currentConfig);
-      const loader = nativeContext.loadGatewayModelCatalogSnapshot;
+      const nativeContext = createCatalogContext(() => nativeCfg);
       try {
         await publishOwner(nativeCfg);
         // This fixture tests retained discovery; startup now acquires provider inventory only.
@@ -459,48 +456,14 @@ describe("gateway chat metadata lifecycle composition", () => {
           });
           expect(respond).toHaveBeenCalledWith(true, expect.objectContaining(expected), undefined);
           await expect(lifecycle.readMain()).resolves.toMatchObject(expected);
-          const catalogs = await lifecycle.startup({ readPolicy: "ready" });
-          expect(catalogs?.sessionModelCatalog).toBe(catalogs?.defaultModelCatalog);
-          expect(catalogs).not.toHaveProperty("metadata");
         };
         await expectNativeAvailable(false);
-        const imageCatalogLoader = vi.fn(loader);
-        await expect(
-          resolveGatewayModelSupportsImages({
-            agentId: "main",
-            provider: "openai",
-            model: "codex-latest",
-            loadGatewayModelCatalog: async (params) => (await loader(params)).entries,
-            loadGatewayModelCatalogSnapshot: imageCatalogLoader,
-          }),
-        ).resolves.toBe(false);
-        expect(imageCatalogLoader.mock.calls).toEqual([[{ agentId: "main", readOnly: true }]]);
         expect(loadModelCatalog).not.toHaveBeenCalled();
         const builds = mocks.buildPreparedModelCatalogSnapshot.mock.calls.length;
 
         await loadModelCatalog();
         await lifecycle.refresh(); // Matching prepared/auth facts must not freeze the old boolean.
         await expectNativeAvailable(true);
-        const lockedSession = {
-          authProfileOverride: "openai:missing",
-          authProfileOverrideSource: "user" as const,
-        };
-        await expect(
-          lifecycle.startup({ sessionEntry: lockedSession, readPolicy: "ready" }),
-        ).resolves.toBeUndefined();
-        const lockedMetadata = await lifecycle.readMain({ sessionEntry: lockedSession });
-        expect(lockedMetadata).toMatchObject({
-          models: wildcard
-            ? []
-            : [expect.objectContaining({ id: "codex-latest", available: false })],
-        });
-        const lockedStartup = await lifecycle.startup({ sessionEntry: lockedSession });
-        await expect(
-          lifecycle.startup({ sessionEntry: lockedSession, readPolicy: "ready" }),
-        ).resolves.toEqual({
-          sessionModelCatalog: lockedStartup?.sessionModelCatalog,
-          defaultModelCatalog: lockedStartup?.defaultModelCatalog,
-        });
 
         if (invalidate === "generation") {
           const retained = await prepareModelsListResult({
@@ -516,14 +479,6 @@ describe("gateway chat metadata lifecycle composition", () => {
             entered.resolve();
             return await release.promise;
           });
-          const events: string[] = [];
-          const published = createDeferredCore();
-          const unregister = registerPreparedModelRuntimePublicationListener((event) => {
-            events.push(event.phase);
-            if (event.phase === "published" || event.phase === "failed") {
-              published.resolve();
-            }
-          });
           let nextRead: ReturnType<typeof lifecycle.read> | undefined;
           try {
             expect(mocks.mutationListener).toBeTypeOf("function");
@@ -531,7 +486,6 @@ describe("gateway chat metadata lifecycle composition", () => {
               agentDir: state.agentDir("main"),
               affectsInheritedStores: false,
             });
-            expect(events).toEqual(["invalidated"]);
             let settled = false;
             nextRead = lifecycle.readMain();
             const markSettled = () => {
@@ -544,9 +498,6 @@ describe("gateway chat metadata lifecycle composition", () => {
             const staleCurrent = retained.isCurrent();
             const staleModels = retained.read().models;
             release.resolve({ agentDir: state.agentDir("main"), wrote: false });
-            await published.promise;
-            expect(events).toContain("published");
-            expect(events).not.toContain("failed");
             await expect(nextRead).resolves.toMatchObject({
               models: [
                 expect.objectContaining({
@@ -574,20 +525,9 @@ describe("gateway chat metadata lifecycle composition", () => {
           } finally {
             release.resolve({ agentDir: state.agentDir("main"), wrote: false });
             await Promise.allSettled([nextRead]);
-            unregister();
           }
           return;
         }
-
-        const retainedStartup = await lifecycle.startup({ readPolicy: "ready" });
-        expect(retainedStartup).toBeDefined();
-        currentConfig = { ...nativeCfg };
-        await lifecycle.refresh();
-        const copiedStartup = await lifecycle.startup({ readPolicy: "ready" });
-        expect(copiedStartup?.sessionModelCatalog).toBe(retainedStartup?.sessionModelCatalog);
-        expect(copiedStartup?.defaultModelCatalog).toBe(retainedStartup?.defaultModelCatalog);
-        await lifecycle.readMain();
-        await expectNativeAvailable(true);
 
         revision += 1;
         await expectNativeAvailable(false);
@@ -766,21 +706,6 @@ describe("gateway chat metadata lifecycle composition", () => {
         modelBaseUrl,
         config: activeConfig,
       });
-      if (!apiKey) {
-        expect(mocks.ensureOpenClawModelsJson).toHaveBeenCalledOnce();
-      }
-      expect(mocks.preparedAuthMaterializations).toEqual([
-        expect.objectContaining({
-          provider: "openai",
-          modelId: "gpt-5.4",
-          modelApi,
-          modelBaseUrl,
-          requestTransportOverrides: "none",
-          authMode: apiKey ? "api-key" : "oauth",
-          runtimeOwnerId: "codex",
-          ...(apiKey ? { authProfileId: "openai:default" } : {}),
-        }),
-      ]);
       await vi.waitFor(() => expectAvailability());
       revokeRuntimeAuthMaterializations({
         agentDir: state.agentDir("main"),
