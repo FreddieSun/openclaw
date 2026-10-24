@@ -70,6 +70,22 @@ function loadPlugins(options: Parameters<typeof loadOpenClawPlugins>[0]) {
   return loadOpenClawPlugins({ config, env: {}, installRecords: {}, activate: false, ...options });
 }
 
+function configuredPlugin<T>(file: string, pluginConfig: T) {
+  return {
+    plugins: {
+      allow: ["same-id"],
+      load: { paths: [file] },
+      entries: { "same-id": { enabled: true, config: pluginConfig } },
+    },
+  };
+}
+
+function activate(options: Parameters<typeof loadOpenClawPlugins>[0]) {
+  const loaded = loadOpenClawPlugins(options);
+  setActivePluginRegistry(loaded, loadCacheContext(options).cacheKey);
+  return loaded;
+}
+
 function labels(providers: readonly { label: string }[] | undefined) {
   return providers?.map((provider) => provider.label);
 }
@@ -184,25 +200,11 @@ describe("provider runtime physical ownership", () => {
           additionalProperties: false,
         },
       });
-      const runtimeConfig = {
-        plugins: {
-          allow: ["same-id"],
-          load: { paths: [plugin.file] },
-          entries: { "same-id": { enabled: true, config: { credential: "resolved-fixture-key" } } },
-        },
-      };
-      const sourceFor = (id: string) => ({
-        ...runtimeConfig,
-        plugins: {
-          ...runtimeConfig.plugins,
-          entries: {
-            "same-id": {
-              enabled: true,
-              config: { credential: { source: "store", provider: "default", id } },
-            },
-          },
-        },
-      });
+      const runtimeConfig = configuredPlugin(plugin.file, { credential: "resolved-fixture-key" });
+      const sourceFor = (id: string) =>
+        configuredPlugin(plugin.file, {
+          credential: { source: "store", provider: "default", id },
+        });
       const sourceConfig = sourceFor("KEY");
       const env = { OPENCLAW_STATE_DIR: makePluginLoaderTempDir() };
       try {
@@ -217,8 +219,7 @@ describe("provider runtime physical ownership", () => {
           onlyPluginIds: ["same-id"],
           activate: false,
         };
-        const loadedRegistry = loadOpenClawPlugins(loadOptions);
-        setActivePluginRegistry(loadedRegistry, loadCacheContext(loadOptions).cacheKey);
+        const loadedRegistry = activate(loadOptions);
         const lookup = {
           provider: "same-provider",
           config: runtimeConfig,
@@ -292,13 +293,7 @@ describe("provider runtime physical ownership", () => {
           additionalProperties: false,
         },
       });
-      const configFor = (revision: string) => ({
-        plugins: {
-          allow: ["same-id"],
-          load: { paths: [plugin.file] },
-          entries: { "same-id": { enabled: true, config: { revision } } },
-        },
-      });
+      const configFor = (revision: string) => configuredPlugin(plugin.file, { revision });
       const firstConfig = configFor("A");
       const env = { OPENCLAW_STATE_DIR: makePluginLoaderTempDir() };
       const firstSnapshot = loadMetadata({ config: firstConfig, env });
@@ -310,8 +305,7 @@ describe("provider runtime physical ownership", () => {
         manifestRegistry: firstSnapshot.manifestRegistry,
         activate: false,
       };
-      const loadedRegistry = loadOpenClawPlugins(loadOptions);
-      setActivePluginRegistry(loadedRegistry, loadCacheContext(loadOptions).cacheKey);
+      const loadedRegistry = activate(loadOptions);
       const lookup = { provider: receiver === "declared" ? "same-provider" : "runtime-alias", env };
       const modelOnlyConfig = { ...firstConfig, agents: { defaults: { model: "other/model" } } };
       expect(loadedProvider({ ...lookup, config: modelOnlyConfig })?.label).toBe("A/1");

@@ -59,14 +59,13 @@ function mockContract(
 }
 
 const providerRenames = [{ from: "old", to: "new", baseUrl: "https://models.example" }];
+const providerConfig = (baseUrl: string) => ({ baseUrl, models: [] });
 
 function mockExternalShadow(enabledByDefault = false) {
   const bundled = registry({
     id: "matrix",
     rootDir: makeTempDir(),
     origin: "bundled",
-    channels: [],
-    providers: [],
     doctorContract: { stateMigrations: [{ id: "matrix-inbound-dedupe-to-claimable-dedupe" }] },
   });
   mocks.loadPluginManifestRegistry.mockReturnValueOnce(bundled).mockReturnValueOnce(
@@ -110,11 +109,8 @@ describe("doctor-contract-registry module loader", () => {
     expect(withPluginCache(createPluginCache(), resolvePath)).toBeNull();
   });
 
-  it.each([
-    { configRepair: false, count: 0 },
-    { configRepair: undefined, count: 1 },
-    { configRepair: true, count: 1 },
-  ])("gates config-repair artifacts: $configRepair", ({ configRepair, count }) => {
+  it.each([false, undefined, true])("gates config-repair artifacts: %s", (configRepair) => {
+    const count = configRepair === false ? 0 : 1;
     const pluginRoot = mockContract(
       {
         legacyConfigRules: [{ path: ["plugins", "entries", "demo"], message: "demo rule" }],
@@ -139,11 +135,7 @@ describe("doctor-contract-registry module loader", () => {
   it("rejects provider renames outside the plugin's declared providers", () => {
     const root = mockContract(
       { providerRenames },
-      {
-        id: "owner",
-        providers: ["old"],
-        doctorContract: { configRepair: true },
-      },
+      { id: "owner", providers: ["old"], doctorContract: { configRepair: true } },
     );
     expect(doctor.resolvePluginDoctorProviderRenames({ pluginIds: ["old"], env: {} })).toEqual([]);
     expect(doctorContractWarnMock).toHaveBeenCalledWith(
@@ -165,11 +157,7 @@ describe("doctor-contract-registry module loader", () => {
     const config: OpenClawConfig = {
       models: {
         providers: {
-          old: {
-            baseUrl: "https://models.example",
-            api: "openai-completions",
-            models: [],
-          },
+          old: { ...providerConfig("https://models.example"), api: "openai-completions" },
         },
       },
       agents: { defaults: { model: "old/model@old:default" } },
@@ -196,10 +184,7 @@ describe("doctor-contract-registry module loader", () => {
           return { config: cfg, changes: ["repaired config"] };
         },
       },
-      {
-        id: "normalizer-only",
-        doctorContract: { configRepair: true },
-      },
+      { id: "normalizer-only", doctorContract: { configRepair: true } },
     );
 
     const config = {};
@@ -241,13 +226,12 @@ describe("doctor-contract-registry module loader", () => {
     expect(config).toEqual({});
   });
 
-  it.each([
-    { extension: "js", key: "legacy", message: "legacy demo key" },
-    { extension: "ts", key: "ts", message: "typescript contract" },
-  ])(
-    "loads Windows $extension contracts through their compatible boundary",
-    ({ extension, key, message }) => {
-      const legacyConfigRules = [{ path: ["plugins", "entries", "demo", key], message }];
+  it.each(["js", "ts"])(
+    "loads Windows %s contracts through their compatible boundary",
+    (extension) => {
+      const legacyConfigRules = [
+        { path: ["plugins", "entries", "demo", "legacy"], message: "legacy demo key" },
+      ];
       const source =
         extension === "js"
           ? `module.exports = ${JSON.stringify({ legacyConfigRules })};\n`
@@ -352,12 +336,8 @@ describe("doctor-contract-registry module loader", () => {
     const bundled = registry({
       id: "discord",
       rootDir: makeTempDir(),
-      origin: "bundled",
       channels: ["discord"],
-      providers: [],
-      doctorContract: {
-        stateMigrations: [{ id: "discord-legacy-channel-state" }],
-      },
+      doctorContract: { stateMigrations: [{ id: "discord-legacy-channel-state" }] },
     });
     mocks.loadPluginManifestRegistry.mockReturnValueOnce(bundled).mockReturnValueOnce(bundled);
     const config = {
@@ -513,25 +493,15 @@ describe("doctor-contract-registry selection", () => {
   });
 
   it.each([
-    { name: "full scan", touchedPaths: undefined, configRepair: true, expected: true },
-    { name: "parent edit", touchedPaths: [["legacyRoots"]], configRepair: true, expected: true },
-    {
-      name: "dotted owner edit",
-      touchedPaths: [["legacyRoots", "store.with.dots", "root"]],
-      configRepair: true,
-      expected: true,
-    },
-    {
-      name: "unrelated edit",
-      touchedPaths: [["gateway", "port"]],
-      configRepair: true,
-      expected: false,
-    },
-    { name: "empty edit", touchedPaths: [], configRepair: true, expected: false },
-    { name: "undeclared repair", touchedPaths: undefined, configRepair: false, expected: false },
-  ])(
-    "discovers declared config migration sources without plugin entries: $name",
-    async ({ touchedPaths, configRepair, expected }) => {
+    ["full scan", undefined, true, true],
+    ["parent edit", [["legacyRoots"]], true, true],
+    ["dotted owner edit", [["legacyRoots", "store.with.dots", "root"]], true, true],
+    ["unrelated edit", [["gateway", "port"]], true, false],
+    ["empty edit", [], true, false],
+    ["undeclared repair", undefined, false, false],
+  ] satisfies Array<[string, string[][] | undefined, boolean, boolean]>)(
+    "discovers declared config migration sources without plugin entries: %s",
+    async (_name, touchedPaths, configRepair, expected) => {
       const pluginRoot = writeContract();
       const rule = {
         path: ["legacyRoots", "store.with.dots", "root"],
@@ -664,7 +634,7 @@ describe("doctor-contract-registry selection", () => {
     const pluginRoot = writeContract();
     const unrelatedRoot = writeContract();
     const config = {
-      models: { providers: { "ollama-cloud": { baseUrl: "https://ai.ollama.com", models: [] } } },
+      models: { providers: { "ollama-cloud": providerConfig("https://ai.ollama.com") } },
     };
     mocks.createJiti.mockImplementation(() => (modulePath: string) => ({
       normalizeCompatibilityConfig: ({ cfg }: { cfg: typeof config }) => {
@@ -703,10 +673,9 @@ describe("doctor-contract-registry selection", () => {
     });
 
     expect(result.changes).toEqual(["normalized ollama cloud provider endpoint"]);
-    expect(result.config.models?.providers?.["ollama-cloud"]).toEqual({
-      baseUrl: "https://ollama.com",
-      models: [],
-    });
+    expect(result.config.models?.providers?.["ollama-cloud"]).toEqual(
+      providerConfig("https://ollama.com"),
+    );
     expect(mocks.createJiti).toHaveBeenCalledTimes(1);
   });
 
@@ -718,12 +687,7 @@ describe("doctor-contract-registry selection", () => {
           changes: ["mixed-case owner repaired config"],
         }),
       },
-      {
-        id: "MiXeD-upgrade-proof",
-        channels: [],
-        providers: [],
-        doctorContract: { configRepair: true },
-      },
+      { id: "MiXeD-upgrade-proof", doctorContract: { configRepair: true } },
     );
     const config = { plugins: { entries: { "mixed-upgrade-proof": { enabled: true } } } };
     const result = doctor.applyPluginDoctorCompatibilityMigrations(config, {

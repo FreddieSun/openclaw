@@ -34,8 +34,11 @@ import {
   markPluginRegistryRetired,
   revokePluginRecord,
 } from "./registry-lifecycle.js";
-import { createRuntimeTestRegistry } from "./registry-runtime.test-helpers.js";
-import { createEmptyPluginRegistry, createPluginRegistry } from "./registry.js";
+import {
+  createRuntimeTestRegistry,
+  createTestPluginRegistry,
+} from "./registry-runtime.test-helpers.js";
+import { createEmptyPluginRegistry } from "./registry.js";
 import { disposePluginRegistryInstances, withPluginRegistrationContext } from "./runtime.js";
 import {
   getPluginRuntimeGatewayRequestScope,
@@ -101,7 +104,9 @@ function registered(
 ) {
   const builder = createRuntimeTestRegistry(runtime);
   const record = createRecord(id, overrides);
-  return { builder, record, api: builder.createApi(record, { config: {} }) };
+  const api = builder.createApi(record, { config: {} });
+  const owner = expectDefined(getPluginInstance(record), "plugin instance");
+  return { builder, record, api, owner };
 }
 
 function sessionFixture(id: string) {
@@ -134,9 +139,9 @@ async function expectSessionNamespace(
   conflict: CreateParams,
 ) {
   const create = api.runtime.agent.session.createSessionEntry;
-  await expect(create({ cfg: {}, key, initialEntry })).resolves.toEqual(
-    expect.objectContaining({ sessionId: "session-1" }),
-  );
+  await expect(create({ cfg: {}, key, initialEntry })).resolves.toMatchObject({
+    sessionId: "session-1",
+  });
   expect(createSessionEntry).toHaveBeenCalledWith(
     expect.objectContaining({
       initialEntry: expect.objectContaining({ pluginOwnerId: record.id }),
@@ -153,11 +158,7 @@ describe("plugin registration runtime admission", () => {
     const list = vi.fn(async () => ({ nodes: [] }));
     const runtime = createPluginRuntime();
     runtime.nodes.list = list;
-    const builder = createPluginRegistry({
-      runtime,
-      activateGlobalSideEffects: false,
-      logger: { info() {}, warn() {}, error() {} },
-    });
+    const builder = createTestPluginRegistry(runtime);
     const record = createRecord("register-runtime", { origin });
     const api = builder.createApi(record, { config: {} });
     const owner = expectDefined(getPluginInstance(record), "registration instance");
@@ -341,8 +342,7 @@ describe("plugin registry runtime config scope", () => {
     source.transcribeAudioFile = async () => ({
       text: getPluginRuntimeGatewayRequestScope()?.pluginRegistry?.coreGatewayMethodNames[0],
     });
-    const { builder, record, api } = registered("stable-media", {}, runtime);
-    const instance = expectDefined(getPluginInstance(record), "media instance");
+    const { builder, record, api, owner } = registered("stable-media", {}, runtime);
     builder.registry.coreGatewayMethodNames.push("original");
     markPluginRegistryActive(builder.registry);
     const facade = api.runtime.mediaUnderstanding;
@@ -399,7 +399,7 @@ describe("plugin registry runtime config scope", () => {
       );
     } finally {
       intercept.mockRestore();
-      await instance.dispose();
+      await owner.dispose();
       markPluginRegistryRetired(successor);
     }
   });
@@ -409,8 +409,7 @@ describe("plugin registry runtime config scope", () => {
       readonly fixtureLabel = "RetiredRegistry";
     }
     const runtime = createPluginRuntime();
-    const { builder, record, api } = registered("hosted-media", {}, runtime);
-    const instance = expectDefined(getPluginInstance(record), "media instance");
+    const { builder, record, api, owner } = registered("hosted-media", {}, runtime);
     builder.registry.plugins.push(record);
     const media = api.runtime.media;
     expect(media.detectMime).toBe(runtime.media.detectMime);
@@ -418,7 +417,7 @@ describe("plugin registry runtime config scope", () => {
     const resource = (() => {
       const previous = Object.assign(new RetiredRegistry(), builder.registry);
       markPluginRegistryActive(previous);
-      const captured = instance.run(() => new AsyncResource("hosted-media-retention"));
+      const captured = owner.run(() => new AsyncResource("hosted-media-retention"));
       markPluginRegistryActive(current);
       markPluginRegistryRetired(previous);
       return captured;
@@ -442,7 +441,7 @@ describe("plugin registry runtime config scope", () => {
       expect(readFile.mock.calls[1]?.[0]).toBe("/synthetic/resolved.txt");
     } finally {
       resource.emitDestroy();
-      await instance.dispose();
+      await owner.dispose();
       markPluginRegistryRetired(current);
     }
   });
@@ -469,12 +468,11 @@ describe("plugin registry runtime config scope", () => {
           audit: { caller: { kind: "plugin", id: "pending-runtime" } },
         };
       };
-      const { builder, record, api } = registered("pending-runtime", {}, runtime);
-      const instance = expectDefined(getPluginInstance(record), "runtime instance");
+      const { builder, record, api, owner } = registered("pending-runtime", {}, runtime);
       markPluginRegistryActive(builder.registry);
       // Channel monitors retain instance custody without pinning a registry generation.
       const consumer =
-        mode === "custody" ? instance.retainConsumer(undefined, undefined, "custody") : undefined;
+        mode === "custody" ? owner.retainConsumer(undefined, undefined, "custody") : undefined;
       const successor = createEmptyPluginRegistry();
       successor.plugins.push(record);
       const pending = (() => {
@@ -503,7 +501,7 @@ describe("plugin registry runtime config scope", () => {
         resume.resolve();
         await Promise.allSettled([pending]);
         consumer?.release();
-        await instance.dispose();
+        await owner.dispose();
         markPluginRegistryRetired(successor);
       }
     },
@@ -521,15 +519,12 @@ describe("plugin registry runtime config scope", () => {
     );
   });
 
-  it.each([
-    {
-      label: "official global",
+  it("binds native compaction to the official global Codex harness", async () => {
+    const { builder, api, owner } = registered("codex", {
       source: "/plugins/node_modules/@openclaw/codex/index.js",
       origin: "global",
       packageName: "@openclaw/codex",
-    },
-  ] as const)("binds native compaction to the $label Codex harness", async (fixture) => {
-    const { builder, record, api } = registered("codex", fixture);
+    });
     const nativeCompaction = vi.fn(async () => ({ ok: true, compacted: true }));
     const options = { nativeCompaction };
 
@@ -548,7 +543,7 @@ describe("plugin registry runtime config scope", () => {
     expect(nativeCompaction).toHaveBeenCalledWith(request);
     expect(nativeCompaction.mock.contexts[0]).toBe(options);
     expect(registration.harness).not.toHaveProperty("compactNative");
-    await expectDefined(getPluginInstance(record), "compaction owner").dispose();
+    await owner.dispose();
     expect(() => compact(request)).toThrow(/reloaded|disabled|retiring/);
     expect(nativeCompaction).toHaveBeenCalledTimes(1);
   });
@@ -773,9 +768,9 @@ describe("plugin registry runtime config scope", () => {
       initialEntry: { agentHarnessId: "codex" },
     };
 
-    await expect(ownerApi.runtime.agent.session.createSessionEntry(createParams)).resolves.toEqual(
-      expect.objectContaining({ sessionId: "session-1" }),
-    );
+    await expect(
+      ownerApi.runtime.agent.session.createSessionEntry(createParams),
+    ).resolves.toMatchObject({ sessionId: "session-1" });
     expect(createScope).toMatchObject({
       pluginId: "codex-owner",
       pluginSource: "/plugins/codex-owner/index.js",
@@ -792,7 +787,7 @@ describe("plugin registry runtime config scope", () => {
     }
     await expect(
       ownerApi.runtime.agent.session.createSessionEntry(ordinaryParams),
-    ).resolves.toEqual(expect.objectContaining({ sessionId: "session-1" }));
+    ).resolves.toMatchObject({ sessionId: "session-1" });
     expect(createSessionEntry).toHaveBeenCalledTimes(2);
   });
 

@@ -64,16 +64,6 @@ function expectValidationIssue(
   return issue;
 }
 
-function expectIssueMessageIncludes(
-  issue: ReturnType<typeof expectValidationIssue>,
-  fragments: readonly string[],
-) {
-  expect(issue.message).toContain(fragments[0] ?? "");
-  fragments.slice(1).forEach((fragment) => {
-    expect(issue.message).toContain(fragment);
-  });
-}
-
 function expectSuccessfulValidationValue(
   input: Parameters<typeof validateJsonSchemaValue>[0],
   expectedValue: unknown,
@@ -154,54 +144,31 @@ describe("schema validator", () => {
     });
     expectValidationIssue(denied, "<root>");
 
-    expectReference({
-      $defs: { Value: { $anchor: "value", type: "string" } },
-      $ref: "#value",
-    });
-
-    expectReference({
-      $defs: {
-        Other: {
-          $id: "other",
-          $defs: { Value: { $anchor: "value", type: "string" } },
-          $ref: "#value",
-        },
+    const string = { type: "string" };
+    const anchored = { $defs: { Value: { ...string, $anchor: "value" } }, $ref: "#value" };
+    for (const schema of [
+      anchored,
+      { $defs: { Other: { $id: "other", ...anchored } }, $ref: "#/$defs/Other" },
+      {
+        $id: "https://example.com/schema",
+        $defs: { Value: string },
+        $ref: "https://example.com/schema#/$defs/Value",
       },
-      $ref: "#/$defs/Other",
-    });
-
-    expectReference({
-      $id: "https://example.com/schema",
-      $defs: { Value: { type: "string" } },
-      $ref: "https://example.com/schema#/$defs/Value",
-    });
-
-    expectReference({
-      $defs: { Value: { $id: "https://example.com/value", type: "string" } },
-      $ref: "https://example.com/value",
-    });
-
-    expectReference({
-      $defs: { Value: { $id: "value", type: "string" } },
-      $ref: "value",
-    });
-
-    expectReference({
-      $id: "https://example.com/root/",
-      $defs: { Value: { $id: "value", type: "string" } },
-      $ref: "https://example.com/root/value",
-    });
-
-    expectReference({
-      $id: "",
-      $defs: { Value: { type: "string" } },
-      $ref: "#/$defs/Value",
-    });
-
-    expectReference({
-      $defs: { Value: { $dynamicAnchor: "value", type: "string" } },
-      $dynamicRef: "#value",
-    });
+      {
+        $defs: { Value: { ...string, $id: "https://example.com/value" } },
+        $ref: "https://example.com/value",
+      },
+      { $defs: { Value: { ...string, $id: "value" } }, $ref: "value" },
+      {
+        $id: "https://example.com/root/",
+        $defs: { Value: { ...string, $id: "value" } },
+        $ref: "https://example.com/root/value",
+      },
+      { $id: "", $defs: { Value: string }, $ref: "#/$defs/Value" },
+      { $defs: { Value: { ...string, $dynamicAnchor: "value" } }, $dynamicRef: "#value" },
+    ]) {
+      expectReference(schema);
+    }
 
     expectValidationFailure({
       cacheKey: "schema-validator.test.dynamic-ref",
@@ -262,28 +229,48 @@ describe("schema validator", () => {
   });
 
   it("applies defaults through active dependency and conditional schemas", () => {
+    const kind = { kind: { const: "api" } };
+    const defaultKind = { kind: { const: "api", default: "api" } };
+    const kindReference = fields({ value: { const: "api" } }, ["value"]);
+    const withEndpoint = (schema: Parameters<typeof expectDefaults>[0], value = { kind: "api" }) =>
+      expectDefaults(schema, value, { ...value, endpoint: "https://example.com" });
+    const flagConditional = conditionalSchema(
+      fields({ flag: { const: true } }, ["flag"]),
+      { required: ["secret"] },
+      { properties: { flag: defaulted("boolean", true) } },
+    );
+    const modeConditional = conditionalSchema(
+      { not: { required: ["mode"] } },
+      fields({ mode: defaulted("string", "auto") }),
+      { else: fields({ explicit: defaulted("boolean", true) }, ["explicit"]) },
+    );
+
     expectDefaults(
       objectSchema({ flag: { type: "boolean" } }, { dependencies: { flag: modeDefaults() } }),
       { flag: true },
       { flag: true, mode: "auto" },
     );
-
-    expectDefaults(
-      conditionalSchema(apiCondition(), endpointDefaults(true), {
-        properties: { kind: { const: "api" } },
-      }),
-      { kind: "api" },
-      { kind: "api", endpoint: "https://example.com" },
-    );
-
-    expectDefaults(
+    for (const schema of [
+      conditionalSchema(apiCondition(), endpointDefaults(true), { properties: kind }),
       conditionalSchema({ $ref: "#/$defs/ApiKind" }, endpointDefaults(true), {
         $defs: { ApiKind: apiCondition() },
       }),
-      { kind: "api" },
-      { kind: "api", endpoint: "https://example.com" },
-    );
-
+      conditionalSchema(
+        { $defs: { Local: { type: "string" } }, $ref: "#/$defs/ApiKind" },
+        endpointDefaults(true),
+        { $defs: { ApiKind: apiCondition() } },
+      ),
+      conditionalSchema(
+        {
+          $defs: { MatchKind: fields({ kind: { const: "other" } }, ["kind"]) },
+          $ref: "#/$defs/MatchKind",
+        },
+        endpointDefaults(),
+        { $defs: { MatchKind: apiCondition() } },
+      ),
+    ]) {
+      withEndpoint(schema);
+    }
     expectDefaults(
       conditionalSchema(
         fields({ contact: { type: "string", format: "email" } }, ["contact"]),
@@ -293,131 +280,62 @@ describe("schema validator", () => {
       { contact: "not an email" },
       { contact: "not an email", mode: "auto" },
     );
-
+    const rootReference = conditionalSchema({ $ref: "#/properties/kind" }, endpointDefaults(true), {
+      properties: { kind: kindReference },
+    });
     expectDefaults(
-      conditionalSchema({ $ref: "#/properties/kind" }, endpointDefaults(true), {
-        properties: { kind: fields({ value: { const: "api" } }, ["value"]) },
-      }),
+      rootReference,
       { value: "api" },
       { value: "api", endpoint: "https://example.com" },
     );
-
     expectDefaults(
       conditionalSchema(
         fields({ kind: { $ref: "#/properties/kind" } }, ["kind"]),
         endpointDefaults(true),
-        { properties: { kind: fields({ value: { const: "api" } }, ["value"]) } },
+        { properties: { kind: kindReference } },
       ),
       { kind: { value: "api" } },
       { kind: { value: "api" }, endpoint: "https://example.com" },
     );
-
-    expectDefaults(
-      conditionalSchema(
-        { $defs: { Local: { type: "string" } }, $ref: "#/$defs/ApiKind" },
-        endpointDefaults(true),
-        { $defs: { ApiKind: apiCondition() } },
-      ),
-      { kind: "api" },
-      { kind: "api", endpoint: "https://example.com" },
-    );
-
-    expectDefaults(
-      conditionalSchema(
-        {
-          $defs: { MatchKind: fields({ kind: { const: "other" } }, ["kind"]) },
-          $ref: "#/$defs/MatchKind",
-        },
-        endpointDefaults(),
-        { $defs: { MatchKind: apiCondition() } },
-      ),
-      { kind: "api" },
-      { kind: "api", endpoint: "https://example.com" },
-    );
-
-    expectDefaults(
-      conditionalSchema(apiCondition(), endpointDefaults(true), {
-        properties: { kind: { const: "api", default: "api" } },
-      }),
-      {},
-      { kind: "api", endpoint: "https://example.com" },
-    );
-
-    expectDefaults(
+    for (const schema of [
+      conditionalSchema(apiCondition(), endpointDefaults(true), { properties: defaultKind }),
       conditionalSchema(apiCondition(), endpointDefaults(), {
-        properties: { kind: { const: "api", default: "api" } },
+        properties: defaultKind,
         else: fields({ path: defaulted("string", "/tmp") }),
       }),
-      {},
-      { kind: "api", endpoint: "https://example.com" },
+    ]) {
+      expectDefaults(schema, {}, { kind: "api", endpoint: "https://example.com" });
+    }
+    expectDefaults(modeConditional, {}, { mode: "auto" });
+    expectDefaults(flagConditional, {}, { flag: true });
+    expectValidationIssue(
+      expectValidationFailure({
+        schema: flagConditional,
+        value: { flag: true },
+        applyDefaults: true,
+      }),
+      "<root>",
     );
-
-    expectDefaults(
+    for (const schema of [
+      conditionalSchema({ not: { required: ["mode"] } }, fields({ mode: defaulted("number", 1) }), {
+        properties: { mode: { type: "string" } },
+        else: fields({ explicit: { type: "boolean" } }, ["explicit"]),
+      }),
       conditionalSchema(
-        { not: { required: ["mode"] } },
-        fields({ mode: defaulted("string", "auto") }),
-        {
-          else: fields({ explicit: defaulted("boolean", true) }, ["explicit"]),
-        },
-      ),
-      {},
-      { mode: "auto" },
-    );
-
-    expectDefaults(
-      conditionalSchema(
-        fields({ flag: { const: true } }, ["flag"]),
-        { required: ["secret"] },
-        { properties: { flag: defaulted("boolean", true) } },
-      ),
-      {},
-      { flag: true },
-    );
-
-    const explicitConditionResult = expectValidationFailure({
-      cacheKey: "schema-validator.test.defaults.conditional-explicit-condition-still-fails",
-      schema: conditionalSchema(
-        fields({ flag: { const: true } }, ["flag"]),
-        { required: ["secret"] },
-        { properties: { flag: defaulted("boolean", true) } },
-      ),
-      value: { flag: true },
-      applyDefaults: true,
-    });
-    expectValidationIssue(explicitConditionResult, "<root>");
-
-    expectValidationFailure({
-      cacheKey: "schema-validator.test.defaults.conditional-invalid-default",
-      schema: conditionalSchema(
-        { not: { required: ["mode"] } },
-        fields({ mode: defaulted("number", 1) }),
-        {
-          properties: { mode: { type: "string" } },
-          else: fields({ explicit: { type: "boolean" } }, ["explicit"]),
-        },
-      ),
-      value: {},
-      applyDefaults: true,
-    });
-
-    expectValidationFailure({
-      cacheKey: "schema-validator.test.defaults.conditional-invalid-branch-default",
-      schema: conditionalSchema(
         fields({ flag: { const: true } }, ["flag"]),
         fields({ mode: defaulted("number", "bad") }),
         { properties: { flag: defaulted("boolean", true) } },
       ),
-      value: {},
-      applyDefaults: true,
-    });
-
+    ]) {
+      expectValidationFailure({ schema, value: {}, applyDefaults: true });
+    }
     expectDefaults(
       conditionalSchema(
         apiCondition(),
         fields({ settings: { type: "object", default: {} } }, ["settings"]),
         {
           properties: {
-            kind: { const: "api" },
+            ...kind,
             settings: objectSchema({ mode: defaulted("string", "auto") }, { required: ["mode"] }),
           },
         },
@@ -425,7 +343,6 @@ describe("schema validator", () => {
       { kind: "api" },
       { kind: "api", settings: { mode: "auto" } },
     );
-
     expectDefaults(
       objectSchema(
         { flag: defaulted("boolean", true) },
@@ -434,16 +351,14 @@ describe("schema validator", () => {
       {},
       { flag: true, mode: "auto" },
     );
-
     expectDefaults(
       conditionalSchema(apiCondition(), requiredFlagDefault("flag"), {
-        properties: { kind: { const: "api" } },
+        properties: kind,
         dependencies: { flag: modeDefaults() },
       }),
       { kind: "api" },
       { kind: "api", flag: true, mode: "auto" },
     );
-
     expectDefaults(
       objectSchema(
         { a: defaulted("boolean", true) },
@@ -460,14 +375,10 @@ describe("schema validator", () => {
       {},
       { a: true, b: true, c: true, d: true, e: true, f: true },
     );
-
     expectDefaults(
       conditionalSchema(apiCondition(), endpointDefaults(true), {
         properties: { a: defaulted("boolean", true) },
-        dependencies: {
-          b: fields({ kind: { const: "api", default: "api" } }, ["kind"]),
-          a: requiredFlagDefault("b"),
-        },
+        dependencies: { b: fields(defaultKind, ["kind"]), a: requiredFlagDefault("b") },
       }),
       {},
       { a: true, b: true, kind: "api", endpoint: "https://example.com" },
@@ -529,28 +440,21 @@ describe("schema validator", () => {
     const result = expectValidationFailure(params);
     const issue = expectValidationIssue(result, path);
 
-    expectIssueMessageIncludes(issue, messageIncludes);
-    if (allowedValues) {
-      expect(issue?.allowedValues).toEqual(allowedValues);
-      expect(issue?.allowedValuesHiddenCount).toBe(hiddenCount);
+    for (const fragment of messageIncludes) {
+      expect(issue.message).toContain(fragment);
     }
+    expect([issue.allowedValues, issue.allowedValuesHiddenCount]).toEqual([
+      allowedValues,
+      hiddenCount,
+    ]);
   });
 
-  it.each([
-    {
-      title: "appends missing dependency property to the structured path",
-      params: {
-        cacheKey: "schema-validator.test.dependencies.path",
-        schema: objectSchema({ settings: { type: "object", dependencies: { mode: ["format"] } } }),
-        value: { settings: { mode: "strict" } },
-      },
-      expectedPath: "settings.format",
-    },
-  ])("$title", ({ params, expectedPath }) => {
-    const result = expectValidationFailure(params);
-    const issue = expectValidationIssue(result, expectedPath);
-
-    expect(issue?.allowedValues).toBeUndefined();
+  it("appends missing dependency property to the structured path", () => {
+    const result = expectValidationFailure({
+      schema: objectSchema({ settings: { type: "object", dependencies: { mode: ["format"] } } }),
+      value: { settings: { mode: "strict" } },
+    });
+    expect(expectValidationIssue(result, "settings.format").allowedValues).toBeUndefined();
   });
 });
 
