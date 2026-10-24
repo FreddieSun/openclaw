@@ -213,11 +213,11 @@ export function createChannelIngressDrainOwner<
     clearStallTimer(state);
     clearClaimRefresh(state);
     activeByClaim.delete(activeClaimKey(state.claim));
+    options.onClaimSettled?.();
     if (laneOwnerByKey.get(state.laneKey) === state) {
       laneOwnerByKey.delete(state.laneKey);
     }
     state.occupiesLane = false;
-    options.onClaimSettled?.();
   };
 
   const markLeaseReclaimed = (state: ActiveHandlerState<TPayload, TMetadata>) => {
@@ -676,11 +676,11 @@ export function createChannelIngressDrainOwner<
     // The ordered snapshot owns selection for this pass. A delayed head blocks its lane.
     for (const [index, event] of pending.entries()) {
       const laneKey = laneKeyFor(event);
-      const delay = retry.delay(event, options.retryPolicy, currentTime);
-      if (delay > 0) {
+      if (retry.delay(event, options.retryPolicy, now()) > 0) {
         retryDelayed[index] = 1;
         if (!pendingLaneKeys.has(laneKey)) {
           retryDelayedLaneKeys.add(laneKey);
+          const delay = retry.delay(event, options.retryPolicy, currentTime);
           retryAt = Math.min(retryAt ?? Infinity, currentTime + delay);
         }
       }

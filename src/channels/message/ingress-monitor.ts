@@ -93,14 +93,14 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
   let releaseRestartFenceWake = () => {};
   let suspensionDrainPending = false;
   let unsubscribeSuspension: (() => void) | undefined;
-  let recoveryTimer: ReturnType<typeof setInterval> | undefined;
-  let retryTimer: ReturnType<typeof setTimeout> | undefined;
-  let recoveryRequested = true;
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
   let lastPrunedAt = 0;
   let admissionTail: Promise<void> = Promise.resolve();
   const withAdmissionClaimLock = createAdmissionClaimLock();
   let stopTask: Promise<void> | undefined;
   let lastReportedActive = false;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let recoveryRequested = true;
 
   const clearSuspensionSubscription = (): void => {
     suspensionDrainPending = false;
@@ -323,6 +323,8 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
               if (releasedStartCapacity) {
                 releasedStartCapacity = false;
                 deferredStartCapacity -= 1;
+              } else if (handedOff) {
+                requestDrain();
               }
               publishActivity();
             });
@@ -533,8 +535,8 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
   };
 
   const clearTimers = () => {
-    clearInterval(recoveryTimer);
-    recoveryTimer = undefined;
+    clearInterval(pollTimer);
+    pollTimer = undefined;
     clearTimeout(retryTimer);
     retryTimer = undefined;
   };
@@ -671,14 +673,14 @@ export function createChannelIngressMonitor<TRaw, TBody, TStoredPayload, TMetada
       // Admissions and claim settlements wake normal work; only abandoned or
       // externally enqueued rows need a bounded recovery sweep.
       recoveryRequested = true;
-      recoveryTimer = setInterval(
+      pollTimer = setInterval(
         () => {
           recoveryRequested = true;
           requestDrain();
         },
         Math.max(60_000, options.pollIntervalMs),
       );
-      recoveryTimer.unref?.();
+      pollTimer.unref?.();
       requestDrain();
     },
     ensureQueueAvailable,

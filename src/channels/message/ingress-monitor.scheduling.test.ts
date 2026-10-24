@@ -132,6 +132,53 @@ describe("ingress wake scheduling", () => {
     });
   });
 
+  it("uses a freed delivery slot while other adopted deliveries are still running", async () => {
+    await withQueue(async (queue) => {
+      const releaseFirst = createDeferred();
+      const releaseOthers = createDeferred();
+      const batchStarted = createDeferred();
+      const delivered: string[] = [];
+      const monitor = createMonitor(
+        queue,
+        async (raw, lifecycle) => {
+          await lifecycle.onAdopted();
+          delivered.push(raw.id);
+          if (delivered.length === 32) {
+            batchStarted.resolve();
+          }
+          if (raw.id === "000") {
+            await releaseFirst.promise;
+          } else if (raw.id !== "032") {
+            await releaseOthers.promise;
+          }
+        },
+        { pollIntervalMs: 60_000 },
+      );
+      try {
+        for (let index = 0; index < 33; index++) {
+          const raw = { ...event, id: String(index).padStart(3, "0"), lane: String(index) };
+          await queue.enqueue(
+            raw.id,
+            { version: 1, rawEvent: JSON.stringify(raw) },
+            {
+              laneKey: `lane:${raw.lane}`,
+            },
+          );
+        }
+        monitor.start();
+        await batchStarted.promise;
+        await monitor.waitForPumpIdle();
+        expect(delivered).toHaveLength(32);
+        releaseFirst.resolve();
+        await vi.waitFor(() => expect(delivered).toContain("032"));
+      } finally {
+        releaseFirst.resolve();
+        releaseOthers.resolve();
+        await monitor.stop();
+      }
+    });
+  });
+
   it("recovers a dead owner's claim on the bounded sweep", async () => {
     await withQueue(async (queue) => {
       await queue.listPending();
