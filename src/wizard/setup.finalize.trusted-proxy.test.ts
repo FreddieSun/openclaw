@@ -6,9 +6,6 @@ import type * as AuthChoiceModelCheck from "../commands/auth-choice.model-check.
 type DefaultModelAuthStatus = Awaited<
   ReturnType<typeof AuthChoiceModelCheck.resolveDefaultModelAuthStatus>
 >;
-type DefaultModelCatalogFacts = ReturnType<
-  typeof AuthChoiceModelCheck.resolveDefaultModelCatalogFacts
->;
 
 const readPin = vi.hoisted(() => vi.fn());
 // mock-isolation: Service-planning fixtures replace pin admission without opening stores or native locks.
@@ -70,7 +67,7 @@ const resolveDefaultModelAuthStatus = vi.hoisted(() =>
   })),
 );
 const resolveDefaultModelCatalogFacts = vi.hoisted(() =>
-  vi.fn<() => DefaultModelCatalogFacts>(() => ({})),
+  vi.fn((): ReturnType<typeof AuthChoiceModelCheck.resolveDefaultModelCatalogFacts> => ({})),
 );
 const buildGatewayInstallPlan = vi.hoisted(() =>
   vi.fn(async (_params?: { warn?: (message: string, title?: string) => void }) => ({
@@ -147,7 +144,8 @@ vi.mock("../web-search/runtime.js", () => ({
   listConfiguredWebSearchProviders,
 }));
 
-vi.mock("../daemon/service.js", () => ({
+vi.mock("../daemon/service.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../daemon/service.js")>()),
   describeGatewayServiceRestart: vi.fn(describeGatewayServiceRestart),
   formatGatewayServiceStartRepairIssues: (issues: Array<{ message: string }>) =>
     issues.map((issue) => issue.message).join("; "),
@@ -163,7 +161,8 @@ vi.mock("../daemon/service.js", () => ({
   })),
 }));
 
-vi.mock("../daemon/systemd.js", () => ({
+vi.mock("../daemon/systemd.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../daemon/systemd.js")>()),
   isSystemdUserServiceAvailable,
   resolveSystemdUserServiceAccount,
   readSystemdUserLingerStatus,
