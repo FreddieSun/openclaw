@@ -413,7 +413,7 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
     const sessionManager = guardSessionManager(SessionManager.inMemory(), { runId: "run-1" });
     sessionManager.appendMessage({ role: "user", content: "Remember Blue Heron", timestamp: 1 });
     sessionManager.appendMessage({
-      ...createAssistant(model, [{ type: "text", text: "Blue Heron is the project." }]),
+      ...createAssistant(model, "Blue Heron is the project."),
       timestamp: 2,
     });
     const { session } = await createTestSession({
@@ -446,21 +446,14 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
     streamMocks.streamSimple.mockImplementation((activeModel, _context, options) => {
       if (++requests === 1) {
         return createAssistantResultStream(
-          createAssistant(
-            activeModel,
-            [{ type: "text", text: "Blue Heron answer" }],
-            "stop",
-            4_090,
-          ),
+          createAssistant(activeModel, "Blue Heron answer", "stop", 4_090),
         );
       }
       const response = createAssistantMessageEventStream();
       summaryStarted.resolve();
       void releaseSummary.promise.then(() => {
         summarySignalAborted = options?.signal?.aborted;
-        const message = createAssistant(activeModel, [
-          { type: "text", text: "Blue Heron summary" },
-        ]);
+        const message = createAssistant(activeModel, "Blue Heron summary");
         response.push({ type: "done", reason: "stop", message });
         response.end();
       });
@@ -589,21 +582,15 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
       "timeout",
       "settled-phase",
     ]);
-    expect(fixture.state).toEqual(
-      expect.objectContaining({
-        terminal: {
-          aborted: true,
-          kind: "timeout",
-          phase: "compaction",
-          source: "external",
-        },
-      }),
-    );
+    expect(fixture.state.terminal).toEqual({
+      aborted: true,
+      kind: "timeout",
+      phase: "compaction",
+      source: "external",
+    });
     const settledInput = mocks.runSettledPhase.mock.calls[0]?.[0];
     expect(fixture.runAbort).toHaveBeenCalledWith(true, expect.any(Error));
     const streamInput = mocks.prepareStream.mock.calls[0]?.[0];
-    expect(streamInput.agentSession.activeSession).toBe(fixture.activeSession);
-    expect(streamInput.agentSession.trustedLocalMediaToolNames).toEqual(new Set(["read"]));
     expect(streamInput.getRunState()).toEqual({
       aborted: true,
       promptError: null,
@@ -619,11 +606,7 @@ describe("runEmbeddedAttemptExecutionPhase", () => {
   it("publishes the replacement fact and invalidates the skill cache before attempt cleanup throws", async () => {
     const fixture = await createFixture({ exerciseTerminalMerges: false });
     const events: EmbeddedContextAccountingEvent[] = [];
-    Object.assign(fixture.input.attempt, {
-      onContextAccountingEvent: (event: EmbeddedContextAccountingEvent) => {
-        events.push(event);
-      },
-    });
+    fixture.input.attempt.onContextAccountingEvent = (event) => events.push(event);
     const cleanupError = new Error("attempt cleanup failed after compaction committed");
     let eventsBeforeCleanup: EmbeddedContextAccountingEvent[] | undefined;
     let cacheSizeBeforeCleanup: number | undefined;

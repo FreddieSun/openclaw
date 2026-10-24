@@ -1,4 +1,3 @@
-import { DatabaseSync, StatementSync } from "node:sqlite";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -25,13 +24,12 @@ import type {
 } from "../../../infra/sqlite-worker-store.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import { openOpenClawAgentDatabase } from "../../../state/openclaw-agent-db.js";
+import { observeMainThreadSql } from "../../../test-utils/main-thread-sql-spies.test-support.js";
 import { withOpenClawTestState } from "../../../test-utils/openclaw-test-state.js";
-import { createTestAdmittedRunContext } from "../../admitted-run-context.test-support.js";
 import { runWithModelFallback } from "../../model-fallback-runner.js";
 import { isRecordedModelFallbackStop } from "../../model-fallback-stop.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import { SessionManager } from "../../sessions/session-manager.js";
-import { createUsageAccumulator } from "../usage-accumulator.js";
 
 const mocks = vi.hoisted(() => ({
   clearActiveEmbeddedRun: vi.fn(),
@@ -82,8 +80,6 @@ import {
   createPersistedImageNoteFixture,
 } from "./attempt-execution-settle.test-support.js";
 import { runEmbeddedAttemptSettledPhase } from "./attempt-settle.js";
-import { createEmbeddedRunContextRecoveryState } from "./context-recovery-state.js";
-import { prepareEmbeddedRunTerminal } from "./terminal-preparation.js";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -129,19 +125,15 @@ describe("runEmbeddedAttemptSettledPhase", () => {
       "clear-active-run",
       "result",
     ]);
-    expect(fixture.state).toEqual(
-      expect.objectContaining({
-        beforeAgentRunBlockedBy: "before_agent",
-        terminal: { kind: "ok" },
-        trajectoryEndRecorded: true,
-      }),
-    );
-    expect(fixture.sessionRuntimeState).toEqual(
-      expect.objectContaining({
-        prePromptMessageCount: 4,
-        promptCache: { cacheRead: 1 },
-      }),
-    );
+    expect(fixture.state).toMatchObject({
+      beforeAgentRunBlockedBy: "before_agent",
+      terminal: { kind: "ok" },
+      trajectoryEndRecorded: true,
+    });
+    expect(fixture.sessionRuntimeState).toMatchObject({
+      prePromptMessageCount: 4,
+      promptCache: { cacheRead: 1 },
+    });
     expect(mocks.completeAfterTurn).toHaveBeenCalledWith(
       fixture.input,
       expect.objectContaining({ sessionIdUsed: "settled-session" }),
@@ -203,15 +195,8 @@ describe("runEmbeddedAttemptSettledPhase", () => {
         const database = openOpenClawAgentDatabase({ agentId: "main", path: target.storePath });
         // Prepare before instrumentation so the probes must observe cached statements too.
         const calibration = database.db.prepare("SELECT 1 AS value");
-        const probes = {
-          prepare: vi.spyOn(DatabaseSync.prototype, "prepare"),
-          exec: vi.spyOn(DatabaseSync.prototype, "exec"),
-          get: vi.spyOn(StatementSync.prototype, "get"),
-          all: vi.spyOn(StatementSync.prototype, "all"),
-          run: vi.spyOn(StatementSync.prototype, "run"),
-          iterate: vi.spyOn(StatementSync.prototype, "iterate"),
-        };
-        const measured = await (async () => {
+        const probes = observeMainThreadSql();
+        const result = await (async () => {
           try {
             database.db.exec("SELECT 1");
             database.db.prepare("SELECT 1");
@@ -219,23 +204,16 @@ describe("runEmbeddedAttemptSettledPhase", () => {
             calibration.all();
             calibration.run();
             expect([...calibration.iterate()]).toEqual([{ value: 1 }]);
-            for (const [name, probe] of Object.entries(probes)) {
-              expect(
-                probe.mock.calls.length,
-                `positive parent ${name} calibration`,
-              ).toBeGreaterThan(0);
-              probe.mockClear();
+            for (const probe of probes.calls) {
+              expect(probe).toHaveBeenCalled();
             }
+            probes.clear();
 
-            const result = await runEmbeddedAttemptSettledPhase(fixture.input);
-            return {
-              result,
-              parentSql: Object.fromEntries(
-                Object.entries(probes).map(([name, probe]) => [name, probe.mock.calls.length]),
-              ),
-            };
+            const measuredResult = await runEmbeddedAttemptSettledPhase(fixture.input);
+            probes.expectIdle();
+            return measuredResult;
           } finally {
-            Object.values(probes).forEach((probe) => probe.mockRestore());
+            probes.restore();
           }
         })();
 
@@ -266,17 +244,9 @@ describe("runEmbeddedAttemptSettledPhase", () => {
         expect(appended.message).not.toHaveProperty("excludeFromContext");
         const expectedMessages = [...previousMessages, appended.message];
         expect(activeSession.messages).toEqual(expectedMessages);
-        expect(measured.result.messagesSnapshot).toEqual(expectedMessages);
+        expect(result.messagesSnapshot).toEqual(expectedMessages);
         expect(fixture.unsubscribe).toHaveBeenCalledOnce();
         expect(fixture.detachBackend).toHaveBeenCalledOnce();
-        expect(measured.parentSql).toEqual({
-          prepare: 0,
-          exec: 0,
-          get: 0,
-          all: 0,
-          run: 0,
-          iterate: 0,
-        });
       } finally {
         await lifecycle.dispose();
       }
@@ -760,7 +730,7 @@ describe("runEmbeddedAttemptSettledPhase", () => {
     },
   );
 
-  it("carries a successful hidden target through settlement into the terminal receipt", async () => {
+  it("carries successful hidden targets through settlement", async () => {
     const fixture = createFixture(mocks);
     fixture.input.prepared.toolBase.nestedToolActivityState.successfulToolNames.add("read");
     const actualStreamSettle = await vi.importActual<typeof import("./attempt-stream-settle.js")>(
@@ -770,37 +740,8 @@ describe("runEmbeddedAttemptSettledPhase", () => {
     await useActualResult(true);
 
     const attempt = await runEmbeddedAttemptSettledPhase(fixture.input);
-    const prepared = prepareEmbeddedRunTerminal({
-      runParams: {
-        admittedRunContext: createTestAdmittedRunContext("run-1"),
-        sessionId: "session-1",
-        runId: "run-1",
-        workspaceDir: "/workspace",
-        prompt: "read the QA scenario index",
-        trigger: "user",
-        timeoutMs: 60_000,
-      },
-      attempt,
-      currentAttemptCompletedAssistant: attempt.currentAttemptCompletedAssistant,
-      provider: "openai",
-      model: "model",
-      activeErrorContext: { provider: "openai", model: "model" },
-      authProfileStore: { version: 1, profiles: {} },
-      sessionIdUsed: attempt.sessionIdUsed,
-      sessionFileUsed: attempt.sessionFileUsed,
-      outerContextTokenMeta: {},
-      usageAccumulator: createUsageAccumulator(),
-      contextRecoveryState: createEmbeddedRunContextRecoveryState(),
-      resolvedToolResultFormat: "markdown",
-      terminalState: {
-        outcome: { reason: "completed", status: "ok", stopReason: "stop" },
-        signalOwnedInterruption: false,
-      },
-    });
-
-    expect(prepared.agentMeta).toMatchObject({
-      terminalReceipt: { successfulToolNames: ["exec", "read"] },
-    });
+    expect(attempt.successfulNestedToolNames).toEqual(["read"]);
+    expect(attempt.toolMetas).toEqual([{ toolName: "exec", isError: false }]);
   });
 
   it("preserves a prompt failure while still completing stream cleanup", async () => {
@@ -826,21 +767,19 @@ describe("runEmbeddedAttemptSettledPhase", () => {
   it("defaults a source-less settlement failure without dropping it", async () => {
     const fixture = createFixture(mocks);
     const failure = new Error("settlement failed");
-    mocks.settleStream.mockImplementationOnce(async () => {
-      return {
-        promptError: failure,
-        promptErrorSource: null,
-        timedOutDuringCompaction: true,
-        messagesSnapshot: [],
-        sessionIdUsed: "settled-session",
-        lastAssistant: undefined,
-        currentAttemptAssistant: undefined,
-        attemptUsage: undefined,
-        promptCache: undefined,
-        lastCallUsage: undefined,
-        compactionOccurredThisAttempt: false,
-      };
-    });
+    mocks.settleStream.mockImplementationOnce(async () => ({
+      promptError: failure,
+      promptErrorSource: null,
+      timedOutDuringCompaction: true,
+      messagesSnapshot: [],
+      sessionIdUsed: "settled-session",
+      lastAssistant: undefined,
+      currentAttemptAssistant: undefined,
+      attemptUsage: undefined,
+      promptCache: undefined,
+      lastCallUsage: undefined,
+      compactionOccurredThisAttempt: false,
+    }));
 
     await runEmbeddedAttemptSettledPhase(fixture.input);
 

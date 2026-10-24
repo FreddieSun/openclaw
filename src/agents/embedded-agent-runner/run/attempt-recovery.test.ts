@@ -297,7 +297,7 @@ describe("recoverEmbeddedRunAttempt", () => {
     },
   );
 
-  it.each(outputLimitScenarios)(
+  it.each([outputLimitScenario, emptyLengthScenario])(
     "does not bypass the output-limit budget through empty-error retries",
     async (scenario) => {
       const fixture = await recoverAfterTransportDrop({
@@ -314,7 +314,7 @@ describe("recoverEmbeddedRunAttempt", () => {
     },
   );
 
-  it.each(outputLimitScenarios)(
+  it.each([outputLimitScenario, emptyLengthScenario])(
     "allows only one output-limit continuation even after successful model progress",
     async (scenario) => {
       const fixture = await recoverAfterTransportDrop(scenario);
@@ -332,7 +332,7 @@ describe("recoverEmbeddedRunAttempt", () => {
     },
   );
 
-  it.each(outputLimitScenarios)(
+  it.each([outputLimitScenario, emptyLengthScenario])(
     "continues slow output generation without consuming the transient outage window",
     async (scenario) => {
       const startedAt = Date.now();
