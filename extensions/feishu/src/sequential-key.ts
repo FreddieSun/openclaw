@@ -2,6 +2,7 @@ import {
   isAbortRequestText,
   isBtwRequestText,
 } from "openclaw/plugin-sdk/command-primitives-runtime";
+import { normalizeFeishuCommandProbeBody } from "./bot-content.js";
 import { parseFeishuMessageEvent, type FeishuMessageEvent } from "./bot.js";
 
 export function getFeishuSequentialKey(params: {
@@ -13,7 +14,9 @@ export function getFeishuSequentialKey(params: {
   const { accountId, event, botOpenId, preparedContent } = params;
   const chatId = event.message.chat_id?.trim() || "unknown";
   const baseKey = `feishu:${accountId}:${chatId}`;
-  const text = (preparedContent ?? parseFeishuMessageEvent(event, botOpenId).content).trim();
+  const text = normalizeFeishuCommandProbeBody(
+    preparedContent ?? parseFeishuMessageEvent(event, botOpenId).content,
+  );
 
   if (isAbortRequestText(text)) {
     return `${baseKey}:control`;

@@ -9,17 +9,23 @@ import {
 } from "openclaw/plugin-sdk/channel-ingress-test-runtime";
 import { DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS } from "openclaw/plugin-sdk/channel-outbound";
 import { createTestInboundDebounceFlush } from "openclaw/plugin-sdk/channel-test-helpers";
+import { isControlCommandMessage } from "openclaw/plugin-sdk/command-detection";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import { createNonExitingRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
+import {
+  createNonExitingRuntimeEnv,
+  createPluginRuntimeMock,
+} from "openclaw/plugin-sdk/plugin-test-runtime";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginRuntime, RuntimeEnv } from "../runtime-api.js";
+import { parseFeishuMessageEvent } from "./bot.js";
 import { createFeishuTestEvent } from "./bot.test-support.js";
 import * as dedup from "./dedup.js";
 import { resolveFeishuMessageDedupeKey } from "./dedupe-key.js";
 import type { FeishuMessageEvent } from "./event-types.js";
 import { createFeishuDurableIngress, type FeishuIngressLifecycle } from "./feishu-ingress.js";
 import { createFeishuMessageReceiveHandler } from "./monitor.message-handler.js";
+import { getFeishuSequentialKey } from "./sequential-key.js";
 
 type MessageReceiveHandlerContext = Parameters<typeof createFeishuMessageReceiveHandler>[0];
 type HandleMessageParams = Parameters<MessageReceiveHandlerContext["handleMessage"]>[0];
@@ -231,6 +237,66 @@ it("keeps same-id media variants distinct at receive time", async () => {
   expect(
     harness.handleMessage.mock.calls.map(([call]) => typeof call.processingClaim?.commit),
   ).toEqual(["function", "function"]);
+});
+
+it("admits mention-prefixed stop and btw without batching behind an active turn", async () => {
+  vi.useFakeTimers();
+  const active = createDeferred<void>();
+  const completed: string[] = [];
+  const pending: Promise<unknown>[] = [];
+  vi.spyOn(dedup, "claimUnprocessedFeishuMessage").mockImplementation(async () => ({
+    kind: "claimed",
+    handle: createClaim("mention-controls"),
+  }));
+  const handler = createFeishuMessageReceiveHandler({
+    cfg: {},
+    channelRuntime: createPluginRuntimeMock({
+      channel: {
+        commands: { isControlCommandMessage },
+        debounce: { resolveInboundDebounceMs: () => 1000, createInboundDebouncer },
+      },
+    }).channel,
+    accountId: "mention-controls",
+    runtime: createNonExitingRuntimeEnv(),
+    chatHistories: new Map(),
+    getBotOpenId: () => "ou-bot",
+    resolveSequentialKey: getFeishuSequentialKey,
+    resolveDebounceText: ({ event, botOpenId }) =>
+      parseFeishuMessageEvent(event, botOpenId).content,
+    hasProcessedMessage: async () => false,
+    handleMessage: async ({ event, turnAdoptionLifecycle }) => {
+      await turnAdoptionLifecycle?.onAdopted();
+      if (event.message.message_id === "om-active") {
+        await active.promise;
+      }
+      completed.push(event.message.message_id);
+    },
+  });
+  try {
+    pending.push(handler(createTextEvent("evt-active", "om-active", "ordinary turn")));
+    await vi.advanceTimersByTimeAsync(1000);
+    for (const [index, text] of ["@_bot/stop", "@_bot /btw progress?"].entries()) {
+      const event = createTextEvent(`evt-control-${index}`, `om-control-${index}`, text);
+      event.message.mentions = [{ key: "@_bot", id: { open_id: "ou-bot" }, name: "Bot" }];
+      pending.push(handler(event));
+    }
+    await vi.advanceTimersByTimeAsync(0);
+    expect(completed).toEqual(expect.arrayContaining(["om-control-0", "om-control-1"]));
+    expect(completed).not.toContain("om-active");
+    pending.push(handler(createTextEvent("evt-queued", "om-queued", "next ordinary turn")));
+    active.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.all(pending);
+    expect(completed.filter((id) => ["om-active", "om-queued"].includes(id))).toEqual([
+      "om-active",
+      "om-queued",
+    ]);
+  } finally {
+    active.resolve();
+    await vi.advanceTimersByTimeAsync(1000);
+    await Promise.all(pending);
+    vi.useRealTimers();
+  }
 });
 
 describe("Feishu durable ingress debounce lifecycle", () => {

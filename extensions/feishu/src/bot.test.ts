@@ -27,6 +27,11 @@ import {
   createFeishuTestConfig,
   createFeishuTestEvent,
   createFeishuTestRoute,
+  replyDispatcher,
+  senderClient,
+  historyMessage,
+  fetchedMessage,
+  mergeForwardItem,
   sentMessage,
   withFeishuRuntimeDefaults,
 } from "./bot.test-support.js";
@@ -65,19 +70,6 @@ function unboundRoute({
   route: NonNullable<ConfiguredBindingRoute>["route"];
 }): ConfiguredBindingRoute {
   return { bindingResolution: null, route };
-}
-
-function replyDispatcher(ensureNoVisibleReplyFallback = vi.fn()) {
-  return {
-    dispatcherOptions: {},
-    delivery: { deliver: vi.fn(async () => undefined) },
-    replyOptions: {},
-    ensureNoVisibleReplyFallback,
-  };
-}
-
-function senderClient(get = vi.fn().mockResolvedValue({ data: { user: { name: "Sender" } } })) {
-  return { contact: { user: { get } } };
 }
 
 function savedMedia(id: string, contentType: string, size: number, path = `/tmp/${id}`) {
@@ -368,32 +360,6 @@ function rejectSenderPermission(msg: string) {
     senderClient(vi.fn().mockRejectedValue({ response: { data: { code: 99991672, msg } } })),
   );
 }
-function historyMessage(senderId: string, content: string, offset = 0, senderType = "user") {
-  return { senderId, senderType, content, createTime: 1710000000000 + offset * 1000 };
-}
-
-function fetchedMessage(
-  messageId: string,
-  content: string,
-  fields: Partial<NonNullable<Awaited<ReturnType<typeof getMessage>>>> = {},
-) {
-  return { messageId, chatId: "oc-group", content, contentType: "text", ...fields };
-}
-
-function mergeForwardItem(
-  text: string,
-  fields: Partial<Parameters<typeof parseMergeForwardContent>[0][number]> & {
-    message_id?: string;
-  } = {},
-) {
-  return {
-    msg_type: "text",
-    upper_message_id: "container",
-    body: { content: JSON.stringify({ text }) },
-    ...fields,
-  };
-}
-
 function expectDispatcher(options: Partial<Parameters<typeof createReplyDispatcher>[0]>) {
   expect(createReplyDispatcher).toHaveBeenCalledWith(expect.objectContaining(options));
 }
@@ -803,15 +769,37 @@ describe("handleFeishuMessage command authorization", () => {
     expect(sendMessage.mock.calls[0]![0].to).toBe("chat:oc_dm_chat_1");
   });
 
+  it.each(["/status", "/btw progress?"])(
+    "keeps DM %s separate from agent mention context",
+    async (command) => {
+      computeCommandAccess.mockReturnValue(true);
+      await receiveConfigured(
+        {
+          messageId: `msg-dm-mention-${command}`,
+          text: `@_bot ${command}`,
+          message: { mentions: [{ key: "@_bot", id: { open_id: "ou-bot" }, name: "Bot" }] },
+        },
+        createFeishuTestConfig({ dmPolicy: "open", allowFrom: ["*"] }),
+        { botOpenId: "ou-bot" },
+      );
+      const context = inboundContext();
+      expect(context).toMatchObject({
+        RawBody: `<at user_id="ou-bot">Bot</at> ${command}`,
+        CommandBody: command,
+        BodyForCommands: command,
+      });
+      expect(context.BodyForAgent).toContain(`<at user_id="ou-bot">Bot</at> ${command}`);
+      expect(dispatchReply).toHaveBeenCalledOnce();
+    },
+  );
+
   it.each([
     ["ou-attacker", false],
     ["ou-admin", true],
   ] as const)("computes group command authorization for %s", async (senderOpenId, authorized) => {
     const allowFrom = authorized ? [senderOpenId] : undefined;
-    const mentions = authorized
-      ? undefined
-      : [{ key: "@_user_1", id: { open_id: "ou-bot" }, name: "Bot" }];
-    const text = authorized ? "/status" : "@_user_1/status";
+    const mentions = [{ key: "@_user_1", id: { open_id: "ou-bot" }, name: "Bot" }];
+    const text = "@_user_1/status";
     computeCommandAccess.mockReturnValue(true);
     await receiveGroup(
       {
@@ -828,6 +816,9 @@ describe("handleFeishuMessage command authorization", () => {
     expect(computeCommandAccess).toHaveBeenCalledWith("/status", currentRuntimeConfig);
     expect(context).toMatchObject({
       ChatType: "group",
+      RawBody: '<at user_id="ou-bot">Bot</at>/status',
+      CommandBody: "/status",
+      BodyForCommands: "/status",
       CommandAuthorized: authorized,
       SenderId: senderOpenId,
       GroupRequireMention: false,
@@ -837,6 +828,7 @@ describe("handleFeishuMessage command authorization", () => {
       OriginatingTo: "chat:oc-group",
       NativeChannelId: "oc-group",
     });
+    expect(context.BodyForAgent).toContain('<at user_id="ou-bot">Bot</at>/status');
     expect(resolveGroupSessionKey(context as never)).toMatchObject({
       channel: "feishu",
       id: "oc-group",
@@ -916,6 +908,7 @@ describe("handleFeishuMessage command authorization", () => {
     });
     const inbound = inboundContext();
     expect(inbound.CommandBody).toBe("/status");
+    expect(inbound.BodyForAgent).toContain('<at user_id="ou-openclaw">OpenClaw</at>');
     expect(inbound.BodyForAgent).not.toContain("ou-other-app-openclaw");
     expect(inbound.BodyForAgent).not.toContain("ou-alice");
     expect(verifiedMessageLookup).toHaveBeenCalledTimes(3);

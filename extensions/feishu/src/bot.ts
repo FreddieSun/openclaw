@@ -111,14 +111,13 @@ export function parseFeishuMessageEvent(
 ): FeishuMessageContext {
   const mentionedBot = checkBotMentioned(event, botOpenId);
   const hasAnyMention = (event.message.mentions?.length ?? 0) > 0;
-  // Strip bot addressing for commands (#35994); debounced content already expanded
-  // each message's own keys, so never reinterpret placeholder-like display names.
+  // Keep mention identities for the agent. Debounced content already expanded each
+  // message's own keys, so never reinterpret placeholder-like display names.
   const content =
     preparedContent ??
     normalizeMentions(
       parseMessageContent(event.message.content, event.message.message_type),
       event.message.mentions,
-      botOpenId,
     );
   const senderOpenId = event.sender.sender_id.open_id?.trim();
   const senderUserId = event.sender.sender_id.user_id?.trim();
@@ -292,7 +291,9 @@ export async function handleFeishuMessage(params: {
     // bot was addressed. Re-read mismatched mentions with this app's token because open_ids are
     // app-scoped (#40768); names are not stable recipient identities.
     if (isGroup && !ctx.mentionedBot) {
-      let verifiedEvent: FeishuMessageEvent | undefined;
+      let verifiedBotMention:
+        | NonNullable<FeishuMessageEvent["message"]["mentions"]>[number]
+        | undefined;
       try {
         const response = (await createFeishuClient(account).im.message.get({
           params: { user_id_type: "open_id" },
@@ -317,16 +318,9 @@ export async function handleFeishuMessage(params: {
             (mention) => mention.key === verifiedKey && !isFeishuBroadcastMention(mention),
           );
           if (eventMention) {
-            verifiedEvent = {
-              ...event,
-              message: {
-                ...event.message,
-                mentions: event.message.mentions?.map((mention) =>
-                  mention === eventMention
-                    ? { ...mention, id: { ...mention.id, open_id: localBotOpenId } }
-                    : mention,
-                ),
-              },
+            verifiedBotMention = {
+              ...eventMention,
+              id: { ...eventMention.id, open_id: localBotOpenId },
             };
           }
         }
@@ -335,17 +329,18 @@ export async function handleFeishuMessage(params: {
           `feishu[${account.accountId}]: failed to verify bot mention for ${ctx.messageId}: ${String(err)}`,
         );
       }
-      if (!verifiedEvent) {
+      if (!verifiedBotMention) {
         log(
           `feishu[${account.accountId}]: dropping bot message ${ctx.messageId} (local mention not verifiable)`,
         );
         return;
       }
-      const deliveredCtx = parseFeishuMessageEvent(verifiedEvent, localBotOpenId, preparedContent);
       ctx = {
-        ...deliveredCtx,
+        ...ctx,
         mentionedBot: true,
-        content: normalizeFeishuCommandProbeBody(deliveredCtx.content),
+        // Only this receiving bot's identity was verified with the local app.
+        content:
+          `${normalizeMentions(verifiedBotMention.key, [verifiedBotMention])} ${normalizeFeishuCommandProbeBody(ctx.content)}`.trim(),
         // App-scoped IDs cannot safely identify additional recipients here.
         mentionTargets: undefined,
       };
@@ -611,7 +606,7 @@ export async function handleFeishuMessage(params: {
       channel: "feishu",
       accountId: account.accountId,
     });
-    const commandProbeBody = isGroup ? normalizeFeishuCommandProbeBody(ctx.content) : ctx.content;
+    const commandProbeBody = normalizeFeishuCommandProbeBody(ctx.content);
     const shouldComputeCommandAuthorized = core.channel.commands.shouldComputeCommandAuthorized(
       commandProbeBody,
       cfg,
@@ -977,9 +972,7 @@ export async function handleFeishuMessage(params: {
     const effectiveCommandProbeBody =
       audioTranscript === undefined
         ? commandProbeBody
-        : isGroup
-          ? normalizeFeishuCommandProbeBody(audioTranscript)
-          : audioTranscript;
+        : normalizeFeishuCommandProbeBody(audioTranscript);
     const shouldComputeEffectiveCommandAuthorized =
       audioTranscript === undefined
         ? effectiveShouldComputeCommandAuthorized
@@ -1291,7 +1284,7 @@ export async function handleFeishuMessage(params: {
           bodyForAgent: messageBody,
           inboundHistory,
           rawBody: commandFacingContent,
-          commandBody: commandFacingContent,
+          commandBody: effectiveCommandProbeBody,
         },
         sessionTranscript: { historyLimit: isGroup ? historyLimit : 0 },
         access: {

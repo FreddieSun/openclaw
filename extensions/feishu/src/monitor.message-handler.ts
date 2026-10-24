@@ -1,6 +1,7 @@
 import { createRuntimeConfigReader } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { isRecord, readStringValue as readString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ClawdbotConfig, HistoryEntry, PluginRuntime, RuntimeEnv } from "../runtime-api.js";
+import { normalizeFeishuCommandProbeBody } from "./bot-content.js";
 import type { handleFeishuMessage } from "./bot.js";
 import {
   claimUnprocessedFeishuMessage,
@@ -239,8 +240,10 @@ export function createFeishuMessageReceiveHandler({
         if (event.message.message_type !== "text") {
           return false;
         }
-        const text = resolveDebounceText(event);
-        return Boolean(text) && !channelRuntime.commands.isControlCommandMessage(text, cfg);
+        const text = normalizeFeishuCommandProbeBody(resolveDebounceText(event));
+        return (
+          Boolean(text) && !channelRuntime.commands.isControlCommandMessage(text, readConfig())
+        );
       },
       onFlush: (entries, createFlush) => {
         const activeEntries = entries.filter((entry) => !entry.abandoned);
