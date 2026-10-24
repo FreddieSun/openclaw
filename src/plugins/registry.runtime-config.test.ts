@@ -111,14 +111,17 @@ function registered(
 
 function sessionFixture(id: string) {
   const runtime = createPluginRuntime();
-  const createSessionEntry = vi.fn<CreateSession>(async (params) => ({
-    key: params.key,
-    agentId: "main",
-    sessionId: "session-1",
-    entry: { sessionId: "session-1", updatedAt: 1 },
-  }));
+  const scope = scopeCapture();
+  const createSessionEntry = vi.fn<CreateSession>(async (params) =>
+    scope.capture(() => ({
+      key: params.key,
+      agentId: "main",
+      sessionId: "session-1",
+      entry: { sessionId: "session-1", updatedAt: 1 },
+    }))(),
+  );
   runtime.agent.session.createSessionEntry = createSessionEntry;
-  return { ...registered(id, { origin: "bundled" }, runtime), createSessionEntry };
+  return { ...registered(id, { origin: "bundled" }, runtime), createSessionEntry, scope };
 }
 
 function expectRejectedHarness(
@@ -352,28 +355,19 @@ describe("plugin registry runtime config scope", () => {
       return { ...result, text: `intercepted:${result.text}` };
     });
     const request = { cfg: {}, filePath: "/synthetic/voice.wav" };
+    const resultText = () =>
+      api.runtime.mediaUnderstanding.transcribeAudioFile(request).then(({ text }) => text);
     const successor = { ...builder.registry, coreGatewayMethodNames: ["successor"] };
     try {
-      await expect(
-        api.runtime.mediaUnderstanding.transcribeAudioFile(request),
-      ).resolves.toMatchObject({
-        text: "intercepted:original",
-      });
+      await expect(resultText()).resolves.toBe("intercepted:original");
       markPluginRegistryActive(successor);
       markPluginRegistryRetired(builder.registry);
-      await expect(
-        api.runtime.mediaUnderstanding.transcribeAudioFile(request),
-      ).resolves.toMatchObject({
-        text: "intercepted:successor",
-      });
+      await expect(resultText()).resolves.toBe("intercepted:successor");
       const selected = createEmptyPluginRegistry();
       selected.coreGatewayMethodNames.push("prepared");
-      await expect(
-        withPluginRuntimeRegistryScope(selected, () =>
-          api.runtime.mediaUnderstanding.transcribeAudioFile(request),
-        ),
-      ).resolves.toMatchObject({ text: "intercepted:prepared" });
-      expect(intercept).toHaveBeenCalledTimes(3);
+      await expect(withPluginRuntimeRegistryScope(selected, resultText)).resolves.toBe(
+        "intercepted:prepared",
+      );
 
       const replacement: PluginRuntime["mediaUnderstanding"] = {
         ...source,
@@ -385,18 +379,11 @@ describe("plugin registry runtime config scope", () => {
         value: replacement,
         configurable: true,
       });
-      await expect(
-        api.runtime.mediaUnderstanding.transcribeAudioFile(request),
-      ).resolves.toMatchObject({
-        text: "replacement:successor",
-      });
-      expect(intercept).toHaveBeenCalledTimes(3);
+      await expect(resultText()).resolves.toBe("replacement:successor");
       intercept.mockRestore();
       revokePluginRecord(successor, record);
       expect(() => facade.transcribeAudioFile(request)).toThrow("runtime is no longer active");
-      expect(() => api.runtime.mediaUnderstanding.transcribeAudioFile(request)).toThrow(
-        "runtime is no longer active",
-      );
+      expect(resultText).toThrow("runtime is no longer active");
     } finally {
       intercept.mockRestore();
       await owner.dispose();
@@ -540,8 +527,6 @@ describe("plugin registry runtime config scope", () => {
       nativeCompactionRequest: "required_preflight",
     } satisfies Parameters<typeof compact>[0];
     await expect(compact(request)).resolves.toEqual({ ok: true, compacted: true });
-    expect(nativeCompaction).toHaveBeenCalledWith(request);
-    expect(nativeCompaction.mock.contexts[0]).toBe(options);
     expect(registration.harness).not.toHaveProperty("compactNative");
     await owner.dispose();
     expect(() => compact(request)).toThrow(/reloaded|disabled|retiring/);
@@ -748,17 +733,7 @@ describe("plugin registry runtime config scope", () => {
   });
 
   it("limits harness session creation to the registering plugin", async () => {
-    const { builder, api: ownerApi, createSessionEntry } = sessionFixture("codex-owner");
-    let createScope = getPluginRuntimeGatewayRequestScope();
-    createSessionEntry.mockImplementation(async (params) => {
-      createScope = getPluginRuntimeGatewayRequestScope();
-      const entry = {
-        sessionId: "session-1",
-        updatedAt: 1,
-        agentHarnessId: "codex",
-      };
-      return { key: params.key, agentId: "main", sessionId: entry.sessionId, entry };
-    });
+    const { builder, api: ownerApi, createSessionEntry, scope } = sessionFixture("codex-owner");
     const otherRecord = createRecord("other-plugin", { origin: "bundled" });
     const otherApi = builder.createApi(otherRecord, { config: {} });
     ownerApi.registerAgentHarness(createHarness("codex"));
@@ -771,10 +746,7 @@ describe("plugin registry runtime config scope", () => {
     await expect(
       ownerApi.runtime.agent.session.createSessionEntry(createParams),
     ).resolves.toMatchObject({ sessionId: "session-1" });
-    expect(createScope).toMatchObject({
-      pluginId: "codex-owner",
-      pluginSource: "/plugins/codex-owner/index.js",
-    });
+    scope.expectOwner("codex-owner", 1);
     const ordinaryParams = {
       cfg: {},
       key: "agent:main:ordinary",

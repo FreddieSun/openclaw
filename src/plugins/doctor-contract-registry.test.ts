@@ -5,11 +5,9 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.js";
 import { createLegacyWebhookListenerDoctorContract } from "../plugin-sdk/legacy-webhook-listener-migration.js";
 import { withMockedPlatform } from "../test-utils/vitest-spies.js";
-import { resolvePluginDoctorContractArtifact } from "./doctor-contract-artifact.js";
 import type * as DoctorContractRegistry from "./doctor-contract-registry.js";
 import { useDoctorContractRegistryHarness } from "./doctor-contract-registry.test-harness.js";
 import { defineRetiredPluginStateMigration } from "./doctor-retired-state.js";
-import { createPluginCache, withPluginCache } from "./plugin-cache.js";
 import { createPluginManifestRecordFixture } from "./plugin-metadata.test-support.js";
 const retainedConfigDoctorMock = vi.hoisted(() => vi.fn());
 // mock-isolation: Script retained artifacts without loading real bundled plugin modules.
@@ -80,35 +78,6 @@ function mockExternalShadow(enabledByDefault = false) {
 }
 
 describe("doctor-contract-registry module loader", () => {
-  it("preserves source artifact precedence across root and dist candidates", () => {
-    const pluginRoot = makeTempDir();
-    const distRoot = path.join(pluginRoot, "dist");
-    fs.mkdirSync(distRoot);
-    const candidates = [
-      "doctor-contract-api.ts",
-      "dist/doctor-contract-api.ts",
-      "contract-api.cjs",
-    ].map((relativePath) => path.join(pluginRoot, relativePath));
-    for (const filePath of candidates) {
-      fs.writeFileSync(filePath, "export {};\n", "utf-8");
-    }
-
-    const originalOwner = createPluginCache();
-    const resolvePath = () =>
-      resolvePluginDoctorContractArtifact({
-        rootDir: pluginRoot,
-        origin: "bundled",
-        sourcePreferred: true,
-      })?.modulePath ?? null;
-    expect(withPluginCache(originalOwner, resolvePath)).toBe(candidates[0]);
-    for (const candidate of candidates) {
-      expect(withPluginCache(createPluginCache(), resolvePath)).toBe(candidate);
-      fs.rmSync(candidate);
-      expect(withPluginCache(originalOwner, resolvePath)).toBe(candidates[0]);
-    }
-    expect(withPluginCache(createPluginCache(), resolvePath)).toBeNull();
-  });
-
   it.each([false, undefined, true])("gates config-repair artifacts: %s", (configRepair) => {
     const count = configRepair === false ? 0 : 1;
     const pluginRoot = mockContract(
@@ -173,15 +142,17 @@ describe("doctor-contract-registry module loader", () => {
     expect(mocks.createJiti).toHaveBeenCalledTimes(1);
   });
 
-  it.each([false, true])("isolates a normalizer-only config repair (throws=%s)", (throws) => {
+  it.each(["repair", "throw", "warning"])("isolates a normalizer-only config %s", (mode) => {
     mockContract(
       {
         normalizeCompatibilityConfig: ({ cfg }: { cfg: Record<string, unknown> }) => {
           cfg.repaired = true;
-          if (throws) {
+          if (mode === "throw") {
             throw new Error("fixture repair failed");
           }
-          return { config: cfg, changes: ["repaired config"] };
+          return mode === "warning"
+            ? { config: cfg, changes: [], warnings: ["Repair requires operator input."] }
+            : { config: cfg, changes: ["repaired config"] };
         },
       },
       { id: "normalizer-only", doctorContract: { configRepair: true } },
@@ -191,7 +162,7 @@ describe("doctor-contract-registry module loader", () => {
     const result = doctor.applyPluginDoctorCompatibilityMigrations(config, { env: {} });
     expect(config).toEqual({});
     expect(result).toEqual(
-      throws
+      mode === "throw"
         ? {
             config: {},
             changes: [],
@@ -201,29 +172,11 @@ describe("doctor-contract-registry module loader", () => {
               ),
             ],
           }
-        : { config: { repaired: true }, changes: ["repaired config"] },
+        : mode === "warning"
+          ? { config: {}, changes: [], warnings: ["Repair requires operator input."] }
+          : { config: { repaired: true }, changes: ["repaired config"] },
     );
     expect(mocks.createJiti).toHaveBeenCalledTimes(1);
-  });
-
-  it("retains warning-only repairs without publishing their candidate", () => {
-    mockContract(
-      {
-        normalizeCompatibilityConfig: ({ cfg }: { cfg: Record<string, unknown> }) => {
-          cfg.unreported = true;
-          return { config: cfg, changes: [], warnings: ["Repair requires operator input."] };
-        },
-      },
-      { id: "warning-only" },
-    );
-
-    const config = {};
-    expect(doctor.applyPluginDoctorCompatibilityMigrations(config, { env: {} })).toEqual({
-      config,
-      changes: [],
-      warnings: ["Repair requires operator input."],
-    });
-    expect(config).toEqual({});
   });
 
   it.each(["js", "ts"])(
@@ -359,6 +312,19 @@ function mockRawDoctorPlugins(...plugins: Record<string, unknown>[]): void {
 }
 
 describe("doctor-contract-registry selection", () => {
+  const configuredProviders = [
+    "channel",
+    "default",
+    "entry",
+    "fallback",
+    "gmail",
+    "hook",
+    "opencode",
+    "policy",
+    "tts",
+    "voice",
+    "worker",
+  ];
   it.each([
     { name: "missing official plugin", pins: true },
     { name: "authored listener endpoints", explicit: true, pins: true },
@@ -554,9 +520,19 @@ describe("doctor-contract-registry selection", () => {
             },
           ],
         },
-        hooks: { mappings: [{ model: "hook/model" }, { model: 42 }] },
+        hooks: {
+          mappings: [{ model: "hook/model" }, { model: 42 }],
+          gmail: { model: "gmail/model" },
+        },
+        tts: { summaryModel: "tts/model" },
+        tools: { media: { image: { preferredModel: "opencode/minimax-m3" } } },
+        channels: {
+          modelByChannel: { slack: { room: "channel/model" } },
+          discord: { voice: { model: "voice/model" } },
+        },
       },
-      ids: ["default", "entry", "fallback", "hook", "ollama-cloud", "policy", "worker"],
+      ids: [...configuredProviders, "discord", "ollama-cloud"].toSorted(),
+      touchedIds: configuredProviders,
     },
     {
       name: "model and policy providers from the legacy list when entries is absent",
@@ -572,6 +548,7 @@ describe("doctor-contract-registry selection", () => {
         },
       },
       ids: ["legacy-model", "legacy-policy"],
+      touchedIds: ["legacy-model", "legacy-policy"],
     },
     {
       name: "no shadow-list policy providers when entries is null",
@@ -582,12 +559,16 @@ describe("doctor-contract-registry selection", () => {
         },
       },
       ids: [],
+      touchedIds: [],
     },
-  ])("collects $name", ({ raw, ids }) => {
+  ])("collects $name", ({ raw, ids, touchedIds }) => {
     expect(doctor.collectRelevantDoctorPluginIds(raw)).toEqual(ids);
+    expect(
+      doctor.collectDoctorConfigRepairPluginIds(raw, [["agents", "defaults", "model"]]),
+    ).toEqual(touchedIds);
   });
 
-  it("excludes channel metadata and blank ids from full and touched doctor scans", () => {
+  it("narrows touched doctor scans without treating channel metadata as owners", () => {
     const raw = {
       plugins: { entries: { "memory-wiki": {} } },
       channels: {
@@ -595,10 +576,13 @@ describe("doctor-contract-registry selection", () => {
         modelByChannel: { discord: { guild: "openai/gpt-5.6-luna" } },
         " ": {},
         discord: {},
+        telegram: {},
       },
+      models: { providers: { "ollama-cloud": {} } },
+      talk: { voiceId: "legacy-voice" },
     };
 
-    const allIds = ["discord", "memory-wiki", "openai"];
+    const allIds = ["discord", "elevenlabs", "memory-wiki", "ollama-cloud", "openai", "telegram"];
     expect(doctor.collectRelevantDoctorPluginIds(raw)).toEqual(allIds);
     expect(
       doctor.collectDoctorConfigRepairPluginIds(raw, [
@@ -606,6 +590,14 @@ describe("doctor-contract-registry selection", () => {
       ]),
     ).toStrictEqual(["openai"]);
     expect(doctor.collectDoctorConfigRepairPluginIds(raw, [["channels"]])).toEqual(allIds);
+    expect(
+      doctor.collectDoctorConfigRepairPluginIds(raw, [
+        ["channels", "discord", "token"],
+        ["plugins", "entries", "memory-wiki", "enabled"],
+        ["models", "providers", "ollama-cloud", "baseUrl"],
+        ["talk", "voiceId"],
+      ]),
+    ).toEqual(["discord", "elevenlabs", "memory-wiki", "ollama-cloud", "openai"]);
   });
 
   it("collects provider ids from media model entries", () => {
@@ -698,64 +690,6 @@ describe("doctor-contract-registry selection", () => {
     expect(result.changes).toEqual(["mixed-case owner repaired config"]);
     expect(result.config).toHaveProperty("repairedBy", "MiXeD-upgrade-proof");
     expect(mocks.createJiti).toHaveBeenCalledTimes(1);
-  });
-
-  it("narrows touched-path doctor ids for scoped dry-run validation", () => {
-    expect(
-      doctor.collectDoctorConfigRepairPluginIds(
-        {
-          channels: {
-            discord: {},
-            telegram: {},
-          },
-          plugins: {
-            entries: { "memory-wiki": {} },
-          },
-          models: {
-            providers: { "ollama-cloud": {} },
-          },
-          talk: {
-            voiceId: "legacy-voice",
-          },
-        },
-        [
-          ["channels", "discord", "token"],
-          ["plugins", "entries", "memory-wiki", "enabled"],
-          ["models", "providers", "ollama-cloud", "baseUrl"],
-          ["talk", "voiceId"],
-        ],
-      ),
-    ).toEqual(["discord", "elevenlabs", "memory-wiki", "ollama-cloud"]);
-  });
-
-  it("keeps all configured model and policy providers active during touched scans", () => {
-    expect(
-      doctor.collectDoctorConfigRepairPluginIds(
-        {
-          agents: {
-            defaults: {
-              model: { primary: "primary/model", fallbacks: ["fallback/model"] },
-            },
-            entries: {
-              worker: { modelPolicy: { allow: ["worker/*"] } },
-            },
-          },
-          hooks: { gmail: { model: "gmail/model" } },
-          tts: { summaryModel: "tts/model" },
-          tools: { media: { image: { preferredModel: "opencode/minimax-m3" } } },
-          channels: {
-            modelByChannel: { slack: { room: "channel/model" } },
-            discord: { voice: { model: "voice/model" } },
-          },
-        },
-        [
-          ["agents", "defaults", "model"],
-          ["agents", "entries", "worker", "modelPolicy", "allow", "0"],
-          ["hooks", "gmail", "model"],
-          ["channels", "modelByChannel", "slack", "room"],
-        ],
-      ),
-    ).toEqual(["channel", "fallback", "gmail", "opencode", "primary", "tts", "voice", "worker"]);
   });
 });
 

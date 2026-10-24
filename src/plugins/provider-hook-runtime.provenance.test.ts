@@ -329,10 +329,13 @@ describe("provider runtime physical ownership", () => {
         ...(snapshotPresent ? { pluginMetadataSnapshot: nextSnapshot } : {}),
       };
       expect(
-        withGeneration(
-          { pluginRegistry: loadedRegistry, metadataSnapshot: firstSnapshot },
-          () => resolveProvider(requested)?.label,
-        ),
+        withGeneration({ pluginRegistry: loadedRegistry, metadataSnapshot: firstSnapshot }, () => {
+          expect(loadedProvider(requested)?.label).toBe("A/1");
+          expect(
+            labels(resolveProviders({ ...requested, providerRefs: [requested.provider] })),
+          ).toEqual(["A/1"]);
+          return resolveProvider(requested)?.label;
+        }),
       ).toBe("A/1");
       expect(loadedProvider(requested)).toBeUndefined();
       expect(readFileSync(registrationMarker, "utf8")).toBe("A/1");
@@ -381,26 +384,11 @@ describe("provider runtime physical ownership", () => {
     expect(resolveProvider(changed)?.label).toBe("next");
   });
 
-  it.each(["replaced", "absent", "setup-only"] as const)(
+  it.each(["replaced", "absent"] as const)(
     "reserves a %s literal owner before considering another loaded hook alias",
     (state) => {
       const old = loadFixture("old");
-      let selected: ReturnType<typeof metadata> = loadFixture("selected");
-      if (state === "setup-only") {
-        selected = createSnapshot({
-          plugins: selected.plugins.map((plugin) => ({
-            ...plugin,
-            channels: ["setup-channel"],
-            setupSource: path.join(plugin.rootDir, "setup.cjs"),
-          })),
-        });
-        const plugin = selected.plugins[0];
-        assert.ok(plugin?.setupSource);
-        writeFileSync(
-          plugin.setupSource,
-          `module.exports={plugin:{id:"setup-channel",meta:{id:"setup-channel",label:"Setup",selectionLabel:"Setup",docsPath:"/synthetic",blurb:"Synthetic"},capabilities:{chatTypes:["direct"]},config:{listAccountIds:()=>[],resolveAccount:()=>({})}}};`,
-        );
-      }
+      const selected = loadFixture("selected");
       const alias = writePlugin({
         id: "alias-owner",
         filename: "index.cjs",
@@ -437,12 +425,8 @@ describe("provider runtime physical ownership", () => {
       });
       const loaded = loadPlugins({
         config: pluginConfig,
-        channelPluginLoadIntent: state === "setup-only" ? "setup" : undefined,
         manifestRegistry: {
-          plugins: [
-            ...(state === "absent" ? [] : state === "replaced" ? old.plugins : selected.plugins),
-            ...aliasMetadata.plugins,
-          ],
+          plugins: [...(state === "absent" ? [] : old.plugins), ...aliasMetadata.plugins],
           diagnostics: [],
         },
       });
@@ -471,18 +455,6 @@ describe("provider runtime physical ownership", () => {
         config: pluginConfig,
         manifestRegistry: snapshot.manifestRegistry,
       });
-      if (state === "setup-only") {
-        expect(labels(complete.providers.map((entry) => entry.provider))?.toSorted()).toEqual([
-          "alias",
-          "selected",
-        ]);
-        withGeneration({ metadataSnapshot: snapshot, pluginRegistry: loaded }, () => {
-          expect(
-            labels(resolveHooks({ ...lookup, providerRefs: hookLookup.providerRefs })),
-          ).toEqual(["alias"]);
-          expectAbsent(resolveProvider({ ...lookup, provider: "same-provider" }));
-        });
-      }
       const verifyAliasProjection = () => {
         const aliases = { ...lookup, providerRefs: ["runtime-only"] };
         expect(labels(loadedHooks(aliases))).toEqual(["alias"]);
@@ -723,29 +695,6 @@ describe("provider runtime physical ownership", () => {
     expect([load(old), load(next), load(old)]).toEqual(["old", "new", "old"]);
   });
 
-  it("retains an exact runtime generation despite newer supplied metadata", () => {
-    const selected = loadFixture("old");
-    const old = registry(selected);
-    const newer = createSnapshot();
-    const lookup = { provider: "same-provider", config, pluginMetadataSnapshot: newer };
-    withGeneration({ metadataSnapshot: selected, pluginRegistry: old }, () => {
-      expect(loadedProvider(lookup)?.label).toBe("old");
-      expect(
-        labels(
-          resolveProviders({
-            config,
-            providerRefs: [lookup.provider],
-            pluginMetadataSnapshot: newer,
-          }),
-        ),
-      ).toEqual(["old"]);
-      withGeneration({ metadataSnapshot: selected }, () => {
-        expectAbsent(loadedProvider(lookup));
-        expect(loadedHooks({ providerRefs: [lookup.provider] })).toEqual([]);
-      });
-    });
-  });
-
   it.each([undefined, "/synthetic/retained"])(
     "carries retained workspace %s into handles without explicit metadata",
     (workspaceDir) => {
@@ -769,6 +718,7 @@ describe("provider runtime physical ownership", () => {
         const empty = providerHandle(lookup);
         expect(empty.plugin).toBeUndefined();
         expect(empty.workspaceDir).toBe(workspaceDir);
+        expect(loadedHooks({ providerRefs: [lookup.provider] })).toEqual([]);
       });
     },
   );

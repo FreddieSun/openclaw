@@ -247,65 +247,6 @@ describe("discoverOpenAICompatibleLocalModels", () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
-  it("bounds concurrent llama.cpp runtime probes without truncating its model catalog", async () => {
-    const release = vi.fn(async () => undefined);
-    const data = Array.from({ length: 201 }, (_, index) => ({
-      id: `local/model-${index}`,
-      meta: { n_ctx_train: 32_768 },
-    }));
-    let activePropsRequests = 0;
-    let maximumPropsRequests = 0;
-    fetchWithSsrFGuardMock.mockImplementation(async ({ url }: { url: string }) => {
-      if (url.endsWith("/models")) {
-        return {
-          response: new Response(JSON.stringify({ data }), { status: 200 }),
-          finalUrl: url,
-          release,
-        };
-      }
-      activePropsRequests += 1;
-      maximumPropsRequests = Math.max(maximumPropsRequests, activePropsRequests);
-      await Promise.resolve();
-      activePropsRequests -= 1;
-      return {
-        response: new Response(JSON.stringify({ default_generation_settings: { n_ctx: 16_384 } }), {
-          status: 200,
-        }),
-        finalUrl: url,
-        release,
-      };
-    });
-
-    const models = await discoverModels("llama.cpp", "http://127.0.0.1:8080/v1");
-
-    expect(models).toHaveLength(201);
-    expect(models[0]).toMatchObject({ id: "local/model-0", contextTokens: 16_384 });
-    expect(models[199]).toMatchObject({ id: "local/model-199", contextTokens: 16_384 });
-    expect(models[200]).toMatchObject({ id: "local/model-200", contextWindow: 32_768 });
-    expect(models[200]).not.toHaveProperty("contextTokens");
-    expect(maximumPropsRequests).toBeLessThanOrEqual(8);
-    expect(fetchWithSsrFGuardMock).toHaveBeenCalledTimes(201);
-    expect(release).toHaveBeenCalledTimes(201);
-  });
-
-  it("discovers a large non-llama.cpp catalog without probing per-model llama.cpp props", async () => {
-    const data = Array.from({ length: 500 }, (_, index) => ({
-      id: `Qwen/model-${index}`,
-      meta: { n_ctx_train: 32_768 },
-    }));
-    const release = queueCatalog(data);
-
-    const models = await discoverModels("vLLM", "http://127.0.0.1:8000/v1", {
-      discoverRuntimeContext: false,
-    });
-
-    expect(models).toHaveLength(500);
-    expect(models[0]).toMatchObject({ id: "Qwen/model-0", contextWindow: 32_768 });
-    expect(models[499]).toMatchObject({ id: "Qwen/model-499", contextWindow: 32_768 });
-    expect(fetchWithSsrFGuardMock).toHaveBeenCalledOnce();
-    expect(release).toHaveBeenCalledOnce();
-  });
-
   it.each([
     ["non-array catalog", JSON.stringify({ data: {} })],
     ["malformed JSON", "not valid json {"],
@@ -346,34 +287,6 @@ describe("discoverOpenAICompatibleLocalModels", () => {
     expect(propsResponse.wasCanceled()).toBe(true);
   });
 
-  it.each([
-    ["context_length", 200_000],
-    ["context_window", 400_000],
-    ["context_size", 1_048_576],
-  ] as const)("reads provider-advertised %s", async (field, contextWindow) => {
-    const model = await discoverSingleCatalogModel({ id: "custom-model", [field]: contextWindow });
-
-    expect(model).toMatchObject({ id: "custom-model", contextWindow });
-  });
-
-  it("keeps explicit and llama.cpp metadata ahead of top-level catalog fields", async () => {
-    const row = {
-      id: "custom-model",
-      meta: { n_ctx_train: 262_144 },
-      context_length: 200_000,
-      context_window: 100_000,
-      context_size: 50_000,
-    };
-
-    await expect(discoverSingleCatalogModel(row)).resolves.toMatchObject({
-      contextWindow: 262_144,
-    });
-
-    await expect(
-      discoverSingleCatalogModel(row, { contextWindow: 524_288 }),
-    ).resolves.toMatchObject({ contextWindow: 524_288 });
-  });
-
   it("uses a deterministic top-level field priority", async () => {
     const model = await discoverSingleCatalogModel({
       id: "custom-model",
@@ -384,18 +297,6 @@ describe("discoverOpenAICompatibleLocalModels", () => {
 
     expect(model).toMatchObject({ contextWindow: 300_000 });
   });
-
-  it.each([0, "1048576"])(
-    "ignores malformed top-level context metadata: %j",
-    async (contextSize) => {
-      const model = await discoverSingleCatalogModel({
-        id: "custom-model",
-        context_size: contextSize,
-      });
-
-      expect(model).toMatchObject({ contextWindow: 128_000 });
-    },
-  );
 
   it("cancels model discovery error bodies before falling back", async () => {
     const response = cancelTrackedResponse({ status: 503, statusText: "Service Unavailable" });

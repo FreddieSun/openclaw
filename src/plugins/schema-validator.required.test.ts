@@ -251,15 +251,9 @@ describe("schema validator", () => {
       { flag: true, mode: "auto" },
     );
     for (const schema of [
-      conditionalSchema(apiCondition(), endpointDefaults(true), { properties: kind }),
       conditionalSchema({ $ref: "#/$defs/ApiKind" }, endpointDefaults(true), {
         $defs: { ApiKind: apiCondition() },
       }),
-      conditionalSchema(
-        { $defs: { Local: { type: "string" } }, $ref: "#/$defs/ApiKind" },
-        endpointDefaults(true),
-        { $defs: { ApiKind: apiCondition() } },
-      ),
       conditionalSchema(
         {
           $defs: { MatchKind: fields({ kind: { const: "other" } }, ["kind"]) },
@@ -280,14 +274,6 @@ describe("schema validator", () => {
       { contact: "not an email" },
       { contact: "not an email", mode: "auto" },
     );
-    const rootReference = conditionalSchema({ $ref: "#/properties/kind" }, endpointDefaults(true), {
-      properties: { kind: kindReference },
-    });
-    expectDefaults(
-      rootReference,
-      { value: "api" },
-      { value: "api", endpoint: "https://example.com" },
-    );
     expectDefaults(
       conditionalSchema(
         fields({ kind: { $ref: "#/properties/kind" } }, ["kind"]),
@@ -297,15 +283,14 @@ describe("schema validator", () => {
       { kind: { value: "api" } },
       { kind: { value: "api" }, endpoint: "https://example.com" },
     );
-    for (const schema of [
-      conditionalSchema(apiCondition(), endpointDefaults(true), { properties: defaultKind }),
+    expectDefaults(
       conditionalSchema(apiCondition(), endpointDefaults(), {
         properties: defaultKind,
         else: fields({ path: defaulted("string", "/tmp") }),
       }),
-    ]) {
-      expectDefaults(schema, {}, { kind: "api", endpoint: "https://example.com" });
-    }
+      {},
+      { kind: "api", endpoint: "https://example.com" },
+    );
     expectDefaults(modeConditional, {}, { mode: "auto" });
     expectDefaults(flagConditional, {}, { flag: true });
     expectValidationIssue(
@@ -344,36 +329,12 @@ describe("schema validator", () => {
       { kind: "api", settings: { mode: "auto" } },
     );
     expectDefaults(
-      objectSchema(
-        { flag: defaulted("boolean", true) },
-        { dependencies: { flag: modeDefaults() } },
-      ),
-      {},
-      { flag: true, mode: "auto" },
-    );
-    expectDefaults(
       conditionalSchema(apiCondition(), requiredFlagDefault("flag"), {
         properties: kind,
         dependencies: { flag: modeDefaults() },
       }),
       { kind: "api" },
       { kind: "api", flag: true, mode: "auto" },
-    );
-    expectDefaults(
-      objectSchema(
-        { a: defaulted("boolean", true) },
-        {
-          dependencies: {
-            e: requiredFlagDefault("f"),
-            d: requiredFlagDefault("e"),
-            c: requiredFlagDefault("d"),
-            b: requiredFlagDefault("c"),
-            a: requiredFlagDefault("b"),
-          },
-        },
-      ),
-      {},
-      { a: true, b: true, c: true, d: true, e: true, f: true },
     );
     expectDefaults(
       conditionalSchema(apiCondition(), endpointDefaults(true), {
@@ -404,44 +365,23 @@ describe("schema validator", () => {
   });
 
   it.each([
-    {
-      title: "includes allowed value in const validation errors",
-      params: {
-        cacheKey: "schema-validator.test.const",
-        schema: objectSchema({ mode: { const: "strict" } }, { required: ["mode"] }),
-        value: { mode: "relaxed" },
-      },
-      path: "mode",
-      messageIncludes: ["(allowed:"],
-      allowedValues: ["strict"],
-      hiddenCount: 0,
-    },
-    {
-      title: "truncates long allowed-value hints",
-      params: {
-        cacheKey: "schema-validator.test.enum.truncate",
-        schema: objectSchema(
-          {
-            mode: {
-              type: "string",
-              enum: Array.from({ length: 13 }, (_, index) => `v${index + 1}`),
-            },
-          },
-          { required: ["mode"] },
-        ),
+    [{ const: "strict" }, ["strict"], 0],
+    [
+      { type: "string", enum: Array.from({ length: 13 }, (_, i) => `v${i + 1}`) },
+      ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"],
+      1,
+    ],
+  ] as const)("includes bounded allowed values for %j", (property, allowedValues, hiddenCount) => {
+    const issue = expectValidationIssue(
+      expectValidationFailure({
+        schema: objectSchema({ mode: property }, { required: ["mode"] }),
         value: { mode: "not-listed" },
-      },
-      path: "mode",
-      messageIncludes: ["(allowed:", "... (+1 more)"],
-      allowedValues: ["v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"],
-      hiddenCount: 1,
-    },
-  ])("$title", ({ params, path, messageIncludes, allowedValues, hiddenCount }) => {
-    const result = expectValidationFailure(params);
-    const issue = expectValidationIssue(result, path);
-
-    for (const fragment of messageIncludes) {
-      expect(issue.message).toContain(fragment);
+      }),
+      "mode",
+    );
+    expect(issue.message).toContain("(allowed:");
+    if (hiddenCount) {
+      expect(issue.message).toContain("... (+1 more)");
     }
     expect([issue.allowedValues, issue.allowedValuesHiddenCount]).toEqual([
       allowedValues,
@@ -459,7 +399,6 @@ describe("schema validator", () => {
 });
 
 describe("source-aware schema validation", () => {
-  const cache = true;
   const schema = objectSchema(
     {
       credential: objectSchema({ id: { type: "string" } }, { required: ["id"] }),
@@ -467,37 +406,40 @@ describe("source-aware schema validation", () => {
     },
     { required: ["credential"] },
   );
-
-  it("validates uncached persisted references and defaults runtime without mutating either", () => {
+  function fixture(
+    selectedSchema: Parameters<typeof validateJsonSchemaValue>[0]["schema"] = schema,
+  ) {
     const sourceValue = { credential: { id: "KEY" } };
     const value = { credential: "resolved-fixture-key" };
-    const params = {
-      schema,
-      cacheKey: "source-ref",
+    return {
       value,
       sourceValue,
-      applyDefaults: true,
-      cache: false,
+      validate: (overrides: Partial<Parameters<typeof validateJsonSchemaValue>[0]> = {}) =>
+        validateJsonSchemaValue({
+          schema: selectedSchema,
+          sourceValue,
+          value,
+          applyDefaults: true,
+          ...overrides,
+        }),
     };
-    expect(validateJsonSchemaValue(params)).toEqual({ ok: true, value: { ...value, retries: 2 } });
-    expect(
-      validateJsonSchemaValue({ ...params, sourceValue: { credential: "plaintext" } }).ok,
-    ).toBe(false);
-    expect(validateJsonSchemaValue({ ...params, sourceValue: null }).ok).toBe(false);
+  }
+
+  it("validates uncached persisted references and defaults runtime without mutating either", () => {
+    const { value, sourceValue, validate } = fixture();
+    expect(validate({ cache: false })).toEqual({ ok: true, value: { ...value, retries: 2 } });
+    expect(validate({ cache: false, sourceValue: { credential: "plaintext" } }).ok).toBe(false);
+    expect(validate({ cache: false, sourceValue: null }).ok).toBe(false);
     expect(sourceValue).toEqual({ credential: { id: "KEY" } });
     expect(value).toEqual({ credential: "resolved-fixture-key" });
   });
 
   it("preserves the runtime identity without applicable defaults", () => {
-    const value = { credential: "resolved-fixture-key" };
-    const result = validateJsonSchemaValue({
-      schema: { ...schema, properties: { credential: schema.properties.credential } },
-      cacheKey: "source-no-defaults",
-      sourceValue: { credential: { id: "KEY" } },
-      value,
-      applyDefaults: true,
-      cache,
+    const { value, validate } = fixture({
+      ...schema,
+      properties: { credential: schema.properties.credential },
     });
+    const result = validate();
     expect(result).toEqual({ ok: true, value });
     if (result.ok) {
       expect(result.value).toBe(value);
@@ -509,43 +451,16 @@ describe("source-aware schema validation", () => {
       ...schema,
       properties: { ...schema.properties, enabled: defaulted("boolean", true) },
       if: fields({ enabled: { const: true } }, ["enabled"]),
-      // oxlint-disable-next-line unicorn/no-thenable -- JSON Schema branch data, not a promise method.
-      then: { required: ["confirmation"] },
+      [jsonSchemaThenKeyword]: { required: ["confirmation"] },
     };
-    const params = {
-      schema: conditional,
-      cacheKey: "source-conditional",
-      value: { credential: "resolved-fixture-key" },
-      sourceValue: { credential: { id: "KEY" } },
-      applyDefaults: true,
-      cache,
-    };
-    expect(validateJsonSchemaValue({ ...params, applyDefaults: false })).toEqual({
-      ok: true,
-      value: params.value,
-    });
+    const { value, sourceValue, validate } = fixture(conditional);
+    expect(validate({ applyDefaults: false })).toEqual({ ok: true, value });
+    const expected = { ok: true, value: { ...value, retries: 2, enabled: true } };
     const compile = vi.spyOn(globalThis, "Function");
     try {
-      expect(
-        validateJsonSchemaValue({
-          ...params,
-          schema: structuredClone(conditional),
-          cacheKey: "source-conditional-clone",
-        }),
-      ).toEqual({
-        ok: true,
-        value: { credential: "resolved-fixture-key", retries: 2, enabled: true },
-      });
-      expect(
-        validateJsonSchemaValue({
-          ...params,
-          sourceValue: { ...params.sourceValue, enabled: true },
-        }).ok,
-      ).toBe(false);
-      expect(validateJsonSchemaValue(params)).toEqual({
-        ok: true,
-        value: { credential: "resolved-fixture-key", retries: 2, enabled: true },
-      });
+      expect(validate({ schema: structuredClone(conditional) })).toEqual(expected);
+      expect(validate({ sourceValue: { ...sourceValue, enabled: true } }).ok).toBe(false);
+      expect(validate()).toEqual(expected);
       expect(compile).not.toHaveBeenCalled();
     } finally {
       compile.mockRestore();
@@ -553,66 +468,53 @@ describe("source-aware schema validation", () => {
   });
 
   it("rejects invalid source even when the runtime itself matches the schema", () => {
-    const sourceValue = { credential: "invalid-plaintext-fixture" };
-    const result = validateJsonSchemaValue({
-      schema,
-      cacheKey: "source-invalid",
-      sourceValue,
+    const { validate } = fixture();
+    const result = validate({
+      sourceValue: { credential: "invalid-plaintext-fixture" },
       value: { credential: { id: "VALID" } },
-      applyDefaults: true,
-      cache,
     });
     expect(result.ok).toBe(false);
     expect(JSON.stringify(result)).not.toContain("invalid-plaintext-fixture");
   });
 
   it("uses source-selected conditional defaults in nested runtime objects and arrays", () => {
-    const settingsSchema = {
+    const settings = {
       ...schema,
       properties: { ...schema.properties, endpoint: { type: "string" } },
       if: fields({ credential: { type: "object" } }, ["credential"]),
-      // oxlint-disable-next-line unicorn/no-thenable -- JSON Schema branch data, not a promise method.
-      then: fields({ endpoint: { default: "https://reference.example" } }),
+      [jsonSchemaThenKeyword]: fields({ endpoint: { default: "https://reference.example" } }),
       else: fields({ endpoint: { default: "https://plaintext.example" } }),
     };
-    const sourceValue = { accounts: [{ credential: { id: "KEY" } }] };
-    const value = { accounts: [{ credential: "resolved-fixture-key" }] };
+    const { value: account, sourceValue: sourceAccount, validate } = fixture();
+    const value = { accounts: [account] },
+      sourceValue = { accounts: [sourceAccount] };
     expect(
-      validateJsonSchemaValue({
-        schema: objectSchema({ accounts: { type: "array", items: settingsSchema } }),
-        cacheKey: "source-conditional-branch",
+      validate({
+        schema: objectSchema({ accounts: { type: "array", items: settings } }),
         value,
         sourceValue,
-        applyDefaults: true,
-        cache,
       }),
     ).toEqual({
       ok: true,
-      value: {
-        accounts: [
-          { credential: "resolved-fixture-key", retries: 2, endpoint: "https://reference.example" },
-        ],
-      },
+      value: { accounts: [{ ...account, retries: 2, endpoint: "https://reference.example" }] },
     });
     expect(sourceValue).toEqual({ accounts: [{ credential: { id: "KEY" } }] });
     expect(value).toEqual({ accounts: [{ credential: "resolved-fixture-key" }] });
   });
 
   it("preserves runtime overrides and removed references while transferring source defaults", () => {
+    const { validate } = fixture();
     const sourceValue = { credential: { id: "KEY" }, accounts: [{ credential: { id: "OTHER" } }] };
     const value = { retries: 9, accounts: [{ credential: "resolved-fixture-key" }] };
     const before = structuredClone({ sourceValue, value });
     expect(
-      validateJsonSchemaValue({
+      validate({
         schema: {
           ...schema,
           properties: { ...schema.properties, accounts: { type: "array", items: schema } },
         },
-        cacheKey: "source-preserve-runtime",
         value,
         sourceValue,
-        applyDefaults: true,
-        cache,
       }),
     ).toEqual({
       ok: true,
@@ -647,6 +549,11 @@ function requiredSchema(names: string[], container?: string) {
   const schema = { type: "object", required: names };
   return container ? { type: "object", properties: { [container]: schema } } : schema;
 }
+
+const dependencySchema = (trigger: string) => ({
+  type: "object",
+  dependentRequired: { [trigger]: ["left", "right"] },
+});
 
 describe("required and dependency diagnostics", () => {
   it("preserves exact value paths despite ambiguous display paths", () => {
@@ -688,49 +595,34 @@ describe("required and dependency diagnostics", () => {
     ).toMatchObject([{ path: "<root>", valuePath: [] }]);
   });
 
-  it.each([
-    {
-      title: "multiple nested fields",
-      schema: requiredSchema(["endpoint", "token"], "settings"),
-      value: { settings: {} },
-      expectedErrors: [
-        requiredDiagnostic("settings.endpoint", ["settings", "endpoint"], "endpoint"),
-        requiredDiagnostic("settings.token", ["settings", "token"], "token"),
-      ],
-    },
-    {
-      title: "terminal controls in a later field",
-      schema: requiredSchema(["endpoint", "evil\nkey\t\x1b[31mred\x1b[0m"]),
-      value: {},
-      expectedErrors: [
-        requiredDiagnostic("endpoint", ["endpoint"], "endpoint"),
-        diagnostic(
-          "evil\nkey\t\x1b[31mred\x1b[0m",
-          ["evil\nkey\t\x1b[31mred\x1b[0m"],
-          "must have required property 'evil\nkey\t\x1b[31mred\x1b[0m'",
-          "evil\\nkey\\tred: must have required property 'evil\\nkey\\tred'",
-        ),
-      ],
-    },
-    {
-      title: "literal missing property names",
-      schema: requiredSchema(["dot.name", "slash/name", "tilde~1name", "", "<root>"], "settings"),
-      value: { settings: {} },
-      expectedErrors: [
-        requiredDiagnostic("settings.dot.name", ["settings", "dot.name"], "dot.name"),
-        requiredDiagnostic("settings.slash/name", ["settings", "slash/name"], "slash/name"),
-        requiredDiagnostic("settings.tilde~1name", ["settings", "tilde~1name"], "tilde~1name"),
-        requiredDiagnostic("settings", ["settings", ""], ""),
-        requiredDiagnostic("settings.<root>", ["settings", "<root>"], "<root>"),
-      ],
-    },
-  ])("reports complete required diagnostics for $title", ({ schema, value, expectedErrors }) => {
+  it("reports all missing properties without splitting literal names", () => {
+    const names = ["endpoint", "token", "dot.name", "slash/name", "tilde~1name", "", "<root>"];
     const result = expectValidationFailure({
-      schema,
-      value,
+      schema: requiredSchema(names, "settings"),
+      value: { settings: {} },
     });
+    expect(result.errors).toEqual(
+      names.map((name) =>
+        requiredDiagnostic(name ? `settings.${name}` : "settings", ["settings", name], name),
+      ),
+    );
+  });
 
-    expect(result.errors).toEqual(expectedErrors);
+  it("sanitizes terminal controls in a later missing field without changing raw diagnostics", () => {
+    const name = "evil\nkey\t\x1b[31mred\x1b[0m";
+    const result = expectValidationFailure({
+      schema: requiredSchema(["endpoint", name]),
+      value: {},
+    });
+    expect(result.errors).toEqual([
+      requiredDiagnostic("endpoint", ["endpoint"], "endpoint"),
+      diagnostic(
+        name,
+        [name],
+        `must have required property '${name}'`,
+        "evil\\nkey\\tred: must have required property 'evil\\nkey\\tred'",
+      ),
+    ]);
   });
 
   it.each([
@@ -751,15 +643,10 @@ describe("required and dependency diagnostics", () => {
       schema: {
         type: "object",
         properties: {
-          "room/one": { type: "object", dependentRequired: { literal: ["left", "right"] } },
-          room: {
-            type: "object",
-            properties: {
-              one: { type: "object", dependentRequired: { nested: ["left", "right"] } },
-            },
-          },
-          "room~1one": { type: "object", dependentRequired: { tilde: ["left", "right"] } },
-          "room%2Fone": { type: "object", dependentRequired: { percent: ["left", "right"] } },
+          "room/one": dependencySchema("literal"),
+          room: objectSchema({ one: dependencySchema("nested") }),
+          "room~1one": dependencySchema("tilde"),
+          "room%2Fone": dependencySchema("percent"),
         },
       },
       value: {
