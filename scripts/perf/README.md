@@ -1230,7 +1230,9 @@ After both print `PHASE warmed`, atomically publish a future epoch in millisecon
 to that file. It replaces `--start-at`; missed deadlines fail the run. Keep the
 wait short and record the resulting process ages. This aligns workload start,
 not maintenance phase: repeating maintenance can be scheduled from the preceding
-pass's completion. Keep maintenance enabled and preserve its logs.
+pass's completion. Initial main-thread and worker heap collections finish before
+`PHASE warmed`; retained-resource baselines therefore precede the barrier.
+Keep maintenance enabled and preserve its logs.
 
 For `memory-soak`, use `--diagnostics --retained-profile-ms 0` without allocation,
 CPU, or GC-trace flags for natural-GC cost. Its continuous `wholeSoakDiagnostics`
