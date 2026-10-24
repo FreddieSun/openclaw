@@ -165,6 +165,16 @@ if (values.mode === "counts") {
   deliveries = 0;
   toolDeliveries = 0;
   prepared = 0;
+  const inspector = new Session();
+  if (values.mode === "allocation") {
+    // Sampler startup must finish before the shared workload deadline.
+    inspector.connect();
+    await inspector.post("HeapProfiler.startSampling", {
+      samplingInterval: 16384,
+      includeObjectsCollectedByMajorGC: true,
+      includeObjectsCollectedByMinorGC: true,
+    });
+  }
   if (startAt) {
     assert(startAt > Date.now(), "missed synchronized start");
     await delay(startAt - Date.now());
@@ -178,15 +188,7 @@ if (values.mode === "counts") {
   };
   const observer = new PerformanceObserver((list) => record(list.getEntries()));
   const lag = monitorEventLoopDelay({ resolution: 1 });
-  const inspector = new Session();
-  if (values.mode === "allocation") {
-    inspector.connect();
-    await inspector.post("HeapProfiler.startSampling", {
-      samplingInterval: 16384,
-      includeObjectsCollectedByMajorGC: true,
-      includeObjectsCollectedByMinorGC: true,
-    });
-  } else {
+  if (values.mode !== "allocation") {
     lag.enable();
     await delay(10);
     observer.observe({ entryTypes: ["gc"] });
