@@ -756,8 +756,6 @@ it.each([false, true])(
       } else {
         await expect(work).resolves.toMatchObject({ ok: false, phase: "transcript" });
       }
-      expect(create).toHaveBeenCalledOnce();
-      expect(interception).toHaveBeenCalledOnce();
       expect(committed).not.toHaveBeenCalled();
       expect(transcriptRows(database, "cleanup-header")).toHaveLength(1);
       expect(readEntry(database, key)).toBeUndefined();

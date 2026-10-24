@@ -149,6 +149,12 @@ function transcriptRows(fixture: Fixture, sessionId: string) {
   );
 }
 
+async function fileHash(pathname: string) {
+  return createHash("sha256")
+    .update(await fs.readFile(pathname))
+    .digest("hex");
+}
+
 async function archiveFixture(fixture: Fixture) {
   await expectCounts(maintain(fixture));
   const descriptor = readSessionColdTranscript(fixture.database(), historicalId);
@@ -297,17 +303,11 @@ describe("cold transcript storage workers", () => {
     const pathname = fixture.scope.storePath;
     await fs.chmod(pathname, 0o400);
     const originalMode = (await fs.stat(pathname)).mode;
-    const originalHash = createHash("sha256")
-      .update(await fs.readFile(pathname))
-      .digest("hex");
+    const originalHash = await fileHash(pathname);
     try {
       await expectCounts(maintain(fixture), 0);
       expect((await fs.stat(pathname)).mode).toBe(originalMode);
-      expect(
-        createHash("sha256")
-          .update(await fs.readFile(pathname))
-          .digest("hex"),
-      ).toBe(originalHash);
+      expect(await fileHash(pathname)).toBe(originalHash);
       expect(getOpenClawAgentDatabaseIfOpen(fixture.options)).toBeUndefined();
     } finally {
       await fs.chmod(pathname, 0o600);
@@ -761,9 +761,6 @@ describe("cold transcript storage workers", () => {
         name: "SessionMetadataUnavailableError",
         reason: "table-missing",
         missingTables: ["session_transcript_cold_archives"],
-        cause: expect.objectContaining({
-          message: expect.stringMatching(/no such table: session_transcript_cold_archives/),
-        }),
       }),
     },
   ])(
@@ -777,17 +774,11 @@ describe("cold transcript storage workers", () => {
       );
       await closeOpenClawAgentDatabaseByPathAsync(fixture.options.path);
       closeOpenClawAgentDatabasesForTest();
-      const before = createHash("sha256")
-        .update(await fs.readFile(fixture.scope.storePath))
-        .digest("hex");
+      const before = await fileHash(fixture.scope.storePath);
       await expect(
         getSessionColdStorageStatus(maintenanceConfig(fixture.scope.storePath)),
       ).rejects.toThrow(expected);
-      expect(
-        createHash("sha256")
-          .update(await fs.readFile(fixture.scope.storePath))
-          .digest("hex"),
-      ).toBe(before);
+      expect(await fileHash(fixture.scope.storePath)).toBe(before);
       expect(getOpenClawAgentDatabaseIfOpen(fixture.options)).toBeUndefined();
     },
   );

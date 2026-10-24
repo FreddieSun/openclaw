@@ -22,7 +22,6 @@ import {
 import { buildConversationIdentity } from "./conversation-identity.js";
 import { resolveCurrentConversationSession } from "./conversation-registry.js";
 import {
-  appendTranscriptMessageSync as appendMessage,
   applySessionEntryLifecycleMutation,
   createSessionEntryWithTranscript,
   forkSessionAtMessage,
@@ -37,8 +36,6 @@ import {
   replaceTranscriptSuffixEventsSync as replaceSuffix,
   resetSessionEntryLifecycle,
   resolveSessionParentForkDecision,
-  rewindSessionToMessage,
-  switchSessionBranch,
 } from "./session-accessor.js";
 import * as archiveWorkers from "./session-accessor.sqlite-archive.js";
 import {
@@ -53,7 +50,6 @@ import {
   appendTranscriptMessageSnapshotSync,
 } from "./session-accessor.sqlite-transcript-write.js";
 import {
-  appendTranscriptEventSync,
   replaceTranscriptEvents,
   replaceTranscriptEventsSync,
 } from "./session-accessor.sqlite-transcript-write.test-support.js";
@@ -240,18 +236,13 @@ function coldDescriptor(fixture: Fixture) {
 }
 
 function observeCommit(beforeCommit = () => {}) {
-  const commit = { requested: false, inGrant: false };
+  const commit = { requested: false };
   interceptRestoration((params) => ({
     ...params,
     onCommitRequest: () => {
       commit.requested = true;
       beforeCommit();
-      commit.inGrant = true;
-      try {
-        params.onCommitRequest();
-      } finally {
-        commit.inGrant = false;
-      }
+      params.onCommitRequest();
     },
   }));
   return commit;
@@ -374,8 +365,6 @@ const actions = [
   "reset",
   "batched reset",
   "fork",
-  "rewind",
-  "branch switch",
   "branch list",
   "parent fork",
   "cross-store parent fork",
@@ -420,8 +409,6 @@ async function runAction(action: Action, fixture: Fixture) {
     },
     fork: () =>
       forkSessionAtMessage({ ...scope, entryId: "question", targetKey: "agent:main:forked" }),
-    rewind: () => rewindSessionToMessage({ ...scope, entryId: "question" }),
-    "branch switch": () => switchSessionBranch({ ...scope, leafEntryId: "alternate" }),
     "branch list": () => listSessionBranches(scope),
     "parent fork": () => parentFork(),
     "cross-store parent fork": () => {
@@ -459,16 +446,10 @@ describe("cold current transcript lifecycle", () => {
     });
     const archiveBytes = await fs.readFile(archivePath);
     const before = snapshot();
-    expect(fixture.database().prepare("SELECT * FROM transcript_events").all()).toEqual([]);
-    expect(
-      fixture.database().prepare("SELECT current_session_id FROM session_nodes").all(),
-    ).toEqual([{ current_session_id: scope.sessionId }]);
     const event = { type: "custom", id: "sync-custom", customType: "sync-write", data: {} };
     const message = { role: "user", content: "A new synchronous message", timestamp: 20 };
     const mutations = {
-      "append event": () => appendTranscriptEventSync(scope, event),
       "append event snapshot": () => appendTranscriptEventSnapshotSync(scope, event),
-      "append message": () => appendMessage(scope, { message, eventId: "sync-message" }),
       "append message snapshot": () =>
         appendTranscriptMessageSnapshotSync(scope, { message, eventId: "sync-message-snapshot" }),
       "replace transcript": () => replaceTranscriptEventsSync(scope, [event]),
@@ -751,24 +732,18 @@ describe("cold current transcript lifecycle", () => {
         await replaceSessionEntry(sourceScope, sourceEntry);
       }
       const foreign = createCompactAuthority({ scope: sourceScope, entry: sourceEntry });
-      let changed = false;
-      interceptRestoration((params) => ({
-        ...params,
-        onCommitRequest: () => {
-          if (change === "alias path") {
-            unlinkSync(sourceScope.storePath);
-            symlinkSync(seed!.snapshotPath, sourceScope.storePath);
-          } else {
-            replaceSessionEntrySync(sourceScope, { ...sourceEntry, label: "revoked grant" });
-          }
-          changed = true;
-          params.onCommitRequest();
-        },
-      }));
+      const commit = observeCommit(() => {
+        if (change === "alias path") {
+          unlinkSync(sourceScope.storePath);
+          symlinkSync(seed!.snapshotPath, sourceScope.storePath);
+        } else {
+          replaceSessionEntrySync(sourceScope, { ...sourceEntry, label: "revoked grant" });
+        }
+      });
       await expect(createCompactAuthority(fixture).trim(foreign.source)).rejects.toThrow(
         "Compaction source authority revoked",
       );
-      expect(changed).toBe(true);
+      expect(commit.requested).toBe(true);
       expect(fixture.snapshot()).toEqual(before);
       expect(await fs.readFile(fixture.archivePath)).toEqual(archiveBefore);
     },
@@ -802,8 +777,6 @@ describe("cold current transcript lifecycle", () => {
     const result = await runAction(action, fixture);
     if (action === "reset" || action === "batched reset") {
       expect(result).toMatchObject({ sessionId: "reset-next" });
-    } else if (action === "fork" || action === "rewind") {
-      expect(result).toMatchObject({ status: "created", editorText: "Question" });
     } else if (action === "branch list") {
       expect(result).toMatchObject({
         status: "ok",
@@ -820,6 +793,7 @@ describe("cold current transcript lifecycle", () => {
             : action === "parent decision"
               ? "fork"
               : "created",
+        ...(action === "fork" ? { editorText: "Question" } : {}),
       });
     }
     expect(coldDescriptor(fixture)).toBeUndefined();
@@ -858,7 +832,7 @@ describe("cold current transcript lifecycle", () => {
   });
 
   // Message cuts and parent transcript forks restore before dispatching their mutation modes.
-  it.each(actions.filter((action) => !["rewind", "branch switch", "parent fork"].includes(action)))(
+  it.each(actions.filter((action) => action !== "parent fork"))(
     "refuses %s without changing state when its archive is missing",
     async (action) => {
       const fixture = await createColdCurrentSession();

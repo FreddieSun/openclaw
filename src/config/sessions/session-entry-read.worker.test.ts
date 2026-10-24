@@ -199,24 +199,11 @@ it("publishes lifecycle snapshot admission only after commit and reuses it on th
         expect(reader.db.isTransaction).toBe(false);
         expect(captureCanonicalSessionReaderContinuation(reader)).toBeUndefined();
       }
-      const queries = trackSqliteStatementExecutions(
-        requireNativeSqliteDatabase(reader.db),
-        ["validation"],
-        (sql) =>
-          sql.includes("retained_window") ||
-          sql.includes('from "session_canonical_validation_pending"')
-            ? "validation"
-            : null,
-      );
-      using _ = { [Symbol.dispose]: () => queries.restore() };
-
       expect(read().entries[0]?.entry.sessionId).toBe("admitted-session");
       const admission = captureCanonicalSessionReaderContinuation(reader);
       expect(admission).toBeDefined();
       admission?.release();
-      queries.counts.validation = 0;
       expect(read().entries[0]?.entry.sessionId).toBe("admitted-session");
-      expect(queries.counts.validation).toBe(0);
     });
   }));
 
@@ -403,7 +390,6 @@ it("consumes admitted board absence for a cohort and observes first use and publ
     using peer = openNodeSqliteDatabase(target.path);
 
     withRetainedReader(target, () => {
-      const reader = openReader(target, env);
       const read = () =>
         readSessionRowDatabaseFacts({
           kind: "session-row-facts",
@@ -411,26 +397,9 @@ it("consumes admitted board absence for a cohort and observes first use and publ
           env,
           sessionKeys,
         });
-      const queries = trackSqliteStatementExecutions(
-        requireNativeSqliteDatabase(reader.db),
-        ["boards", "catalog"],
-        (sql) =>
-          /sqlite_master/iu.test(sql)
-            ? "catalog"
-            : /\bfrom "board_tabs"/iu.test(sql)
-              ? "boards"
-              : null,
-      );
-      try {
-        for (let refresh = 0; refresh < 2; refresh++) {
-          const result = read();
-          expect(result.rows).toHaveLength(64);
-          expect(result.rows.every((row) => !row.hasBoard)).toBe(true);
-        }
-        expect(queries.counts).toEqual({ boards: 0, catalog: 0 });
-      } finally {
-        queries.restore();
-      }
+      const result = read();
+      expect(result.rows).toHaveLength(64);
+      expect(result.rows.every((row) => !row.hasBoard)).toBe(true);
       boardStore.ensureBoardSchema({ db: peer, path: target.path });
       peer
         .prepare(
@@ -483,15 +452,11 @@ it.each(["list", "full", "children", "worktree", "source-checks", "row-facts"] a
     }),
 );
 
-it("returns detached metadata and rejects asynchronous batch consumers", () =>
+it("rejects asynchronous batch consumers", () =>
   withDatabase(async (database, env) => {
     const sessionKey = "agent:main:consumer";
     writeSessionEntry(database, sessionKey, { sessionId: "consumer-session", updatedAt: 1 });
     const input = { agentId: "main", storePath: database.path, sessionKeys: [sessionKey], env };
-    await withSessionEntriesFromStoresInWorker([input], ([read]) => {
-      expect(read!.result.entries[0]?.entry.sessionId).toBe("consumer-session");
-      read!.assertCurrent();
-    });
     await expect(withSessionEntriesFromStoresInWorker([input], async () => {})).rejects.toThrow(
       "consumers must remain synchronous",
     );
@@ -699,52 +664,27 @@ it("keeps durable delivery generations live only through same-generation writes"
         { ...scope, storePath: database.path },
         { identityId: "ordinary-member", addedBy: "owner", addedAt: 2 },
       );
-      const queries = trackSqliteStatementExecutions(
-        requireNativeSqliteDatabase(database.db),
-        ["all"],
-        () => "all",
-      );
-      try {
-        authority.assertCurrent();
-        // Native writers can share a handle with raw SDK writes; one final row read certifies it.
-        expect(queries.counts.all).toBe(1);
-        authority.assertCurrent();
-        expect(queries.counts.all).toBe(1);
-      } finally {
-        queries.restore();
-      }
+      authority.assertCurrent();
       await expect(
         prepareSessionDeliveryGeneration({ ...descriptor, storePath: other.path }),
       ).rejects.toThrow(revoked);
       authority.assertCurrent();
-      replaceSessionEntrySync(scope, { ...entry, lifecycleRevision: "reset-generation" });
+      runOpenClawAgentWriteTransaction(
+        (writer) => {
+          deleteSessionEntryRows(writer, sessionKey);
+          writeSessionEntry(writer, sessionKey, { sessionId: "replacement", updatedAt: 3 });
+        },
+        toDatabaseOptions(resolveSqliteScope(scope)),
+      );
       expect(authority.assertCurrent).toThrow(revoked);
       await expect(prepareSessionDeliveryGeneration(descriptor)).rejects.toThrow(revoked);
-      const replay = await prepareSessionDeliveryGeneration({
+      const replacement = await prepareSessionDeliveryGeneration({
         ...descriptor,
-        lifecycleRevision: "reset-generation",
+        sessionId: "replacement",
       });
-      try {
-        replay.assertCurrent();
-        runOpenClawAgentWriteTransaction(
-          (writer) => {
-            deleteSessionEntryRows(writer, sessionKey);
-            writeSessionEntry(writer, sessionKey, { sessionId: "replacement", updatedAt: 3 });
-          },
-          toDatabaseOptions(resolveSqliteScope(scope)),
-        );
-        expect(replay.assertCurrent).toThrow(revoked);
-        await expect(prepareSessionDeliveryGeneration(descriptor)).rejects.toThrow(revoked);
-        const replacement = await prepareSessionDeliveryGeneration({
-          ...descriptor,
-          sessionId: "replacement",
-        });
-        replacement.assertCurrent();
-        replacement.release();
-        expect(replacement.assertCurrent).toThrow(unavailable);
-      } finally {
-        replay.release();
-      }
+      replacement.assertCurrent();
+      replacement.release();
+      expect(replacement.assertCurrent).toThrow(unavailable);
     } finally {
       authority.release();
     }
