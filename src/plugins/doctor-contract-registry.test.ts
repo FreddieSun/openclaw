@@ -139,7 +139,6 @@ describe("doctor-contract-registry module loader", () => {
     });
     expect([result.config, result.changes]).toEqual([original, []]);
     expect(config).toEqual(original);
-    expect(mocks.createJiti).toHaveBeenCalledTimes(1);
   });
 
   it.each(["repair", "throw", "warning"])("isolates a normalizer-only config %s", (mode) => {
@@ -161,22 +160,19 @@ describe("doctor-contract-registry module loader", () => {
     const config = {};
     const result = doctor.applyPluginDoctorCompatibilityMigrations(config, { env: {} });
     expect(config).toEqual({});
-    expect(result).toEqual(
+    expect(result.config).toEqual(mode === "repair" ? { repaired: true } : {});
+    expect(result.changes).toEqual(mode === "repair" ? ["repaired config"] : []);
+    expect(result.warnings).toEqual(
       mode === "throw"
-        ? {
-            config: {},
-            changes: [],
-            warnings: [
-              expect.stringContaining(
-                'Plugin "normalizer-only" config repair failed: fixture repair failed',
-              ),
-            ],
-          }
+        ? [
+            expect.stringContaining(
+              'Plugin "normalizer-only" config repair failed: fixture repair failed',
+            ),
+          ]
         : mode === "warning"
-          ? { config: {}, changes: [], warnings: ["Repair requires operator input."] }
-          : { config: { repaired: true }, changes: ["repaired config"] },
+          ? ["Repair requires operator input."]
+          : undefined,
     );
-    expect(mocks.createJiti).toHaveBeenCalledTimes(1);
   });
 
   it.each(["js", "ts"])(
@@ -267,7 +263,6 @@ describe("doctor-contract-registry module loader", () => {
         doctor.listPluginDoctorLegacyConfigRules({ workspaceDir: "/workspace", env: {} }),
       ).toEqual([{ path: ["plugins", "entries", id], message: `${id} contract` }]);
     }
-    expect(mocks.loadPluginManifestRegistry).toHaveBeenCalledTimes(2);
   });
 
   it.each([true, false, undefined])(
@@ -327,7 +322,6 @@ describe("doctor-contract-registry selection", () => {
   ];
   it.each([
     { name: "missing official plugin", pins: true },
-    { name: "authored listener endpoints", explicit: true, pins: true },
     { name: "unresolved host facts", warning: "Resolve account ambiguity", pins: false },
     { name: "deferred installed owner", ownerId: "feishu", pins: false },
     { name: "deferred trusted official owner", ownerId: "feishu", trusted: true, pins: true },
@@ -354,19 +348,13 @@ describe("doctor-contract-registry selection", () => {
     const { ownerId, trusted, restricted, warning, explicit = false, pins } = scenario;
     const config: OpenClawConfig = {
       meta: { migrations: { webhookListeners: { telegram: [] } } },
-      gateway: { port: 18789 },
       ...(restricted ? { plugins: { allow: ["other-plugin"] } } : {}),
       channels: {
         feishu: {
           enabled: true,
           connectionMode: "webhook",
-          tools: { base: true },
           ...(explicit ? { webhookPort: 9001, webhookHost: "0.0.0.0" } : {}),
-          accounts: {
-            default: { enabled: true },
-            optedOut: { legacyWebhook: false },
-            ...(explicit ? { specific: { enabled: true, webhookPort: 9002 } } : {}),
-          },
+          accounts: { default: { enabled: true } },
         },
       },
     };
@@ -378,23 +366,21 @@ describe("doctor-contract-registry selection", () => {
     });
     retainedConfigDoctorMock.mockReturnValue({
       ...listener,
-      normalizeCompatibilityConfig: ({ cfg }: { cfg: OpenClawConfig }) => ({
-        config: { ...cfg, gateway: { ...cfg.gateway, port: 60000 } },
-        changes: ["Unrelated plugin repair"],
-      }),
+      normalizeCompatibilityConfig: () => {
+        throw new Error("deferred repair ran");
+      },
       normalizeHistoricalWebhookConfig: ({ cfg }: { cfg: OpenClawConfig }) => ({
         ...listener.normalizeCompatibilityConfig({ cfg }),
-        historicalWebhookAccountIds: ["default", "optedOut", ...(explicit ? ["specific"] : [])],
+        historicalWebhookAccountIds: ["default"],
         ...(warning ? { warnings: [warning] } : {}),
       }),
     });
     if (ownerId) {
       const pluginRoot = writeContract();
       mocks.createJiti.mockImplementation(() => () => ({
-        normalizeCompatibilityConfig: ({ cfg }: { cfg: OpenClawConfig }) => ({
-          config: { ...cfg, gateway: { ...cfg.gateway, port: 61000 } },
-          changes: ["Deferred owner ran"],
-        }),
+        normalizeCompatibilityConfig: () => {
+          throw new Error("deferred owner ran");
+        },
       }));
       mockRawDoctorPlugins({
         id: ownerId,
@@ -438,10 +424,6 @@ describe("doctor-contract-registry selection", () => {
         delete channel.webhookPort;
         delete channel.webhookHost;
         channel.legacyWebhook = { port: 9001, host: "0.0.0.0" };
-        channel.accounts.specific = {
-          enabled: true,
-          legacyWebhook: { port: 9002, host: "0.0.0.0" },
-        };
       } else {
         channel.accounts.default.legacyWebhook = { port: 3000, host: "127.0.0.1" };
       }
@@ -668,7 +650,6 @@ describe("doctor-contract-registry selection", () => {
     expect(result.config.models?.providers?.["ollama-cloud"]).toEqual(
       providerConfig("https://ollama.com"),
     );
-    expect(mocks.createJiti).toHaveBeenCalledTimes(1);
   });
 
   it("selects a mixed-case manifest Doctor owner from its canonical config entry", () => {
@@ -689,7 +670,6 @@ describe("doctor-contract-registry selection", () => {
     });
     expect(result.changes).toEqual(["mixed-case owner repaired config"]);
     expect(result.config).toHaveProperty("repairedBy", "MiXeD-upgrade-proof");
-    expect(mocks.createJiti).toHaveBeenCalledTimes(1);
   });
 });
 

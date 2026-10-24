@@ -61,7 +61,7 @@ function createHarness(id: string) {
   };
 }
 
-function scopeCapture() {
+function scopeCapture(id: string) {
   const scopes: ReturnType<typeof getPluginRuntimeGatewayRequestScope>[] = [];
   return {
     capture<T>(result: () => T) {
@@ -70,7 +70,7 @@ function scopeCapture() {
         return result();
       };
     },
-    expectOwner(id: string, count: number) {
+    expectOwner(count: number) {
       expect(scopes).toHaveLength(count);
       for (const scope of scopes) {
         expect(scope).toMatchObject({ pluginId: id, pluginSource: `/plugins/${id}/index.js` });
@@ -111,7 +111,7 @@ function registered(
 
 function sessionFixture(id: string) {
   const runtime = createPluginRuntime();
-  const scope = scopeCapture();
+  const scope = scopeCapture(id);
   const createSessionEntry = vi.fn<CreateSession>(async (params) =>
     scope.capture(() => ({
       key: params.key,
@@ -573,29 +573,15 @@ describe("plugin registry runtime config scope", () => {
     });
     const { api } = registered("diagnostic-plugin", { name: "Diagnostic Plugin" }, runtime);
 
-    let thrown: unknown;
-    try {
-      void api.runtime.version;
-    } catch (error) {
-      thrown = error;
-    }
-
-    expect(thrown).toBeInstanceOf(Error);
-    if (!(thrown instanceof Error)) {
-      throw new Error("expected runtime resolution failure");
-    }
-    for (const text of [
-      "Unable to resolve plugin runtime module",
-      "pluginRuntimeContext=pluginId:diagnostic-plugin",
-      "property:version",
-      "source:/plugins/diagnostic-plugin/index.js",
-    ]) {
-      expect(thrown.message).toContain(text);
-    }
+    const read = () => api.runtime.version;
+    expect(read).toThrowError(Error);
+    expect(read).toThrow(
+      /(?=.*Unable to resolve plugin runtime module)(?=.*pluginRuntimeContext=pluginId:diagnostic-plugin)(?=.*property:version)(?=.*source:\/plugins\/diagnostic-plugin\/index.js)/s,
+    );
   });
 
   it("runs config helpers with the owning plugin scope", async () => {
-    const scope = scopeCapture();
+    const scope = scopeCapture("legacy-plugin");
     const config = {} as OpenClawConfig;
     const replaceResult = {
       path: "/tmp/openclaw.json",
@@ -617,9 +603,7 @@ describe("plugin registry runtime config scope", () => {
     } satisfies PluginRuntime["config"];
     const runtime = createPluginRuntime();
     runtime.config = configRuntime;
-    const builder = createRuntimeTestRegistry(runtime);
-    const record = createRecord("legacy-plugin", { name: "Legacy Plugin" });
-    const api = builder.createApi(record, { config });
+    const { api } = registered("legacy-plugin", {}, runtime);
 
     expect(api.runtime.config.current()).toBe(config);
     await api.runtime.config.mutateConfigFile({
@@ -631,25 +615,21 @@ describe("plugin registry runtime config scope", () => {
       afterWrite: { mode: "none", reason: "test" },
     });
 
-    scope.expectOwner("legacy-plugin", 3);
+    scope.expectOwner(3);
   });
 
   it("runs local service acquisition with the owning plugin scope", async () => {
-    const scope = scopeCapture();
+    const scope = scopeCapture("memory-provider");
     const runtime = createPluginRuntime();
     runtime.llm.acquireLocalService = vi.fn(scope.capture(async () => undefined));
-    const { api } = registered(
-      "memory-provider",
-      { name: "Memory Provider", origin: "bundled" },
-      runtime,
-    );
+    const { api } = registered("memory-provider", { origin: "bundled" }, runtime);
 
     await api.runtime.llm.acquireLocalService({
       providerId: "gpu-host",
       baseUrl: "http://127.0.0.1:11434",
     });
 
-    scope.expectOwner("memory-provider", 1);
+    scope.expectOwner(1);
   });
 
   it("keeps scoped LLM acquisition lazy and rejects retained calls after retirement", async () => {
@@ -679,7 +659,7 @@ describe("plugin registry runtime config scope", () => {
   });
 
   it("runs lazy node helpers with the owning plugin scope", async () => {
-    const scope = scopeCapture();
+    const scope = scopeCapture("google-meet");
     const nodes: PluginRuntime["nodes"] = {
       list: vi.fn(scope.capture(async () => ({ nodes: [] }))),
       invoke: vi.fn(scope.capture(async () => ({ ok: true }))),
@@ -698,11 +678,7 @@ describe("plugin registry runtime config scope", () => {
         throw new Error("broad runtime should stay lazy during scoped node access");
       });
     const runtime = createLazyPluginRuntime({ runtimeOptions: { nodes } });
-    const { builder, api } = registered(
-      "google-meet",
-      { name: "Google Meet", origin: "bundled" },
-      runtime,
-    );
+    const { builder, api } = registered("google-meet", { origin: "bundled" }, runtime);
 
     await api.runtime.nodes.list({ connected: true });
     await api.runtime.nodes.invoke({
@@ -712,23 +688,23 @@ describe("plugin registry runtime config scope", () => {
     });
     await api.runtime.nodes.openDuplex({ nodeId: "node-1", command: "image.bridge" });
 
-    scope.expectOwner("google-meet", 3);
+    scope.expectOwner(3);
     expect(scope.scopes[2]?.pluginRegistry).toBe(builder.registry);
     expect(resolveRuntimeModule).not.toHaveBeenCalled();
   });
 
   it("runs gateway requests with the owning plugin scope", async () => {
-    const scope = scopeCapture();
+    const scope = scopeCapture("google-meet");
     const runtime = createPluginRuntime();
     runtime.gateway.isAvailable = async () => true;
     vi.spyOn(runtime.gateway, "request").mockImplementation(
       scope.capture(async () => ({ ok: true })),
     );
-    const { api } = registered("google-meet", { name: "Google Meet", origin: "bundled" }, runtime);
+    const { api } = registered("google-meet", { origin: "bundled" }, runtime);
 
     await api.runtime.gateway.request("voicecall.start", { to: "+15550001234" });
 
-    scope.expectOwner("google-meet", 1);
+    scope.expectOwner(1);
     expect(scope.scopes[0]?.pluginOrigin).toBe("bundled");
   });
 
@@ -746,7 +722,7 @@ describe("plugin registry runtime config scope", () => {
     await expect(
       ownerApi.runtime.agent.session.createSessionEntry(createParams),
     ).resolves.toMatchObject({ sessionId: "session-1" });
-    scope.expectOwner("codex-owner", 1);
+    scope.expectOwner(1);
     const ordinaryParams = {
       cfg: {},
       key: "agent:main:ordinary",
@@ -864,11 +840,10 @@ it.each(["bundled", "global", "config", "workspace"] as const)(
     const { builder, api } = registered("codex", { origin });
     api.registerAgentHarness(createHarness("codex"));
     await withPluginRuntimeRegistryScope(builder.registry, async () => {
-      const registeredHarness = listRegisteredAgentHarnesses()[0]?.harness;
-      expect(registeredHarness).toBeDefined();
-      if (!registeredHarness) {
-        throw new Error("Expected registrar-owned fixture harness");
-      }
+      const registeredHarness = expectDefined(
+        listRegisteredAgentHarnesses()[0]?.harness,
+        "harness",
+      );
       expect(resolveAgentHarnessQueueInputAdapter(registeredHarness)).toBe(
         origin === "bundled" ? "human-and-question-permission" : "legacy-question-category",
       );
@@ -884,10 +859,7 @@ it("keeps direct facade registrations legacy even beside a bundled same-ID recor
   const { builder } = registered("codex", { origin: "bundled" });
   await withPluginRuntimeRegistryScope(builder.registry, async () => {
     registerAgentHarness(createHarness("codex"), { ownerPluginId: "codex" });
-    const harness = listRegisteredAgentHarnesses()[0]?.harness;
-    if (!harness) {
-      throw new Error("Expected direct facade harness");
-    }
+    const harness = expectDefined(listRegisteredAgentHarnesses()[0]?.harness, "direct harness");
     expect(resolveAgentHarnessQueueInputAdapter(harness)).toBe("legacy-question-category");
   });
 });

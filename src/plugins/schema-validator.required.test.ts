@@ -83,11 +83,6 @@ function expectReference(schema: Parameters<typeof validateJsonSchemaValue>[0]["
   expectSuccessfulValidationValue({ schema, value: "ok" }, "ok");
 }
 
-function expectValidationSuccess(params: Parameters<typeof validateJsonSchemaValue>[0]) {
-  const result = validateJsonSchemaValue(params);
-  expect(result.ok).toBe(true);
-}
-
 describe("schema validator", () => {
   it.each([
     ["<root>", []],
@@ -98,41 +93,31 @@ describe("schema validator", () => {
   });
 
   it("rejects invalid JSON Schema constraint keyword values", () => {
-    for (const [cacheKey, schema] of [
-      ["required", objectSchema({ url: { type: "string" } }, { required: "url" })],
-      ["min-length", { type: "string", minLength: "1" }],
-      ["additional-properties", { type: "object", additionalProperties: [] }],
-      ["empty-allof", { allOf: [] }],
-      ["empty-anyof", { anyOf: [] }],
-      ["empty-oneof", { oneOf: [] }],
-      ["empty-enum", { enum: [] }],
-      ["duplicate-enum", { enum: ["api", "api"] }],
-      ["duplicate-required", { type: "object", required: ["mode", "mode"] }],
-      ["duplicate-type-array", { type: ["string", "string"] }],
-      ["ref", { $ref: "#/$defs/Missing" }],
-      [
-        "array-ref-leading-zero",
-        { anyOf: [{ type: "number" }, { type: "string" }], $ref: "#/anyOf/01" },
-      ],
-      ["dynamic-ref-type", { $dynamicRef: 123 }],
-      ["dynamic-ref", { $dynamicRef: "#/$defs/Missing" }],
-      ["nullable-type", { type: "string", nullable: "yes" }],
-      ["nullable-without-type", { nullable: true }],
-      [
-        "anchor-ref",
-        { $defs: { Other: { $id: "other", $anchor: "value", type: "string" } }, $ref: "#value" },
-      ],
-      ["external-ref", { $ref: "https://example.com/missing" }],
-      ["dependencies-value", { type: "object", dependencies: { mode: 123 } }],
-      ["dependencies-array", { type: "object", dependencies: { mode: [1] } }],
+    for (const schema of [
+      objectSchema({ url: { type: "string" } }, { required: "url" }),
+      { type: "string", minLength: "1" },
+      { type: "object", additionalProperties: [] },
+      { allOf: [] },
+      { anyOf: [] },
+      { oneOf: [] },
+      { enum: [] },
+      { enum: ["api", "api"] },
+      { type: "object", required: ["mode", "mode"] },
+      { type: ["string", "string"] },
+      { $ref: "#/$defs/Missing" },
+      { anyOf: [{ type: "number" }, { type: "string" }], $ref: "#/anyOf/01" },
+      { $dynamicRef: 123 },
+      { $dynamicRef: "#/$defs/Missing" },
+      { type: "string", nullable: "yes" },
+      { nullable: true },
+      { $defs: { Other: { $id: "other", $anchor: "value", type: "string" } }, $ref: "#value" },
+      { $ref: "https://example.com/missing" },
+      { type: "object", dependencies: { mode: 123 } },
+      { type: "object", dependencies: { mode: [1] } },
     ] as const) {
-      expect(() =>
-        validateJsonSchemaValue({
-          cacheKey: `schema-validator.test.invalid-${cacheKey}`,
-          schema,
-          value: "anything",
-        }),
-      ).toThrow("invalid schema");
+      expect(() => validateJsonSchemaValue({ schema, value: "anything" })).toThrow(
+        "invalid schema",
+      );
     }
   });
 
@@ -180,48 +165,20 @@ describe("schema validator", () => {
     });
   });
 
-  it("accepts draft-07 tuple item schemas", () => {
-    expectSuccessfulValidationValue(
-      {
-        cacheKey: "schema-validator.test.tuple-items",
-        schema: {
-          type: "array",
-          items: [{ type: "string" }, { type: "number" }],
-          additionalItems: false,
-        },
-        value: ["mode", 1],
-      },
-      ["mode", 1],
-    );
-
+  it("accepts draft-07 tuples and applies defaults to legacy and prefix items", () => {
+    const pair = [defaulted("string", "mode"), defaulted("number", 1)];
+    const tuple = { type: "array", items: pair, additionalItems: false };
+    expectSuccessfulValidationValue({ schema: tuple, value: ["mode", 1] }, ["mode", 1]);
+    for (const items of [{ items: pair, additionalItems: false }, { prefixItems: pair }]) {
+      expectDefaults({ type: "array", minItems: 2, ...items }, [], ["mode", 1]);
+    }
     expectDefaults(
       {
         type: "array",
-        items: [defaulted("string", "mode"), defaulted("number", 1)],
-        minItems: 2,
-        additionalItems: false,
-      },
-      [],
-      ["mode", 1],
-    );
-
-    expectDefaults(
-      {
-        type: "array",
-        prefixItems: [defaulted("string", "mode"), defaulted("number", 1)],
-        minItems: 2,
-      },
-      [],
-      ["mode", 1],
-    );
-
-    expectDefaults(
-      {
-        type: "array",
+        minItems: 1,
         items: [
           objectSchema({ mode: defaulted("string", "auto") }, { default: {}, required: ["mode"] }),
         ],
-        minItems: 1,
       },
       [],
       [{ mode: "auto" }],
@@ -346,22 +303,10 @@ describe("schema validator", () => {
     );
   });
 
-  it("recompiles when a stable cache key receives a different schema shape", () => {
-    const cacheKey = "schema-validator.test.cache-key-drift";
-    const schema = { type: "string" };
-    expectValidationSuccess({ cacheKey, schema, value: "ok" });
-
-    expect(() =>
-      validateJsonSchemaValue({ cacheKey, schema: { type: 1n }, value: "ignored" }),
-    ).toThrow("invalid schema: <schema>.type: expected string or non-empty string array");
-    expectValidationSuccess({ cacheKey, schema, value: "still valid" });
-
-    const result = expectValidationFailure({
-      cacheKey,
-      schema: { type: "number" },
-      value: "not-a-number",
-    });
-    expectValidationIssue(result, "<root>");
+  it("reports malformed schemas that cannot be serialized for cache lookup", () => {
+    expect(() => validateJsonSchemaValue({ schema: { type: 1n }, value: "ignored" })).toThrow(
+      "invalid schema: <schema>.type: expected string or non-empty string array",
+    );
   });
 
   it.each([

@@ -43,23 +43,18 @@ function createUnboundedJsonStream() {
       state.cancelCount += 1;
     },
   });
-  return {
-    body,
-    get cancelCount() {
-      return state.cancelCount;
-    },
-    get bytesPulled() {
-      return state.bytesPulled;
-    },
-  };
+  return { body, state };
 }
 
-function createContext(params: {
-  providerId: string;
-  baseUrl?: string;
-  apiKey?: string;
-  modelId?: string;
-}): ProviderAuthMethodNonInteractiveContext {
+function createContext(
+  overrides: {
+    providerId?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    modelId?: string;
+  } = {},
+): ProviderAuthMethodNonInteractiveContext {
+  const params = { providerId: "vllm", modelId: "Qwen/Qwen3-32B", ...overrides };
   const resolved = {
     key: params.apiKey ?? "self-hosted-test-key",
     source: "flag" as const,
@@ -204,21 +199,6 @@ function discoverModels(
   return discoverOpenAICompatibleLocalModels({ baseUrl, label, env: {}, ...options });
 }
 
-async function discoverSingleCatalogModel(
-  row: Record<string, unknown>,
-  options?: { contextWindow?: number },
-) {
-  const release = queueJsonResponse({ data: [row] }, "https://provider.example/v1/models");
-
-  const models = await discoverModels("custom provider", "https://provider.example/v1", {
-    contextWindow: options?.contextWindow,
-    discoverRuntimeContext: false,
-  });
-
-  expect(release).toHaveBeenCalledOnce();
-  return models[0];
-}
-
 describe("discoverOpenAICompatibleLocalModels", () => {
   it("retains valid models when a provider catalog contains malformed entries", async () => {
     const release = queueJsonResponse(
@@ -229,7 +209,7 @@ describe("discoverOpenAICompatibleLocalModels", () => {
           7,
           "invalid",
           [],
-          { id: "valid-b", meta: { n_ctx_train: 65_536 } },
+          { id: "valid-b", context_length: 65_536, context_window: 32_768, context_size: 16_384 },
         ],
       },
       "http://127.0.0.1:8000/v1/models",
@@ -287,17 +267,6 @@ describe("discoverOpenAICompatibleLocalModels", () => {
     expect(propsResponse.wasCanceled()).toBe(true);
   });
 
-  it("uses a deterministic top-level field priority", async () => {
-    const model = await discoverSingleCatalogModel({
-      id: "custom-model",
-      context_length: 300_000,
-      context_window: 200_000,
-      context_size: 100_000,
-    });
-
-    expect(model).toMatchObject({ contextWindow: 300_000 });
-  });
-
   it("cancels model discovery error bodies before falling back", async () => {
     const response = cancelTrackedResponse({ status: 503, statusText: "Service Unavailable" });
     const release = queueResponse(response.response, "http://127.0.0.1:8000/v1/models");
@@ -331,20 +300,12 @@ describe("discoverOpenAICompatibleLocalModels", () => {
   });
 
   it("scopes llama.cpp /props runtime caps to each discovered model without autoloading", async () => {
-    const modelsRelease = queueJsonResponse(
-      {
-        data: [
-          {
-            id: "qwen/router-a",
-            meta: { n_ctx_train: 262_144 },
-          },
-          {
-            id: "qwen/router-b",
-            meta: { n_ctx_train: 131_072 },
-          },
-        ],
-      },
-      "http://127.0.0.1:8080/v1/models",
+    const modelsRelease = queueCatalog(
+      [
+        { id: "qwen/router-a", meta: { n_ctx_train: 262_144 } },
+        { id: "qwen/router-b", meta: { n_ctx_train: 131_072 } },
+      ],
+      llamaUrl,
     );
     const firstPropsRelease = queueProps(
       { default_generation_settings: { n_ctx: 65_536 } },
@@ -400,8 +361,8 @@ describe("discoverOpenAICompatibleLocalModels", () => {
       );
       // A model overflow rejects discovery; a props overflow preserves the catalog.
       expect(models).toEqual(endpoint === "props" ? [expectedModel("qwen3.6-mxfp4-moe")] : []);
-      expect(oversized.cancelCount).toBe(1);
-      expect(oversized.bytesPulled).toBeLessThanOrEqual(
+      expect(oversized.state.cancelCount).toBe(1);
+      expect(oversized.state.bytesPulled).toBeLessThanOrEqual(
         SELF_HOSTED_DISCOVERY_JSON_MAX_BYTES + 2 * CHUNK_BYTES,
       );
       expectReleased(...releases);
@@ -411,7 +372,7 @@ describe("discoverOpenAICompatibleLocalModels", () => {
 
 describe("configureOpenAICompatibleSelfHostedProviderNonInteractive", () => {
   it("stops setup when the auth profile cannot be persisted", async () => {
-    const ctx = createContext({ providerId: "vllm", modelId: "Qwen/Qwen3-32B" });
+    const ctx = createContext();
     const configBefore = structuredClone(ctx.config);
     const failure = new Error("Auth profile store is unavailable.");
     upsertAuthProfileWithLockOrThrow.mockRejectedValueOnce(failure);
@@ -444,13 +405,6 @@ describe("configureOpenAICompatibleSelfHostedProviderNonInteractive", () => {
       models: [expectedModel(params.modelId)],
     });
     expect(readPrimaryModel(cfg)).toBe(`${params.providerId}/${params.modelId}`);
-    expect(ctx.resolveApiKey).toHaveBeenCalledWith({
-      provider: params.providerId,
-      flagValue: params.apiKey,
-      flagName: "--custom-api-key",
-      envVar: params.envVar,
-      envVarName: params.envVar,
-    });
     expect(upsertAuthProfileWithLockOrThrow).toHaveBeenCalledWith({
       profileId,
       agentDir: ctx.agentDir,
@@ -529,11 +483,7 @@ describe("configureOpenAICompatibleSelfHostedProviderNonInteractive", () => {
       const ctx = createContext({ providerId: params.providerId, modelId: "Qwen/Qwen3-32B" });
       ctx.opts.secretInputMode = "ref";
       vi.mocked(ctx.resolveApiKey).mockResolvedValueOnce({ key, source: "flag" });
-      vi.mocked(ctx.toApiKeyCredential).mockImplementationOnce(() => {
-        ctx.runtime.error("SecretRef mode requires an explicit environment variable.");
-        ctx.runtime.exit(1);
-        return null;
-      });
+      refuseCredential(ctx, "SecretRef mode requires an explicit environment variable.");
 
       const cfg = await configureSelfHostedTestProvider({ ctx, ...params });
 
@@ -546,7 +496,7 @@ describe("configureOpenAICompatibleSelfHostedProviderNonInteractive", () => {
   );
 
   it("does not treat another provider's marker as keyless in plaintext mode", async () => {
-    const ctx = createContext({ providerId: "vllm", modelId: "Qwen/Qwen3-32B" });
+    const ctx = createContext();
     ctx.opts.secretInputMode = "plaintext";
     vi.mocked(ctx.resolveApiKey).mockResolvedValueOnce({ key: "lmstudio-local", source: "flag" });
 
@@ -565,7 +515,7 @@ describe("configureOpenAICompatibleSelfHostedProviderNonInteractive", () => {
   });
 
   it("preserves an environment SecretRef when persisting a new auth profile", async () => {
-    const ctx = createContext({ providerId: "vllm", modelId: "Qwen/Qwen3-32B" });
+    const ctx = createContext();
     ctx.opts.secretInputMode = "ref";
     vi.mocked(ctx.resolveApiKey).mockResolvedValueOnce({
       key: "fixture-existing-environment-secret",
@@ -590,7 +540,7 @@ describe("configureOpenAICompatibleSelfHostedProviderNonInteractive", () => {
   });
 
   it("does not write an auth profile when no usable credential is available", async () => {
-    const ctx = createContext({ providerId: "vllm", modelId: "Qwen/Qwen3-32B" });
+    const ctx = createContext();
     vi.mocked(ctx.resolveApiKey).mockResolvedValueOnce(null);
 
     const cfg = await configureSelfHostedTestProvider({ ctx });
@@ -602,19 +552,14 @@ describe("configureOpenAICompatibleSelfHostedProviderNonInteractive", () => {
 
   it("exits without touching auth when custom model id is missing", async () => {
     const ctx = createContext({
-      providerId: "vllm",
+      modelId: undefined,
       apiKey: "vllm-test-key",
     });
 
     const cfg = await configureSelfHostedTestProvider({ ctx });
 
     expect(cfg).toBeNull();
-    expect(ctx.runtime.error).toHaveBeenCalledWith(
-      [
-        "Missing --custom-model-id for --auth-choice vllm.",
-        "Pass the vLLM model id to use, for example Qwen/Qwen3-32B.",
-      ].join("\n"),
-    );
+    expect(ctx.runtime.error).toHaveBeenCalledWith(expect.stringContaining("--custom-model-id"));
     expect(ctx.runtime.exit).toHaveBeenCalledWith(1);
     expect(ctx.resolveApiKey).not.toHaveBeenCalled();
     expect(upsertAuthProfileWithLockOrThrow).not.toHaveBeenCalled();

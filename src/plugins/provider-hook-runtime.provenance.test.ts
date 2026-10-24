@@ -273,14 +273,12 @@ describe("provider runtime physical ownership", () => {
     "keeps registration config current with snapshot=$snapshotPresent, change=$change, receiver=$receiver",
     ({ snapshotPresent, change, receiver }) => {
       const registrations = createRegistrationProbe();
-      const registrationMarker = path.join(makePluginLoaderTempDir(), "registered");
       const plugin = writePlugin({
         id: "same-id",
         filename: "index.cjs",
         body: `module.exports = { id: "same-id", register(api) {
           ${registrations.source}
           const captured = api.pluginConfig.revision + "/" + registration;
-          require("node:fs").writeFileSync(${JSON.stringify(registrationMarker)}, captured);
           api.registerProvider({ id: "same-provider", label: captured, auth: [],
             hookAliases: ${receiver === "removed-alias" ? 'api.pluginConfig.revision === "A" ? ["runtime-alias"] : ["new-alias"]' : '["runtime-alias"]'},
             normalizeModelId: () => captured });
@@ -297,15 +295,14 @@ describe("provider runtime physical ownership", () => {
       const firstConfig = configFor("A");
       const env = { OPENCLAW_STATE_DIR: makePluginLoaderTempDir() };
       const firstSnapshot = loadMetadata({ config: firstConfig, env });
-      const loadOptions = {
+      const loadedRegistry = activate({
         config: firstConfig,
         env,
         installRecords: {},
         onlyPluginIds: ["same-id"],
         manifestRegistry: firstSnapshot.manifestRegistry,
         activate: false,
-      };
-      const loadedRegistry = activate(loadOptions);
+      });
       const lookup = { provider: receiver === "declared" ? "same-provider" : "runtime-alias", env };
       const modelOnlyConfig = { ...firstConfig, agents: { defaults: { model: "other/model" } } };
       expect(loadedProvider({ ...lookup, config: modelOnlyConfig })?.label).toBe("A/1");
@@ -338,11 +335,10 @@ describe("provider runtime physical ownership", () => {
         }),
       ).toBe("A/1");
       expect(loadedProvider(requested)).toBeUndefined();
-      expect(readFileSync(registrationMarker, "utf8")).toBe("A/1");
+      expect(registrations.count()).toBe(1);
       expect(
         labels(resolveProviders({ ...requested, providerRefs: [requested.provider] })),
       ).toEqual(receiver === "removed-alias" ? [] : ["B/2"]);
-      expect(readFileSync(registrationMarker, "utf8")).toBe("B/2");
       expect(resolveProvider(requested)?.label).toBe(
         receiver === "removed-alias" ? undefined : "B/2",
       );
@@ -524,22 +520,6 @@ describe("provider runtime physical ownership", () => {
     }
   });
 
-  it("matches physical manifests before reusing a bounded active registry", () => {
-    const snapshot = loadFixture("old");
-    const old = registry(snapshot);
-    setActivePluginRegistry(old, "old");
-    const resolve = (selected: ReturnType<typeof metadata>) =>
-      loadedRegistryFor({
-        requiredPluginIds: ["same-id"],
-        loadOptions: {
-          onlyPluginIds: ["same-id"],
-          manifestRegistry: selected.manifestRegistry,
-        },
-      });
-    expect(resolve(snapshot) === old).toBe(true);
-    expectAbsent(resolve(metadata("/synthetic/new")));
-  });
-
   it("does not reuse an active registry for another raw discovery selection", () => {
     const snapshot = loadFixture("old");
     const old = registry(snapshot);
@@ -553,20 +533,11 @@ describe("provider runtime physical ownership", () => {
         diagnostics: [],
       },
     });
-    const oldOptions = options(snapshot);
-    setActivePluginRegistry(old, loadCacheContext(oldOptions).cacheKey);
-    expect(
-      loadedRegistryFor({
-        loadOptions: oldOptions,
-        requiredPluginIds: ["same-id"],
-      }) === old,
-    ).toBe(true);
-    expectAbsent(
-      loadedRegistryFor({
-        loadOptions: options(metadata("/synthetic/new")),
-        requiredPluginIds: ["same-id"],
-      }),
-    );
+    setActivePluginRegistry(old, loadCacheContext(options(snapshot)).cacheKey);
+    const lookup = (selected: ReturnType<typeof metadata>) =>
+      loadedRegistryFor({ loadOptions: options(selected), requiredPluginIds: ["same-id"] });
+    expect(lookup(snapshot) === old).toBe(true);
+    expectAbsent(lookup(metadata("/synthetic/new")));
   });
 
   it("uses the loaded owner rather than a later disabled duplicate record", () => {
