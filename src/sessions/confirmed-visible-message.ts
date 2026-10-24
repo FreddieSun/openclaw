@@ -190,6 +190,10 @@ async function resolveConfirmedDestination(input: {
   if (params.route) {
     return { destination: params.route, route: params.route };
   }
+  const pinned = await resolvePinnedDestination(params, agentId, storePath);
+  if (pinned) {
+    return { destination: pinned, route: params.route };
+  }
   const selection = await resolveCurrentConversationByDelivery(
     { agentId, storePath },
     {
@@ -228,6 +232,56 @@ async function resolveConfirmedDestination(input: {
     : {
         skip: "Conversation context skipped: destination conversation could not be resolved without a network lookup.",
       };
+}
+
+// A caller-pinned conversation is the destination when the send went to its own address.
+// This settles addresses that several current conversations share.
+async function resolvePinnedDestination(
+  params: ConfirmedVisibleMessageParams,
+  agentId: string,
+  storePath: string,
+): Promise<ConfirmedDestination | undefined> {
+  const pinnedKey = params.expectedGeneration?.sessionKey;
+  if (!pinnedKey) {
+    return undefined;
+  }
+  const sessionKey = toAgentStoreSessionKey({
+    agentId,
+    requestKey: pinnedKey,
+    mainKey: params.config.session?.mainKey,
+  });
+  const entry = await readSessionEntryInWorker({
+    sessionKey,
+    storePath,
+    readConsistency: "latest",
+  });
+  const context = deliveryContextFromSession(entry);
+  if (context?.channel !== params.channel) {
+    return undefined;
+  }
+  const pinned = deliveryAddressKey(params.channel, context);
+  const sent = deliveryAddressKey(params.channel, {
+    to: params.to,
+    accountId: params.accountId,
+    threadId: params.threadId ?? undefined,
+  });
+  return pinned && pinned === sent ? { sessionKey } : undefined;
+}
+
+// Normalizes one channel address so separately recorded contexts compare equal.
+function deliveryAddressKey(
+  channel: ChannelId,
+  context: { to?: string; accountId?: string; threadId?: string | number } | undefined,
+): string | undefined {
+  if (!context?.to) {
+    return undefined;
+  }
+  return deliveryContextKey({
+    channel,
+    to: context.to.trim(),
+    accountId: normalizeAccountId(context.accountId),
+    threadId: context.threadId ?? undefined,
+  });
 }
 
 // A destination bound to another agent is not this agent's history to write.

@@ -323,6 +323,47 @@ describe("confirmed visible message ownership", () => {
     });
   });
 
+  it("records a shared address in the conversation the caller pinned", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const { params, storePath } = setup();
+      const delivery = {
+        kind: "external" as const,
+        context: { channel: "telegram", to: "dm:shared" },
+        route: { channel: "telegram", target: { to: "dm:shared" } },
+        origin: { provider: "telegram", to: "dm:shared" },
+      };
+      // Two current conversations bind the same address, so lookup alone is ambiguous.
+      for (const [sessionKey, sessionId] of [
+        ["agent:main:main", "main-session"],
+        ["agent:main:telegram:direct:shared", "requester-session"],
+      ]) {
+        await replaceSessionEntry(
+          { sessionKey, storePath },
+          { sessionId, updatedAt: 1, chatType: "direct", delivery },
+        );
+      }
+      const send = { ...params, route: undefined, to: "dm:shared", threadId: undefined };
+      expect(await commitConfirmedVisibleMessage(send)).toMatchObject({ skipped: true });
+      expect(
+        await commitConfirmedVisibleMessage({
+          ...send,
+          expectedGeneration: {
+            sessionKey: "agent:main:telegram:direct:shared",
+            sessionId: "requester-session",
+          },
+        }),
+      ).toMatchObject({ ok: true });
+      const history = async (sessionKey: string, sessionId: string) =>
+        (await loadTranscriptEvents({ sessionKey, sessionId, storePath }))
+          .map(readTranscriptEventMessage)
+          .filter(Boolean);
+      expect(await history("agent:main:telegram:direct:shared", "requester-session")).toEqual([
+        expect.objectContaining({ content: [{ type: "text", text: "The visible result" }] }),
+      ]);
+      expect(await history("agent:main:main", "main-session")).toEqual([]);
+    });
+  });
+
   it("reports native-only output without inventing conversation text", async () => {
     const { params, storePath } = setup();
     expect(
