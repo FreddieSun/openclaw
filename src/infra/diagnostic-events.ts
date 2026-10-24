@@ -903,7 +903,6 @@ type QueuedDiagnosticEvent = {
 };
 
 type DiagnosticEventsGlobalState = {
-  marker: symbol;
   enabled: boolean;
   seq: number;
   listeners: Map<
@@ -935,7 +934,6 @@ const PRIORITY_ASYNC_DIAGNOSTIC_EVENT_TYPES = new Set<DiagnosticEventPayload["ty
 const diagnosticEventsState = resolveGlobalSingleton<DiagnosticEventsGlobalState>(
   DIAGNOSTIC_EVENTS_STATE_KEY,
   () => ({
-    marker: DIAGNOSTIC_EVENTS_STATE_KEY,
     enabled: true,
     seq: 0,
     listeners: new Map(),

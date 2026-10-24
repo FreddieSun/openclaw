@@ -1,4 +1,3 @@
-import { channel } from "node:diagnostics_channel";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,8 +6,6 @@ import { Worker } from "node:worker_threads";
 import { raceWithTimeout } from "../../packages/retry/src/index.js";
 import { runtimeProcessEntrypoints } from "./runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "./runtime-worker-url.js";
-
-const closeProbe = channel("openclaw.sqlite.close-probe");
 
 type SqliteCloseProbeResult = Readonly<{
   explicitSqliteCloseReleasesNativeResources: boolean;
@@ -55,7 +52,6 @@ export async function probeSqliteNativeClose(): Promise<SqliteCloseProbeResult> 
   try {
     directory = await mkdtemp(join(tmpdir(), "openclaw-sqlite-close-"));
     directory = await realpath(directory);
-    closeProbe.publish({ phase: "start" });
     worker = new Worker(resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.sqliteCloseProbe), {
       workerData: directory,
       execArgv: [],
