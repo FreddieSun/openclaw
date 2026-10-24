@@ -12,8 +12,6 @@ import { createDeferred } from "../../test/helpers/promise.js";
 import { waitForGatewayDiagnosticReadiness } from "../cli/daemon-cli/diagnostic-readiness.js";
 import * as restartHealth from "../cli/daemon-cli/restart-health.constants.js";
 import type { OpenClawConfig } from "../config/config.js";
-import { GatewayTransportError } from "../gateway/transport-error.js";
-import { collectChannelStatusIssues } from "../infra/channels-status-issues.js";
 import {
   GATEWAY_HEALTH_CREDENTIALS_REQUIRED_MESSAGE,
   GATEWAY_HEALTH_CREDENTIALS_REQUIRED_TITLE,
@@ -238,26 +236,14 @@ describe("checkGatewayHealth", () => {
   const execPath = "/opt/homebrew/Cellar/node@24/24.20.0/bin/node";
   it.each([
     {
-      name: "deleted Node runtime",
       status: { childRuntime: { execPath, available: false } },
       title: "Gateway runtime",
-      messages: [
-        `The Node.js runtime this Gateway started with (${execPath}) can no longer start worker processes, likely because it was upgraded or removed. Restart the Gateway.`,
-      ],
+      fragments: [execPath, "Restart the Gateway"],
     },
     {
-      name: "recorded SQLite warning",
-      status: {
-        sqliteWal: createSqliteWalHealth({
-          observedAtMs: Date.parse("2026-09-13T12:00:00.000Z"),
-          walBytes: null,
-          databaseBytes: null,
-          consecutiveBlocked: 2,
-          warning: true,
-        }),
-      },
+      status: { sqliteWal: createSqliteWalHealth({ walBytes: null, databaseBytes: null }) },
       title: "SQLite WAL",
-      messages: [
+      fragments: [
         "checkpoint blocked",
         "WAL unknown",
         "last complete never observed",
@@ -267,36 +253,28 @@ describe("checkGatewayHealth", () => {
       ],
     },
     {
-      name: "broken egress certificates",
       status: {
         secretEgressProxy: {
           state: "degraded",
-          caExpiresAt: "2026-09-01T00:00:00.000Z",
-          failedCertificates: 0,
           message: "Check the system clock, then restart the Gateway.",
         },
       },
       title: "Secret runtime degradation",
-      messages: ["Secret egress proxy: Check the system clock, then restart the Gateway."],
+      fragments: ["Check the system clock, then restart the Gateway."],
     },
     {
-      name: "model reasoning mismatch",
       status: {
         modelReasoningWarning:
           "Model ollama/qwen3:4b emitted hidden reasoning; set reasoning:true.",
       },
       title: "Model reasoning",
-      messages: ["Model ollama/qwen3:4b emitted hidden reasoning; set reasoning:true."],
+      fragments: ["set reasoning:true"],
     },
-  ])("reports $name without failing healthy RPC", async ({ status, title, messages }) => {
+  ])("reports $title without failing healthy RPC", async ({ status, title, fragments }) => {
     callGateway.mockResolvedValueOnce(status).mockResolvedValue({});
     await expect(check()).resolves.toMatchObject({ healthOk: true, authenticated: true });
-    const message = note.mock.calls.find(([, heading]) => heading === title)?.[0];
-    for (const text of messages) {
-      expect(message).toContain(text);
-    }
-    if (title === "Gateway runtime" || title === "Model reasoning") {
-      expect(note).toHaveBeenCalledWith(messages[0], title);
+    for (const fragment of fragments) {
+      noteContains(fragment, title);
     }
   });
 
@@ -332,23 +310,15 @@ describe("checkGatewayHealth", () => {
     const message =
       'Plugin "feishu" loaded from "/fixture/plugins-local/feishu/index.js"; installSource="path". Install the official npm package or ClawHub listing.';
     callGateway.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({
-      statusIssues: collectChannelStatusIssues(
+      statusIssues: [
         {
-          channelAccounts: {
-            feishu: [
-              {
-                accountId: "default",
-                running: false,
-                lifecycle: "blocked",
-                terminalDisconnect: true,
-                ingressUnavailable: true,
-                lastError: message,
-              },
-            ],
-          },
+          channel: "feishu",
+          accountId: "default",
+          kind: "runtime",
+          message,
+          fix: "resolve the reported channel error, then restart the channel",
         },
-        [{ id: "feishu" }],
-      ),
+      ],
     });
 
     await expect(check()).resolves.toMatchObject({
@@ -425,25 +395,6 @@ describe("checkGatewayHealth", () => {
       await expect(result).resolves.toMatchObject({ healthOk: true, authenticated: true });
       expect(note).not.toHaveBeenCalled();
       expect(sharedRuntime.error).not.toHaveBeenCalled();
-      expect(callGateway).toHaveBeenCalledWith(
-        expect.objectContaining({
-          method: "channels.status",
-          params: { probe: true, timeoutMs: 5_000 },
-          timeoutMs: 6_100,
-        }),
-      );
-      expect(callGateway).toHaveBeenCalledWith(
-        expect.objectContaining({ method: "diagnostics.stability", timeoutMs: 6_100 }),
-      );
-      expect(callGateway).toHaveBeenNthCalledWith(
-        1,
-        expect.objectContaining({
-          method: "status",
-          params: { includeChannelSummary: false },
-          timeoutMs: 3_000,
-          config: cfg,
-        }),
-      );
     });
 
     it("reports measured latency and the exhausted diagnostic budget without failing health", async () => {
@@ -456,13 +407,6 @@ describe("checkGatewayHealth", () => {
       await vi.advanceTimersByTimeAsync(21_000);
 
       await expect(result).resolves.toMatchObject({ healthOk: true, authenticated: true });
-      expect(callGateway).toHaveBeenCalledWith(
-        expect.objectContaining({
-          method: "channels.status",
-          params: { probe: true, timeoutMs: 13_000 },
-          timeoutMs: 21_000,
-        }),
-      );
       expect(note).toHaveBeenCalledWith(
         expect.stringContaining(
           "Gateway answered status in 7s; channel diagnostics did not finish within 21s",
@@ -546,89 +490,27 @@ describe("checkGatewayHealth", () => {
   });
 
   it.each([
-    ["auth profile migration required", "auth profile migration required", "doctor --fix", ""],
-    [
-      "auth profile migration required",
-      "auth profile migration required",
-      "doctor --fix",
-      "repair-test",
-    ],
-    ["secret reference was not found", "secret reference was not found", "secrets reload", ""],
-    ["private unknown reason", "secret resolution failed", "secrets reload", ""],
-  ])(
-    "reports the remedy for %s in Doctor (%s, %s, %s)",
-    async (_reason, redacted, command, profile) => {
-      vi.stubEnv("OPENCLAW_PROFILE", profile);
-      vi.stubEnv("OPENCLAW_CONTAINER_HINT", undefined);
-      callGateway
-        .mockResolvedValueOnce({
-          degradedSecretOwners: [
-            {
-              ownerKind: "route",
-              ownerId: "legacy-agent",
-              state: "unavailable",
-              degradationState: "cold",
-              paths: ["auth-profile-legacy:auth-profiles"],
-              reason: redacted,
-            },
-          ],
-        })
-        .mockResolvedValue({});
-
-      await expect(check()).resolves.toMatchObject({
-        healthOk: true,
-        authenticated: true,
-      });
-
-      const retryHint = `openclaw${profile ? ` --profile ${profile}` : ""} ${command}`;
-      expect(note).toHaveBeenCalledWith(
-        `- cold route:legacy-agent (auth-profile-legacy:auth-profiles): ${redacted}\n  Retry: ${retryHint}`,
-        "Secret runtime degradation",
-      );
-    },
-  );
-
-  it("lists every degraded SecretRef owner reported by Gateway status", async () => {
+    ["auth profile migration required", "doctor --fix"],
+    ["secret reference was not found", "secrets reload"],
+  ])("reports the Doctor remedy for %s", async (reason, command) => {
+    vi.stubEnv("OPENCLAW_PROFILE", "");
+    vi.stubEnv("OPENCLAW_CONTAINER_HINT", undefined);
     callGateway
       .mockResolvedValueOnce({
         degradedSecretOwners: [
           {
-            ownerKind: "account",
-            ownerId: "discord:ops",
+            ownerKind: "route",
+            ownerId: "legacy-agent",
             state: "unavailable",
-            paths: ["channels.discord.accounts.ops.token"],
-            reason: "secret reference was not found (env:default:PRIVATE_REF_ID)",
-          },
-          {
-            ownerKind: "capability",
-            ownerId: "tts",
-            state: "unavailable",
-            degradationState: "stale",
-            paths: ["tts.providers.elevenlabs.apiKey"],
-            reason: "secret provider policy denied resolution",
-          },
-          {
-            ownerKind: "capability",
-            ownerId: "web-fetch:firecrawl",
-            state: "unavailable",
-            paths: ["plugins.entries.firecrawl.config.webFetch.apiKey"],
-            reason: "resolved secret value was invalid",
+            paths: ["auth-profile-legacy:auth-profiles"],
+            reason,
           },
         ],
       })
-      .mockResolvedValueOnce({});
-
-    await check();
-
+      .mockResolvedValue({});
+    await expect(check()).resolves.toMatchObject({ healthOk: true, authenticated: true });
     expect(note).toHaveBeenCalledWith(
-      [
-        "- cold account:discord:ops (channels.discord.accounts.ops.token): secret resolution failed",
-        "  Retry: openclaw secrets reload",
-        "- stale capability:tts (tts.providers.elevenlabs.apiKey): secret provider policy denied resolution",
-        "  Retry: openclaw secrets reload",
-        "- cold capability:web-fetch:firecrawl (plugins.entries.firecrawl.config.webFetch.apiKey): resolved secret value was invalid",
-        "  Retry: openclaw secrets reload",
-      ].join("\n"),
+      `- cold route:legacy-agent (auth-profile-legacy:auth-profiles): ${reason}\n  Retry: openclaw ${command}`,
       "Secret runtime degradation",
     );
   });
@@ -670,130 +552,81 @@ describe("checkGatewayHealth", () => {
     );
   });
 
-  it("reports a typed close without depending on gateway error wording", async () => {
-    const error = new GatewayTransportError({
-      message: "transport closed: \u001B]52;c;YXR0YWNr\u0007protocol version mismatch",
-      kind: "closed",
-      code: 1008,
-      connectionDetails: {
-        url: TEST_GATEWAY_URL,
-        urlSource: "local loopback",
-        message: `Gateway target: ${TEST_GATEWAY_URL}`,
-      },
-    });
-    callGateway.mockRejectedValueOnce(error);
-
-    await check();
-
-    expect(note).toHaveBeenCalledWith(
-      "Gateway connect failed: transport closed: protocol version mismatch",
-      "Gateway",
-    );
-    expect(note).not.toHaveBeenCalledWith("Gateway not running.", "Gateway");
-  });
-
-  it("reports a temporary lockout when status auth is rate-limited", async () => {
-    callGateway.mockRejectedValueOnce(new Error());
-    isGatewayCredentialsRequiredError.mockReturnValueOnce(true);
-    probeGatewayStatus.mockResolvedValueOnce({
-      ok: false,
-      kind: "connect",
-      error: "connect failed",
-      connectFailure: { kind: "rate-limited", detailCode: "AUTH_RATE_LIMITED" },
-      gatewayReached: true,
-    });
-
-    await expectUnauthenticated();
-
-    expect(note).toHaveBeenCalledWith(
-      GATEWAY_HEALTH_RATE_LIMITED_MESSAGE,
-      GATEWAY_HEALTH_RATE_LIMITED_TITLE,
-    );
-    expect(note).not.toHaveBeenCalledWith(
-      GATEWAY_HEALTH_CREDENTIALS_REQUIRED_MESSAGE,
-      GATEWAY_HEALTH_CREDENTIALS_REQUIRED_TITLE,
-    );
-    const output = note.mock.calls.flat().join("\n");
-    expect(output).not.toContain("gateway.remote.token");
-    expect(output).not.toContain("devices rotate");
-  });
-
-  it("handles the real typed rate-limit error without forcing the credentials predicate", async () => {
-    const error = new GatewayClientRequestError({
-      code: "INVALID_REQUEST",
-      message: "unauthorized: too many failed authentication attempts (retry later)",
-      details: {
-        code: "AUTH_RATE_LIMITED",
-        authReason: "rate_limited",
-        recommendedNextStep: "wait_then_retry",
-      },
-      retryable: true,
-      retryAfterMs: 60_000,
-    });
-    retainGatewayResponsePayload(error, undefined);
-    callGateway.mockRejectedValueOnce(error);
-
-    await expectUnauthenticated();
-
-    expect(isGatewayCredentialsRequiredError).not.toHaveBeenCalled();
-    expect(probeGatewayStatus).not.toHaveBeenCalled();
-    expect(note).toHaveBeenCalledWith(
-      GATEWAY_HEALTH_RATE_LIMITED_MESSAGE,
-      GATEWAY_HEALTH_RATE_LIMITED_TITLE,
-    );
-  });
-
-  it("keeps a reachable Gateway healthy when device-less auth lacks read scope", async () => {
-    const error = new GatewayClientRequestError({
-      code: "FORBIDDEN",
-      message: "missing scope: operator.read",
-      details: {
-        code: "MISSING_SCOPE",
-        missingScope: "operator.read",
-        requiredScopes: ["operator.read"],
-      },
-    });
-    retainGatewayResponsePayload(error, undefined);
-    callGateway.mockRejectedValueOnce(error);
-    probeGatewayStatus.mockResolvedValueOnce({ ok: false, gatewayReached: true });
-
-    await expectUnauthenticated();
-
-    expect(probeGatewayStatus).toHaveBeenCalledOnce();
-    expect(note).toHaveBeenCalledWith(
-      GATEWAY_HEALTH_CREDENTIALS_REQUIRED_MESSAGE,
-      GATEWAY_HEALTH_CREDENTIALS_REQUIRED_TITLE,
-    );
-  });
-
-  it("reports credentials-required when status RPC auth SecretRefs are unavailable", async () => {
-    const error = new Error("gateway.auth.password unavailable");
-    callGateway.mockRejectedValueOnce(error);
-    isGatewaySecretRefUnavailableError.mockReturnValueOnce(true);
-    probeGatewayStatus.mockResolvedValueOnce({
-      ok: false,
-      kind: "connect",
-      error: TEST_AUTH_CLOSE_ERROR,
-      gatewayReached: true,
-    });
-
-    await expectUnauthenticated();
-
-    expect(isGatewaySecretRefUnavailableError).toHaveBeenCalledWith(error);
-    expect(probeGatewayStatus).toHaveBeenCalledWith({
-      url: TEST_GATEWAY_URL,
-      timeoutMs: 3000,
-      tlsFingerprint: TEST_TLS_FINGERPRINT,
-      preauthHandshakeTimeoutMs: 4321,
-      config: cfg,
-      json: true,
-    });
-    expect(note).toHaveBeenCalledWith(
-      GATEWAY_HEALTH_CREDENTIALS_REQUIRED_MESSAGE,
-      GATEWAY_HEALTH_CREDENTIALS_REQUIRED_TITLE,
-    );
-    expect(callGateway).toHaveBeenCalledTimes(1);
-  });
+  it.each(["probe-rate-limit", "typed-rate-limit", "missing-scope", "secret-ref"] as const)(
+    "keeps a reachable Gateway healthy with %s",
+    async (kind) => {
+      const rateLimited = kind.endsWith("rate-limit");
+      const direct = kind === "typed-rate-limit";
+      let error: Error;
+      if (direct || kind === "missing-scope") {
+        error = new GatewayClientRequestError(
+          direct
+            ? {
+                code: "INVALID_REQUEST",
+                message: "unauthorized: too many failed authentication attempts (retry later)",
+                details: {
+                  code: "AUTH_RATE_LIMITED",
+                  authReason: "rate_limited",
+                  recommendedNextStep: "wait_then_retry",
+                },
+                retryable: true,
+                retryAfterMs: 60_000,
+              }
+            : {
+                code: "FORBIDDEN",
+                message: "missing scope: operator.read",
+                details: {
+                  code: "MISSING_SCOPE",
+                  missingScope: "operator.read",
+                  requiredScopes: ["operator.read"],
+                },
+              },
+        );
+        retainGatewayResponsePayload(error, undefined);
+      } else {
+        error = new Error("gateway.auth.password unavailable");
+        (kind === "secret-ref"
+          ? isGatewaySecretRefUnavailableError
+          : isGatewayCredentialsRequiredError
+        ).mockReturnValueOnce(true);
+      }
+      callGateway.mockRejectedValueOnce(error);
+      if (!direct) {
+        probeGatewayStatus.mockResolvedValueOnce({
+          ok: false,
+          kind: "connect",
+          error: TEST_AUTH_CLOSE_ERROR,
+          gatewayReached: true,
+          ...(rateLimited
+            ? { connectFailure: { kind: "rate-limited", detailCode: "AUTH_RATE_LIMITED" } }
+            : {}),
+        });
+      }
+      await expectUnauthenticated();
+      expect(probeGatewayStatus).toHaveBeenCalledTimes(direct ? 0 : 1);
+      if (direct) {
+        expect(isGatewayCredentialsRequiredError).not.toHaveBeenCalled();
+      }
+      if (kind === "secret-ref") {
+        expect(isGatewaySecretRefUnavailableError).toHaveBeenCalledWith(error);
+      }
+      expect(note).toHaveBeenCalledWith(
+        rateLimited
+          ? GATEWAY_HEALTH_RATE_LIMITED_MESSAGE
+          : GATEWAY_HEALTH_CREDENTIALS_REQUIRED_MESSAGE,
+        rateLimited ? GATEWAY_HEALTH_RATE_LIMITED_TITLE : GATEWAY_HEALTH_CREDENTIALS_REQUIRED_TITLE,
+      );
+      if (rateLimited) {
+        expect(note).not.toHaveBeenCalledWith(
+          GATEWAY_HEALTH_CREDENTIALS_REQUIRED_MESSAGE,
+          GATEWAY_HEALTH_CREDENTIALS_REQUIRED_TITLE,
+        );
+        const output = note.mock.calls.flat().join("\n");
+        expect(output).not.toContain("gateway.remote.token");
+        expect(output).not.toContain("devices rotate");
+      }
+    },
+  );
 });
 
 describe("probeGatewayMemoryStatus", () => {

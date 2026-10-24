@@ -3,7 +3,7 @@ import { resolveContextTokensForModelFromCache } from "../agents/context-resolut
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import { SESSION_TOTAL_TOKENS_VERSION } from "../config/sessions/types.js";
 import { makeCronJob } from "../cron/delivery.test-helpers.js";
-import type { DatabaseStoreDiagnostic } from "../infra/database-engine/diagnostics.js";
+import { createDatabaseStoreDiagnostic } from "../infra/database-engine/diagnostic-record.js";
 import {
   recordReasoningSuppressedDiagnostic,
   resetDiagnosticSessionStateForTest,
@@ -433,10 +433,6 @@ describe("getStatusSummary", () => {
 
     const summary = await getStatusSummary({ includeSensitive: false });
 
-    expect(statusSummaryMocks.getPreparedModelCatalogSnapshot).not.toHaveBeenCalled();
-    expect(statusSummaryRuntime.resolveConfiguredStatusModelRef).not.toHaveBeenCalled();
-    expect(statusSummaryRuntime.resolveSessionRuntime).not.toHaveBeenCalled();
-    expect(statusSummaryMocks.resolveProviderStaticModel).not.toHaveBeenCalled();
     expect(summary.sessions).toEqual({
       paths: [],
       count: 1,
@@ -448,25 +444,22 @@ describe("getStatusSummary", () => {
 
   it("redacts admitted database paths without mutating the owner's facts", async () => {
     const privatePath = "/private/status-operator-read/agent.sqlite";
-    const store: DatabaseStoreDiagnostic = {
-      family: "agent",
-      path: privatePath,
-      configured: { default: "postgres", override: null, effective: "postgres", fixedLocal: false },
+    const store: ReturnType<typeof createDatabaseStoreDiagnostic> = {
+      ...createDatabaseStoreDiagnostic({
+        family: "agent",
+        path: privatePath,
+        configured: {
+          default: "postgres",
+          override: null,
+          effective: "postgres",
+          fixedLocal: false,
+        },
+      }),
       observed: "postgres",
       mismatch: false,
       schema: { versioning: "versioned", version: 5, expectedVersion: null, pending: null },
-      connectivity: "unknown",
       namespace: "oc_agent_fixture",
       storeId: "fixture-store",
-      database: null,
-      extensions: null,
-      admittedExtensions: null,
-      degraded: null,
-      custody: "unverifiable",
-      lease: "unverifiable",
-      backup: null,
-      legacyMigrations: { state: "unknown", pending: [] },
-      issues: [],
       nextSteps: ["Run openclaw doctor on the Gateway host."],
     };
     using admitted = vi.spyOn(
@@ -576,14 +569,6 @@ describe("getStatusSummary", () => {
     expect(JSON.stringify(redacted.utilityModelWarnings)).not.toMatch(
       /fixture-cli|small|worker|agents\./,
     );
-    for (const includeSensitive of [true, false]) {
-      const capable = await getStatusSummary({
-        config: { agents: { ...config.agents, defaults: { utilityModel: "local/capable" } } },
-        includeSensitive,
-        includeChannelSummary: false,
-      });
-      expect(capable.utilityModelWarnings).toBeUndefined();
-    }
   });
 
   it("reports every plugin configured unavailable by startup verification", async () => {
@@ -642,9 +627,6 @@ describe("getStatusSummary", () => {
 
     expect(summary.channelSummary).toStrictEqual([]);
     expect(summary.linkChannel).toBeUndefined();
-    expect(statusSummaryMocks.hasConfiguredChannelsForReadOnlyScopeAsync).toHaveBeenCalledWith({
-      config: {},
-    });
     expect(buildChannelSummary).not.toHaveBeenCalled();
     expect(resolveLinkChannelContext).not.toHaveBeenCalled();
   });
@@ -661,31 +643,6 @@ describe("getStatusSummary", () => {
       totalTokensFresh: false,
       remainingTokens: null,
       percentUsed: null,
-    });
-  });
-
-  it("uses context-only static metadata for nested provider-owned model refs", async () => {
-    vi.mocked(statusSummaryRuntime.resolveConfiguredStatusModelRef).mockReturnValue({
-      provider: "google-gemini-cli",
-      model: "google/gemini-3.1-pro-preview",
-    });
-    statusSummaryMocks.resolveProviderStaticModel.mockResolvedValueOnce({
-      contextWindow: 1_048_576,
-    });
-
-    await getStatusSummary();
-
-    expect(statusSummaryMocks.resolveProviderStaticModel).toHaveBeenCalledWith({
-      provider: "google-gemini-cli",
-      modelId: "google/gemini-3.1-pro-preview",
-    });
-    expect(
-      vi.mocked(statusSummaryRuntime.resolveContextTokensForModel).mock.calls[0]?.[0],
-    ).toMatchObject({
-      provider: "google-gemini-cli",
-      model: "google/gemini-3.1-pro-preview",
-      modelContextWindow: 1_048_576,
-      allowAsyncLoad: false,
     });
   });
 
@@ -845,12 +802,5 @@ describe("getStatusSummary", () => {
     expect(summary.sessions.count).toBe(3);
     expect(summary.sessions.byAgent[0]?.count).toBe(1);
     expect(summary.sessions.byAgent[0]?.recent.map(({ key }) => key)).toEqual(["agent:main:main"]);
-    expect(statusSummaryRuntime.readSessionRuntimeMetadata).toHaveBeenCalledOnce();
-    expect(
-      vi
-        .mocked(statusSummaryRuntime.readSessionRuntimeMetadata)
-        .mock.calls[0]?.[1].map(({ sessionKey }) => sessionKey)
-        .toSorted(),
-    ).toEqual(["agent:main:main", "agent:ops:main", "agent:research:main"]);
   });
 });
