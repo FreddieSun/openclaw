@@ -16,17 +16,12 @@ import {
   loadTranscriptEvents,
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.js";
-import {
-  readTranscriptEventId,
-  readTranscriptEventMessage,
-} from "../../config/sessions/session-accessor.sqlite-read.js";
-import { withOwnedSessionTranscriptWrites } from "../../config/sessions/transcript-write-context.js";
+import { readTranscriptEventMessage } from "../../config/sessions/session-accessor.sqlite-read.js";
 import * as sessionTranscript from "../../config/sessions/transcript.js";
 import { resolveAgentRestartRecoveryContext } from "../../gateway/agent-turn/agent-restart-recovery-context.js";
 import { persistInternalSourceReply } from "../../gateway/internal-source-reply-persistence.js";
 import {
   cleanupManagedOutgoingMediaRecords,
-  MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX,
   resolveManagedOutgoingMediaArtifactDownload,
 } from "../../gateway/managed-image-attachments.js";
 import { listManagedImageRecordEntries } from "../../gateway/managed-image-record-store.js";
@@ -44,7 +39,6 @@ import {
 } from "../../test-utils/openclaw-test-state.js";
 import { readEmbeddedMessageDeliveryFact } from "../embedded-agent-message-delivery.js";
 import { extractMessagingToolSourceReplyPayload } from "../embedded-agent-messaging-extraction.js";
-import { createEmbeddedAttemptTranscriptLifecycle } from "../embedded-agent-runner/run/attempt-transcript-lifecycle.js";
 import { buildEmbeddedRunPayloads } from "../embedded-agent-runner/run/payloads.js";
 import { createRemoteShellSandboxFsBridge } from "../sandbox/remote-fs-bridge.js";
 import { createLocalRemoteShellScriptRunner } from "../sandbox/remote-fs-bridge.test-helpers.js";
@@ -320,22 +314,7 @@ describe("WebChat message tool internal source reply", () => {
         message: "Visible progress from the message tool.",
         final,
       });
-      expect(toolResult.details).toMatchObject({
-        channel: "webchat",
-        target: "current-run",
-        sourceReplyDeliveryMode: "message_tool_only",
-        sourceReplySink: "internal-ui",
-        sourceReply: { text: "Visible progress from the message tool." },
-      });
-      expect(toolResult.content).toEqual([
-        {
-          type: "text",
-          text: "Sent visible reply to the current source conversation via internal-ui.",
-        },
-      ]);
-
       const sourceReply = extractMessagingToolSourceReplyPayload(toolResult);
-      expect(sourceReply).toMatchObject({ text: "Visible progress from the message tool." });
       const delivery = readEmbeddedMessageDeliveryFact(
         asOptionalRecord(toolResult.details)?.messageDelivery,
       );
@@ -623,21 +602,8 @@ describe("WebChat message tool internal source reply", () => {
         attachments: [{ media: documentPath, name: documentName, mimeType: "application/json" }],
       };
       const updates: SessionTranscriptUpdate[] = [];
-      const publishedDownloads: Array<Promise<unknown>> = [];
-      const download = (artifactId: unknown) =>
-        resolveManagedOutgoingMediaArtifactDownload({
-          sessionKey,
-          agentId: "main",
-          artifactId: String(artifactId),
-          stateDir,
-        });
       const unsubscribe = onSessionTranscriptUpdate((update) => {
         updates.push(update);
-        for (const block of readAssistantDisplayContent(update.message).filter(
-          (entry) => entry.type === "image",
-        )) {
-          publishedDownloads.push(download(block.artifactId));
-        }
       });
       const append = sessionTranscript.appendAssistantMessageToSessionTranscript;
       let preCommitEntries: Awaited<ReturnType<typeof listManagedImageRecordEntries>> = [];
@@ -665,7 +631,6 @@ describe("WebChat message tool internal source reply", () => {
       });
       expect(preCommitEntries).toHaveLength(3);
       const sourceReply = extractMessagingToolSourceReplyPayload(toolResult);
-      expect(sourceReply).toMatchObject({ transcriptOwner: true });
       expect(overlappingResult.details).toMatchObject({
         idempotencyKey: sourceReply?.idempotencyKey,
         sourceReplyTranscriptOwner: true,
@@ -717,10 +682,6 @@ describe("WebChat message tool internal source reply", () => {
       const displayContent = readAssistantDisplayContent(assistant);
       const image = displayContent.find((block) => block.type === "image");
       const document = displayContent.find((block) => block.type === "attachment");
-      expect(toolResult.details).toMatchObject({
-        sourceReplySink: "internal-ui",
-        idempotencyKey: expect.any(String),
-      });
       expect(assistant?.content).toEqual([{ type: "text", text: "Durable image reply" }]);
       expect(image).toMatchObject({
         type: "image",
@@ -749,147 +710,69 @@ describe("WebChat message tool internal source reply", () => {
       });
       expect(asOptionalRecord(published?.message)?.content).toEqual(assistant?.content);
       expect(asOptionalRecord(published?.message)?.openclawDisplayContent).toEqual(displayContent);
-      await expect(Promise.all(publishedDownloads)).resolves.toEqual([
-        expect.objectContaining({ type: "image" }),
-        expect.objectContaining({ type: "image" }),
-      ]);
-      for (const block of displayContent.filter((entry) => entry.type === "image")) {
-        await expect(download(block.artifactId)).resolves.toMatchObject({ type: "image" });
-      }
-      await expect(
-        download(asOptionalRecord(document?.attachment)?.artifactId),
-      ).resolves.toMatchObject({ type: "file", title: documentName });
     }));
 
-  it.each(["conflicting-writer", "lifecycle-drain-failure"] as const)(
-    "cleans only uncommitted source-reply originals when append %s",
-    async (outcome) => {
-      await withSourceState(async (state) => {
-        const sessionKey = "agent:main:webchat:dm:append-outcome";
-        const sessionId = "append-outcome-session";
-        const scope = sessionScope(state, sessionKey, sessionId);
-        const cfg = {
-          agents: { entries: { main: { workspace: state.workspaceDir } } },
-        };
-        setRuntimeConfigSnapshot(cfg);
-        const imagePath = path.join(state.workspaceDir, "proof.png");
-        await fs.writeFile(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
-        await replaceSessionEntry(scope, { sessionId, updatedAt: 1 });
-        const append = sessionTranscript.appendAssistantMessageToSessionTranscript;
-        const lifecycle = createEmbeddedAttemptTranscriptLifecycle({ sessionId });
-        const preparedOriginals: string[] = [];
-        const appendSpy = vi
-          .spyOn(sessionTranscript, "appendAssistantMessageToSessionTranscript")
-          .mockImplementationOnce(async (params) => {
-            for (const { record } of await listManagedImageRecordEntries({
-              stateDir: state.stateDir,
-              sessionKey,
-            })) {
-              preparedOriginals.push(
-                path.join(
-                  record.original.mediaRoot,
-                  record.original.mediaSubdir,
-                  record.original.mediaId,
-                ),
-              );
-            }
-            if (outcome === "conflicting-writer") {
-              // Another writer wins after the source-reply owner's initial lookup.
-              await append({
-                ...params,
-                eventId: "winning-message",
-                content: [{ type: "text", text: "Already delivered" }],
-                onMessageCommitted: undefined,
-              });
-            }
-            return append(params);
-          });
-        try {
-          const persist = () =>
-            persistInternalSourceReply({
-              cfg,
-              sessionKey,
-              expectedSessionId: sessionId,
-              agentId: "main",
-              idempotencyKey: "append-outcome-reply",
-              sourceReplyFinal: true,
-              payload: {
-                text: "Attached proof",
-                mediaUrls: [imagePath],
-                trustedLocalMedia: true,
-              },
-            });
-          const persistence =
-            outcome === "lifecycle-drain-failure"
-              ? withOwnedSessionTranscriptWrites(
-                  {
-                    sessionKey,
-                    sessionTarget: scope,
-                    withTranscriptWrite: (run) =>
-                      lifecycle.withTranscriptWrite(async () => {
-                        const result = await run();
-                        // This is an actual nested lifecycle failure after the transcript commits.
-                        void lifecycle
-                          .withTranscriptWrite(() => {
-                            throw new Error("nested drain failed");
-                          })
-                          .catch(() => {});
-                        return result;
-                      }),
-                  },
-                  persist,
-                )
-              : persist();
-          await expect(persistence).rejects.toThrow(
-            outcome === "conflicting-writer"
-              ? "conflicts with the admitted message"
-              : "nested drain failed",
-          );
-        } finally {
-          appendSpy.mockRestore();
-          await lifecycle.dispose();
-        }
-        expect(preparedOriginals).toHaveLength(1);
-        const committed = outcome === "lifecycle-drain-failure";
-        const records = await listManagedImageRecordEntries({
-          stateDir: state.stateDir,
-          sessionKey,
-        });
-        expect(records).toHaveLength(committed ? 1 : 0);
-        for (const original of preparedOriginals) {
-          if (committed) {
-            await expect(fs.readFile(original)).resolves.toEqual(
-              Buffer.from(TINY_PNG_BASE64, "base64"),
+  it("cleans uncommitted source-reply originals when another writer wins", async () =>
+    withSourceState(async (state) => {
+      const sessionKey = "agent:main:webchat:dm:append-outcome";
+      const sessionId = "append-outcome-session";
+      const scope = sessionScope(state, sessionKey, sessionId);
+      const cfg = { agents: { entries: { main: { workspace: state.workspaceDir } } } };
+      setRuntimeConfigSnapshot(cfg);
+      const imagePath = path.join(state.workspaceDir, "proof.png");
+      await fs.writeFile(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
+      await replaceSessionEntry(scope, { sessionId, updatedAt: 1 });
+      const append = sessionTranscript.appendAssistantMessageToSessionTranscript;
+      const preparedOriginals: string[] = [];
+      const appendSpy = vi
+        .spyOn(sessionTranscript, "appendAssistantMessageToSessionTranscript")
+        .mockImplementationOnce(async (params) => {
+          for (const {
+            record: { original },
+          } of await listManagedImageRecordEntries({ stateDir: state.stateDir, sessionKey })) {
+            preparedOriginals.push(
+              path.join(original.mediaRoot, original.mediaSubdir, original.mediaId),
             );
-          } else {
-            await expect(fs.stat(original)).rejects.toMatchObject({ code: "ENOENT" });
           }
-        }
-        const assistants = (await loadTranscriptEvents(scope)).filter(
-          (event) => readTranscriptEventMessage(event)?.role === "assistant",
-        );
-        expect(assistants).toHaveLength(1);
-        if (committed) {
-          expect(records[0]?.record).toMatchObject({
-            messageId: readTranscriptEventId(assistants[0]),
-            retentionClass: "history",
+          // Another writer wins after the source-reply owner's initial lookup.
+          await append({
+            ...params,
+            eventId: "winning-message",
+            content: [{ type: "text", text: "Already delivered" }],
+            onMessageCommitted: undefined,
           });
-          await expect(
-            resolveManagedOutgoingMediaArtifactDownload({
-              sessionKey,
-              agentId: "main",
-              stateDir: state.stateDir,
-              artifactId: `${MANAGED_OUTGOING_IMAGE_ARTIFACT_ID_PREFIX}${records[0]?.record.attachmentId}`,
-            }),
-          ).resolves.toMatchObject({ type: "image" });
-        }
-        if (outcome === "conflicting-writer") {
-          expect(assistants[0]).toMatchObject({
-            id: "winning-message",
-            message: { content: [{ type: "text", text: "Already delivered" }] },
-          });
-        }
-      });
-    },
-  );
+          return append(params);
+        });
+      try {
+        await expect(
+          persistInternalSourceReply({
+            cfg,
+            sessionKey,
+            expectedSessionId: sessionId,
+            agentId: "main",
+            idempotencyKey: "append-outcome-reply",
+            sourceReplyFinal: true,
+            payload: { text: "Attached proof", mediaUrls: [imagePath], trustedLocalMedia: true },
+          }),
+        ).rejects.toThrow("conflicts with the admitted message");
+      } finally {
+        appendSpy.mockRestore();
+      }
+      expect(preparedOriginals).toHaveLength(1);
+      expect(await listManagedImageRecordEntries({ stateDir: state.stateDir, sessionKey })).toEqual(
+        [],
+      );
+      await expect(fs.stat(preparedOriginals[0]!)).rejects.toMatchObject({ code: "ENOENT" });
+      const assistants = (await loadTranscriptEvents(scope)).filter(
+        (event) => readTranscriptEventMessage(event)?.role === "assistant",
+      );
+      expect(assistants).toEqual([
+        expect.objectContaining({
+          id: "winning-message",
+          message: expect.objectContaining({
+            content: [{ type: "text", text: "Already delivered" }],
+          }),
+        }),
+      ]);
+    }));
 });

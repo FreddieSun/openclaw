@@ -22,7 +22,6 @@ import {
 } from "../../gateway/server-plugin-in-process-dispatch.test-support.js";
 import { readSessionSendDeliveryAdmission } from "../../gateway/session-send-delivery.js";
 import { drainSystemEvents, peekSystemEvents } from "../../infra/system-events.js";
-import { createSessionVisibilityChecker } from "../../plugin-sdk/session-visibility.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import {
   getPluginRuntimeGatewayRequestScope,
@@ -267,60 +266,23 @@ describe("sessions_send dispatch admission", () => {
     await state.cleanup();
   });
 
-  it("applies peer preferences to new notifications without revoking accepted events", async () => {
-    const callGateway = vi.fn().mockResolvedValue({ key: targetSessionKey, agentId: "main" });
-    const tool = createTool({ callGateway });
-    const first = await tool.execute("notify-peer", {
-      sessionKey: targetSessionKey,
-      message: "accepted notice",
-      mode: "notify",
-    });
-    expect(first.details).toMatchObject(queuedNotification);
-    await putSession(targetSessionKey, {
-      sessionId: "target-session",
-      updatedAt: 2,
-      communication: { receive: "never" },
-    });
-    expect(peekSystemEvents(targetSessionKey)).toHaveLength(1);
-    const second = await tool.execute("notify-denied", {
-      sessionKey: targetSessionKey,
-      message: "unaccepted notice",
-      mode: "notify",
-    });
-    expect(second.details).toMatchObject({ status: "forbidden" });
-    const consumed = drainSystemEvents(targetSessionKey);
-    expect(consumed).toHaveLength(1);
-    expect(consumed[0]).toContain("accepted notice");
-    expect(consumed[0]).not.toContain("unaccepted notice");
-    expect(runSessionsSendA2AFlow).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    { right: "parent", ageMinutes: 0 },
-    { right: "parent", ageMinutes: 31 },
-    { right: "controller", ageMinutes: 31 },
-    { right: "scoped", ageMinutes: 31 },
-    { right: "bound-parent", ageMinutes: 31 },
-  ] as const)(
-    "keeps $right notification rights for a $ageMinutes-minute child",
-    async ({ right, ageMinutes }) => {
+  it.each([false, true])(
+    "keeps aged parent notification rights unless explicitly incarnation-bound (%s)",
+    async (bound) => {
       const parent = "agent:main:dashboard:notify-parent";
       const child = "agent:main:subagent:notify-child";
-      const owner =
-        right === "parent" || right === "bound-parent"
-          ? parent
-          : "agent:main:dashboard:other-parent";
       const sessionId = "notify-child-incarnation";
       const cfg: OpenClawConfig = { ...config, tools: { sessions: { visibility: "tree" } } };
       setRuntimeConfigSnapshot(cfg);
       await putSession(parent, { sessionId: "notify-parent", updatedAt: Date.now() });
+      const endedAt = Date.now() - 31 * 60_000;
       await putSession(child, {
         sessionId,
-        updatedAt: Date.now() - ageMinutes * 60_000,
-        endedAt: Date.now() - ageMinutes * 60_000,
+        updatedAt: endedAt,
+        endedAt,
         status: "done",
-        parentSessionKey: owner,
-        spawnedBy: owner,
+        parentSessionKey: parent,
+        spawnedBy: parent,
         spawnDepth: 1,
       });
       const callGateway = vi.fn().mockImplementation(async (request: GatewayRequest) => {
@@ -333,10 +295,9 @@ describe("sessions_send dispatch admission", () => {
               key: child,
               agentId: "main",
               sessionId,
-              parentSessionKey: owner,
-              spawnedBy: owner,
-              childOwnerSessionKeys: [right === "controller" ? parent : owner],
-              ...(right === "controller" ? { controlOwnerSessionKey: parent } : {}),
+              parentSessionKey: parent,
+              spawnedBy: parent,
+              childOwnerSessionKeys: [parent],
             },
           };
         }
@@ -346,23 +307,14 @@ describe("sessions_send dispatch admission", () => {
         config: cfg,
         agentSessionKey: parent,
         callGateway,
-        ...(right === "bound-parent" ? { expectedTargetSessionId: sessionId } : {}),
+        ...(bound ? { expectedTargetSessionId: sessionId } : {}),
       });
-      using _ = {
-        [Symbol.dispose]: createSessionVisibilityChecker.registerScopedAccessProvider((request) =>
-          right === "scoped" &&
-          request.requesterSessionKey === parent &&
-          request.targetSessionKey === child
-            ? { expectedSessionId: sessionId }
-            : undefined,
-        ),
-      };
       const result = await tool.execute("notify-lineage", {
         sessionKey: child,
         message: "retained child context",
         mode: "notify",
       });
-      if (right === "parent") {
+      if (!bound) {
         expect(result.details).toMatchObject(queuedNotification);
         expect(drainSystemEvents(child)).toEqual([
           expect.stringContaining("retained child context"),

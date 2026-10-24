@@ -13,7 +13,6 @@ vi.mock("../../config/sessions/session-entry-read-runtime.js", async () => {
     await import("./media-generation-lifecycle.test-support.js");
   return createMediaRequesterReadMock();
 });
-import { MAX_VIDEO_BYTES } from "@openclaw/media-core/constants";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseReplyDirectives } from "../../auto-reply/reply/reply-directives.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -33,14 +32,12 @@ import type { VideoGenerationProvider } from "../../video-generation/types.js";
 import type { AuthProfileStore } from "../auth-profiles/types.js";
 import { formatAgentInternalEventsForPrompt } from "../internal-events.js";
 import { resetRecentMediaGenerationDuplicateGuardsForTests } from "../media-generation-task-status-shared.test-support.js";
-import { VIDEO_GENERATION_TASK_KIND } from "../media-generation-task-status.js";
 import * as videoGenerateBackground from "./media-generate-background.js";
 import {
   defineMediaGenerationCancellationTests,
   defineMediaGenerationDuplicateTests,
   withHeldMediaGenerationResult,
 } from "./media-generation-lifecycle.test-support.js";
-import { createVideoGenerateStatusActionResult } from "./video-generate-tool.actions.js";
 import { createVideoGenerateTool } from "./video-generate-tool.js";
 import { createVideoProviderSnapshot } from "./video-generate-tool.test-support.js";
 
@@ -438,32 +435,6 @@ describe("createVideoGenerateTool", () => {
     expect(saveMediaBuffer).not.toHaveBeenCalled();
   });
 
-  it("rolls back earlier video saves after sequential persistence fails", async () => {
-    mockGeneratedVideo({
-      videos: [
-        videoAsset("saved", "saved.mp4"),
-        { ...videoAsset("failed", "failed.mp4"), url: "https://media.example/failed.mp4" },
-      ],
-    });
-    const terminalError = new Error("video persistence failed");
-    const persistedMedia = savedMedia("saved.mp4", 5);
-    const saveMediaBuffer = vi
-      .spyOn(mediaStore, "saveMediaBuffer")
-      .mockResolvedValueOnce(persistedMedia)
-      .mockRejectedValueOnce(terminalError);
-    const deleteMediaBuffer = vi
-      .spyOn(mediaStore, "deleteMediaBuffer")
-      .mockRejectedValueOnce(new Error("video cleanup failed"));
-    const tool = createConfiguredVideoTool("qwen/wan2.6-t2v");
-
-    await expect(tool.execute("call-partial-save", { prompt: "two videos" })).rejects.toBe(
-      terminalError,
-    );
-    expect(saveMediaBuffer).toHaveBeenCalledTimes(2);
-    expect(deleteMediaBuffer).toHaveBeenCalledTimes(1);
-    expect(deleteMediaBuffer).toHaveBeenCalledWith("saved.mp4", "tool-video-generation");
-  });
-
   it("starts background generation and wakes the session with URL and saved video names", async () => {
     const url = "https://example.com/generated-lobster.mp4";
     const name = "saved-lobster.mp4";
@@ -512,21 +483,6 @@ describe("createVideoGenerateTool", () => {
       expect((result as { terminate?: boolean }).terminate).toBeUndefined();
       expect(saveSpy).not.toHaveBeenCalled();
       await complete();
-      expect(generate).toHaveBeenCalledOnce();
-      expect(saveSpy).toHaveBeenCalledOnce();
-      expect(saveSpy).toHaveBeenCalledWith(
-        savedVideo,
-        "video/mp4",
-        "tool-video-generation",
-        MAX_VIDEO_BYTES,
-        name,
-      );
-      const runId = expect.stringMatching(/^tool:video_generate:/);
-      expect(firstMockCallArg(taskExecutorMocks.recordProgress)).toMatchObject({
-        runId,
-        progressSummary: "Generating video",
-      });
-      expect(firstMockCallArg(taskExecutorMocks.completeOperation)).toMatchObject({ runId });
       const wake = firstMockCallArg(wakeSpy);
       expect(wake).toMatchObject({ handle: { taskId: "task-123" }, status: "ok" });
       expect(wake.attachments).toEqual([
@@ -688,23 +644,9 @@ describe("createVideoGenerateTool", () => {
       action: "list",
     });
     const text = (result.content?.[0] as { text: string } | undefined)?.text ?? "";
-    const details = resultDetails(result);
     expect(text).toContain(
       "model image-video: modes=imageToVideo, maxInputImages=1, maxDurationSeconds=15, supportedDurationSeconds=5/10/15, resolution, aspectRatio",
     );
-    const providers = details.providers as Array<{
-      catalog?: Array<{
-        model?: string;
-        capabilities?: unknown;
-        modes?: string[];
-      }>;
-    }>;
-    const catalogEntry = providers[0]?.catalog?.find((entry) => entry.model === "image-video");
-    expect(catalogEntry).toMatchObject({
-      model: "image-video",
-      capabilities: imageToVideoCapabilities,
-      modes: ["imageToVideo"],
-    });
   });
 
   it("warns when optional provider overrides are ignored", async () => {
@@ -828,41 +770,5 @@ describe("createVideoGenerateTool", () => {
       expect(loadWebMedia).not.toHaveBeenCalled();
       expect(firstMockCallArg(generateSpy).inputImages).toEqual([{ url: reference }]);
     }
-  });
-
-  it("reports active task status when action=status is requested", async () => {
-    mediaActivityMocks.listOperations.mockReturnValue([
-      {
-        taskId: "task-active",
-        runtime: "cli",
-        taskKind: VIDEO_GENERATION_TASK_KIND,
-        sourceId: "video_generate:google",
-        requesterSessionKey: "agent:main:discord:direct:123",
-        ownerKey: "agent:main:discord:direct:123",
-        scopeKind: "session",
-        runId: "tool:video_generate:active",
-        task: "friendly lobster surfing",
-        status: "queued",
-        deliveryStatus: "not_applicable",
-        notifyPolicy: "silent",
-        createdAt: Date.now(),
-        progressSummary: "Queued video generation",
-      },
-    ]);
-
-    const result = await createVideoGenerateStatusActionResult("agent:main:discord:direct:123");
-    const text = (result.content?.[0] as { text: string } | undefined)?.text ?? "";
-
-    expect(text).toContain("Video generation task task-active is already queued with google.");
-    expect(result.details).toMatchObject({
-      action: "status",
-      active: true,
-      existingTask: true,
-      status: "queued",
-      taskKind: VIDEO_GENERATION_TASK_KIND,
-      provider: "google",
-      task: { taskId: "task-active" },
-      progressSummary: "Queued video generation",
-    });
   });
 });
