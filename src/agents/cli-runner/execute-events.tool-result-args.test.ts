@@ -1,6 +1,6 @@
 // Correlated CLI tool results already carry their started args; display-only
 // results must not duplicate that potentially large payload.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { runCliAgentWithLifecycle } from "../../auto-reply/reply/agent-runner-cli-dispatch.js";
 import type { GetReplyOptions } from "../../auto-reply/types.js";
 import { createChannelProgressDraftCompositor } from "../../channels/progress-draft-compositor.js";
@@ -47,7 +47,16 @@ function eventFixture(context: PreparedCliRunContext, tracking = buildToolTracki
       events.push(event);
     }
   });
-  return { handlers, events, dispose };
+  onTestFinished(dispose);
+  const start = (
+    toolCallId: string,
+    name: string,
+    args: Record<string, unknown> = {},
+    kind: Parameters<typeof handlers.emitParsedToolUseStart>[0]["kind"] = "mcp_tool_use",
+  ) => handlers.emitParsedToolUseStart({ toolCallId, name, args, kind });
+  const emitResult = (toolCallId: string, name: string, isError = false, result?: unknown) =>
+    handlers.emitParsedToolResult({ toolCallId, name, isError, result });
+  return { handlers, events, start, emitResult };
 }
 
 function startRecord(id: string, name: string, input: Record<string, unknown>) {
@@ -86,35 +95,31 @@ describe("cli tool result events", () => {
       context.params.executionMode = executionMode;
       context.params.onExecutionPhase = vi.fn();
       const tracking = buildToolTracking();
-      const { handlers, events, dispose } = eventFixture(context, tracking);
-      try {
-        handlers.emitCliToolInputDelta({
-          toolCallId: "write",
-          name: "write",
-          diff: { added: 2, removed: 0 },
-        });
-        handlers.finalizeParsedTools();
-        expect(context.params.onExecutionPhase).not.toHaveBeenCalled();
-        expect(tracking.handleCliToolUseStart).not.toHaveBeenCalled();
-        expect(handlers.hasObservedCliActivity()).toBe(true);
-        expect(events.map(({ stream, data }) => ({ stream, data }))).toEqual(
-          executionMode
-            ? []
-            : [
-                {
-                  stream: "tool",
-                  data: {
-                    phase: "input_delta",
-                    toolCallId: "write",
-                    name: "write",
-                    diff: { added: 2, removed: 0 },
-                  },
+      const { handlers, events } = eventFixture(context, tracking);
+      handlers.emitCliToolInputDelta({
+        toolCallId: "write",
+        name: "write",
+        diff: { added: 2, removed: 0 },
+      });
+      handlers.finalizeParsedTools();
+      expect(context.params.onExecutionPhase).not.toHaveBeenCalled();
+      expect(tracking.handleCliToolUseStart).not.toHaveBeenCalled();
+      expect(handlers.hasObservedCliActivity()).toBe(true);
+      expect(events.map(({ stream, data }) => ({ stream, data }))).toEqual(
+        executionMode
+          ? []
+          : [
+              {
+                stream: "tool",
+                data: {
+                  phase: "input_delta",
+                  toolCallId: "write",
+                  name: "write",
+                  diff: { added: 2, removed: 0 },
                 },
-              ],
-        );
-      } finally {
-        dispose();
-      }
+              },
+            ],
+      );
     },
   );
 
@@ -127,90 +132,65 @@ describe("cli tool result events", () => {
       const context = buildContext(`rewrite-${requested}`);
       const tracking = createCliToolTracking(context);
       tracking.beginGatewayCapture(context.params.runId, () => {});
-      const { handlers, events, dispose } = eventFixture(context, tracking);
+      const { events, start, emitResult } = eventFixture(context, tracking);
       const args = { action: requested, sessionId: "job" };
-      try {
-        handlers.emitParsedToolUseStart({
-          toolCallId: "call",
-          name: "mcp__openclaw__process",
-          kind: "mcp_tool_use",
-          args,
-        });
-        const capture = markMcpLoopbackToolCallStarted({
-          captureKey: context.params.runId,
-          toolName: "process",
-          args,
-        });
-        if (!capture) {
-          throw new Error("Expected loopback capture");
-        }
-        updateMcpLoopbackToolCallCapture(capture, {
-          toolName: "process",
-          args: { ...args, action: executed },
-        });
-        handlers.emitParsedToolResult({
-          toolCallId: "call",
-          name: "mcp__openclaw__process",
-          isError: false,
-          result: "result",
-        });
-        const terminal = events.find(
-          (event) => event.stream === "item" && event.data.phase === "end",
-        );
-        expect(Boolean(terminal?.data.hideFromChannelProgress)).toBe(quiet);
-        expect(
-          events.find((event) => event.stream === "tool" && event.data.phase === "result")?.data
-            .args,
-        ).toEqual(args);
-      } finally {
-        dispose();
-        tracking.finalizeCapture(() => {});
+      onTestFinished(() => tracking.finalizeCapture(() => {}));
+      start("call", "mcp__openclaw__process", args);
+      const capture = markMcpLoopbackToolCallStarted({
+        captureKey: context.params.runId,
+        toolName: "process",
+        args,
+      });
+      if (!capture) {
+        throw new Error("Expected loopback capture");
       }
+      updateMcpLoopbackToolCallCapture(capture, {
+        toolName: "process",
+        args: { ...args, action: executed },
+      });
+      emitResult("call", "mcp__openclaw__process", false, "result");
+      const terminal = events.find(
+        (event) => event.stream === "item" && event.data.phase === "end",
+      );
+      expect(Boolean(terminal?.data.hideFromChannelProgress)).toBe(quiet);
+      expect(
+        events.find((event) => event.stream === "tool" && event.data.phase === "result")?.data.args,
+      ).toEqual(args);
     },
   );
 
   it("projects parsed loopback waits once without changing raw names or display result args", () => {
     const runId = "parsed-activity";
-    const { handlers, events, dispose } = eventFixture(buildContext(runId));
+    const { handlers, events } = eventFixture(buildContext(runId));
     const parser = displayParser(handlers);
-    try {
-      handlers.emitCliCommentaryText("Let me check that for you.");
-      expect(events).toMatchObject([
-        {
-          stream: "item",
-          data: { kind: "preamble", phase: "end", progressText: "Let me check that for you." },
-        },
+    handlers.emitCliCommentaryText("Let me check that for you.");
+    expect(events).toMatchObject([
+      {
+        stream: "item",
+        data: { kind: "preamble", phase: "end", progressText: "Let me check that for you." },
+      },
+    ]);
+    for (const [toolCallId, name, args, isError, quiet] of [
+      ["poll", "mcp__openclaw__process", { action: "poll", sessionId: "process-1" }, false, true],
+      ["failed", "mcp__openclaw__process", { action: "poll", sessionId: "missing" }, true, false],
+      ["kill", "mcp__openclaw__process", { action: "kill", sessionId: "process-1" }, false, false],
+      ["yield", "mcp__openclaw__sessions_yield", {}, false, true],
+      ["third-party", "mcp__other__sessions_yield", {}, false, false],
+    ] as const) {
+      parser.push(startRecord(toolCallId, name, args));
+      parser.push(resultRecord(toolCallId, "raw result", isError));
+      const operation = events.filter((event) => event.data.toolCallId === toolCallId);
+      expect(operation.map((event) => [event.stream, event.data.phase])).toEqual([
+        ["item", "start"],
+        ["tool", "start"],
+        ["tool", "result"],
+        ["item", "end"],
       ]);
-      for (const [toolCallId, name, args, isError, quiet] of [
-        ["poll", "mcp__openclaw__process", { action: "poll", sessionId: "process-1" }, false, true],
-        ["failed", "mcp__openclaw__process", { action: "poll", sessionId: "missing" }, true, false],
-        [
-          "kill",
-          "mcp__openclaw__process",
-          { action: "kill", sessionId: "process-1" },
-          false,
-          false,
-        ],
-        ["yield", "mcp__openclaw__sessions_yield", {}, false, true],
-        ["third-party", "mcp__other__sessions_yield", {}, false, false],
-      ] as const) {
-        parser.push(startRecord(toolCallId, name, args));
-        parser.push(resultRecord(toolCallId, "raw result", isError));
-        const operation = events.filter((event) => event.data.toolCallId === toolCallId);
-        expect(operation.map((event) => [event.stream, event.data.phase])).toEqual([
-          ["item", "start"],
-          ["tool", "start"],
-          ["tool", "result"],
-          ["item", "end"],
-        ]);
-        expect(operation[2]?.data).toMatchObject({ name, result: "raw result", isError });
-        expect(operation[2]?.data.args).toBeUndefined();
-        expect(operation[2]?.data.hideFromChannelProgress).toBeUndefined();
-        expect(Boolean(operation[3]?.data.hideFromChannelProgress)).toBe(quiet);
-        expect(operation[3]?.data.name).toBe(name.replace(/^mcp__openclaw__/, ""));
-      }
-    } finally {
-      dispose();
+      expect(operation[2]?.data).toMatchObject({ name, result: "raw result", isError });
+      expect(operation[2]?.data.args).toBeUndefined();
+      expect(operation[2]?.data.hideFromChannelProgress).toBeUndefined();
+      expect(Boolean(operation[3]?.data.hideFromChannelProgress)).toBe(quiet);
+      expect(operation[3]?.data.name).toBe(name.replace(/^mcp__openclaw__/, ""));
     }
   });
 
@@ -231,17 +211,8 @@ describe("cli tool result events", () => {
       if (isolatedCompletion) {
         context.params.isolatedCompletion = true;
       }
-      const handlers = createCliEventHandlers({
-        context,
-        toolTracking: createCliToolTracking(context),
-        getRunState: () => ({ failed: false, error: undefined }),
-      });
-      handlers.emitParsedToolUseStart({
-        toolCallId: "native-exec",
-        name: "Bash",
-        kind: "tool_use",
-        args: { command: "pwd" },
-      });
+      const { handlers, start } = eventFixture(context, createCliToolTracking(context));
+      start("native-exec", "Bash", { command: "pwd" }, "tool_use");
       const completed = {
         toolCallId: "native-exec",
         name: "Bash",
@@ -353,59 +324,35 @@ describe("cli tool result events", () => {
 
   it("keeps correlated result args without adding them to display results", () => {
     const runId = "run-tool-result-args";
-    const { handlers, events, dispose } = eventFixture(buildContext(runId));
+    const { handlers, events, start, emitResult } = eventFixture(buildContext(runId));
 
-    try {
-      handlers.emitParsedToolUseStart({
-        toolCallId: "call-1",
-        name: "Bash",
-        kind: "tool_use",
-        args: { command: "nope-not-a-command" },
-      });
-      handlers.emitParsedToolResult({
-        toolCallId: "call-1",
-        name: "Bash",
-        isError: true,
-        result: "bash: nope-not-a-command: command not found",
-      });
-      handlers.emitParsedToolResult({
-        toolCallId: "call-1",
-        name: "Bash",
-        isError: false,
-        result: "duplicate terminal",
-      });
-      handlers.emitCliDisplayToolUseStart({
-        toolCallId: "call-2",
-        name: "write",
-        kind: "tool_use",
-        args: { path: "note.txt", content: "hello" },
-      });
-      handlers.emitCliDisplayToolResult({
-        toolCallId: "call-2",
-        name: "write",
-        isError: false,
-        result: "wrote note.txt",
-      });
-      // The display result also releases correlation state for this call id.
-      handlers.emitParsedToolResult({
-        toolCallId: "call-2",
-        name: "write",
-        isError: false,
-        result: "duplicate terminal",
-      });
+    start("call-1", "Bash", { command: "nope-not-a-command" }, "tool_use");
+    emitResult("call-1", "Bash", true, "bash: nope-not-a-command: command not found");
+    emitResult("call-1", "Bash", false, "duplicate terminal");
+    handlers.emitCliDisplayToolUseStart({
+      toolCallId: "call-2",
+      name: "write",
+      kind: "tool_use",
+      args: { path: "note.txt", content: "hello" },
+    });
+    handlers.emitCliDisplayToolResult({
+      toolCallId: "call-2",
+      name: "write",
+      isError: false,
+      result: "wrote note.txt",
+    });
+    // The display result also releases correlation state for this call id.
+    emitResult("call-2", "write", false, "duplicate terminal");
 
-      const results = events.filter(
-        (event) => event.stream === "tool" && event.data.phase === "result",
-      );
-      expect(results[0]?.data.args).toEqual({ command: "nope-not-a-command" });
-      expect(results[0]?.data.isError).toBe(true);
-      expect(results[1]?.data.args).toBeUndefined();
-      expect(results[2]?.data.isError).toBe(false);
-      expect(results[2]?.data.args).toBeUndefined();
-      expect(results[3]?.data.args).toBeUndefined();
-    } finally {
-      dispose();
-    }
+    const results = events.filter(
+      (event) => event.stream === "tool" && event.data.phase === "result",
+    );
+    expect(results[0]?.data.args).toEqual({ command: "nope-not-a-command" });
+    expect(results[0]?.data.isError).toBe(true);
+    expect(results[1]?.data.args).toBeUndefined();
+    expect(results[2]?.data.isError).toBe(false);
+    expect(results[2]?.data.args).toBeUndefined();
+    expect(results[3]?.data.args).toBeUndefined();
   });
 });
 
@@ -418,72 +365,57 @@ describe("CLI progress-card plan projection", () => {
       context.resultContentSourceByToolName = new Map([["progress_card", "network"]]);
       const tracking = createCliToolTracking(context);
       tracking.beginGatewayCapture(runId, () => {});
-      const { handlers, events, dispose } = eventFixture(context, tracking);
+      const { events, start, emitResult } = eventFixture(context, tracking);
       const plan = { plan: [{ step: "Prepared checklist", status: "in_progress" }] };
       const requested = mode === "replacement" ? {} : plan;
       const executed = mode === "clear" ? {} : plan;
       const name = "mcp__openclaw__progress_card";
-      try {
-        handlers.emitParsedToolUseStart({
-          toolCallId: "card",
-          name,
-          kind: "mcp_tool_use",
-          args: requested,
-        });
-        if (mode === "ambiguous") {
-          handlers.emitParsedToolUseStart({
-            toolCallId: "peer",
-            name,
-            kind: "mcp_tool_use",
-            args: requested,
-          });
-        }
-        const capture = markMcpLoopbackToolCallStarted({
-          captureKey: runId,
-          toolName: "progress_card",
-          args: requested,
-        });
-        if (!capture) {
-          throw new Error("Expected loopback capture");
-        }
-        updateMcpLoopbackToolCallCapture(capture, { toolName: "progress_card", args: executed });
-        recordMcpLoopbackToolCallResult({
-          captureHandle: capture,
-          toolName: "progress_card",
-          args: executed,
-          outcome: "completed",
-        });
-        markMcpLoopbackToolCallFinished(capture);
-        handlers.emitParsedToolResult({ toolCallId: "card", name, isError: false });
-        const result = events.find(
-          (event) => event.stream === "tool" && event.data.phase === "result",
-        );
-        expect(result?.data.resultContentSource).toBe("network");
-        expect(
-          events
-            .filter((event) => event.data.toolCallId === "card")
-            .map((event) => [event.stream, event.data.phase]),
-        ).toEqual([
-          ["item", "start"],
-          ["tool", "start"],
-          ["tool", "result"],
-          ["item", "end"],
-        ]);
-        const plans = events.filter((event) => event.stream === "plan");
-        if (mode === "ambiguous") {
-          expect(plans).toEqual([]);
-        } else {
-          expect(plans).toHaveLength(1);
-          expect(plans[0]?.data.steps).toEqual(mode === "clear" ? [] : plan.plan);
-        }
-        expect(
-          events.find((event) => event.stream === "tool" && event.data.phase === "result")?.data
-            .args,
-        ).toEqual(requested);
-      } finally {
-        dispose();
-        tracking.finalizeCapture(() => {});
+      onTestFinished(() => tracking.finalizeCapture(() => {}));
+      start("card", name, requested);
+      if (mode === "ambiguous") {
+        start("peer", name, requested);
       }
+      const capture = markMcpLoopbackToolCallStarted({
+        captureKey: runId,
+        toolName: "progress_card",
+        args: requested,
+      });
+      if (!capture) {
+        throw new Error("Expected loopback capture");
+      }
+      updateMcpLoopbackToolCallCapture(capture, { toolName: "progress_card", args: executed });
+      recordMcpLoopbackToolCallResult({
+        captureHandle: capture,
+        toolName: "progress_card",
+        args: executed,
+        outcome: "completed",
+      });
+      markMcpLoopbackToolCallFinished(capture);
+      emitResult("card", name);
+      const result = events.find(
+        (event) => event.stream === "tool" && event.data.phase === "result",
+      );
+      expect(result?.data.resultContentSource).toBe("network");
+      expect(
+        events
+          .filter((event) => event.data.toolCallId === "card")
+          .map((event) => [event.stream, event.data.phase]),
+      ).toEqual([
+        ["item", "start"],
+        ["tool", "start"],
+        ["tool", "result"],
+        ["item", "end"],
+      ]);
+      const plans = events.filter((event) => event.stream === "plan");
+      if (mode === "ambiguous") {
+        expect(plans).toEqual([]);
+      } else {
+        expect(plans).toHaveLength(1);
+        expect(plans[0]?.data.steps).toEqual(mode === "clear" ? [] : plan.plan);
+      }
+      expect(
+        events.find((event) => event.stream === "tool" && event.data.phase === "result")?.data.args,
+      ).toEqual(requested);
     },
   );
 
@@ -495,110 +427,69 @@ describe("CLI progress-card plan projection", () => {
     (name, trackedResultFirst) => {
       const runId = `display-clear-${name}`;
       const tracking = buildToolTracking();
-      const { handlers, events, dispose } = eventFixture(buildContext(runId), tracking);
+      const { handlers, events, start, emitResult } = eventFixture(buildContext(runId), tracking);
       const parser = displayParser(handlers);
-      try {
-        handlers.emitParsedToolUseStart({
-          toolCallId: "tracked-plan",
-          name,
-          kind: "mcp_tool_use",
-          args: { plan: [{ step: "Keep working", status: "in_progress" }] },
-        });
-        handlers.emitParsedToolResult({ toolCallId: "tracked-plan", name, isError: false });
-        parser.push(startRecord("display-clear", name, {}));
-        if (trackedResultFirst) {
-          handlers.emitParsedToolResult({ toolCallId: "display-clear", name, isError: false });
-        }
-        parser.push(resultRecord("display-clear", "done"));
-        // Neither ordering may promote a display-only start into authoritative plan state.
-        if (!trackedResultFirst) {
-          handlers.emitParsedToolResult({ toolCallId: "display-clear", name, isError: false });
-        }
-        const plans = () => events.filter((event) => event.stream === "plan");
-        expect(plans()).toHaveLength(1);
-        expect(plans()[0]?.data.steps).toEqual([{ step: "Keep working", status: "in_progress" }]);
-        expect(tracking.handleCliToolUseStart).toHaveBeenCalledTimes(1);
-        expect(tracking.handleCliToolResult).toHaveBeenCalledTimes(2);
-        handlers.emitParsedToolUseStart({
-          toolCallId: "tracked-clear",
-          name,
-          kind: "mcp_tool_use",
-          args: {},
-        });
-        handlers.emitParsedToolResult({ toolCallId: "tracked-clear", name, isError: false });
-        expect(plans()).toHaveLength(2);
-        expect(plans()[1]?.data.steps).toEqual([]);
-        expect(handlers.getToolSummary()).toEqual({ calls: 3, tools: [name], failures: 0 });
-      } finally {
-        dispose();
+      start("tracked-plan", name, { plan: [{ step: "Keep working", status: "in_progress" }] });
+      emitResult("tracked-plan", name);
+      parser.push(startRecord("display-clear", name, {}));
+      if (trackedResultFirst) {
+        emitResult("display-clear", name);
       }
+      parser.push(resultRecord("display-clear", "done"));
+      // Neither ordering may promote a display-only start into authoritative plan state.
+      if (!trackedResultFirst) {
+        emitResult("display-clear", name);
+      }
+      const plans = () => events.filter((event) => event.stream === "plan");
+      expect(plans()).toHaveLength(1);
+      expect(plans()[0]?.data.steps).toEqual([{ step: "Keep working", status: "in_progress" }]);
+      expect(tracking.handleCliToolUseStart).toHaveBeenCalledTimes(1);
+      expect(tracking.handleCliToolResult).toHaveBeenCalledTimes(2);
+      start("tracked-clear", name, {});
+      emitResult("tracked-clear", name);
+      expect(plans()).toHaveLength(2);
+      expect(plans()[1]?.data.steps).toEqual([]);
+      expect(handlers.getToolSummary()).toEqual({ calls: 3, tools: [name], failures: 0 });
     },
   );
 
   it.each([
-    {
-      label: "failed",
-      name: "progress_card",
-      args: { plan: [{ step: "Inspect", status: "pending" }] },
-      failed: true,
-    },
-    { label: "malformed", name: "progress_card", args: { plan: "not a plan" } },
-    {
-      label: "other MCP server",
-      name: "mcp__other__progress_card",
-      args: { plan: [{ step: "Inspect", status: "pending" }] },
-    },
-    {
-      label: "uncorrelated",
-      name: "progress_card",
-      args: { plan: [{ step: "Inspect", status: "pending" }] },
-      skipStart: true,
-    },
-    {
-      label: "side question",
-      name: "progress_card",
-      args: { plan: [{ step: "Inspect", status: "pending" }] },
-      sideQuestion: true,
-    },
-    {
-      label: "display only",
-      name: "progress_card",
-      args: { plan: [{ step: "Inspect", status: "pending" }] },
-      displayOnly: true,
-    },
-  ])(
-    "does not fabricate plan state for $label results",
-    ({ name, args, failed, skipStart, sideQuestion, displayOnly }) => {
-      const runId = "no-plan";
-      const context = buildContext(runId);
-      if (sideQuestion) {
-        context.params.executionMode = "side-question";
+    "failed",
+    "malformed",
+    "other MCP server",
+    "uncorrelated",
+    "side question",
+    "display only",
+  ])("does not fabricate plan state for %s results", (mode) => {
+    const name = mode === "other MCP server" ? "mcp__other__progress_card" : "progress_card";
+    const args = {
+      plan: mode === "malformed" ? "not a plan" : [{ step: "Inspect", status: "pending" }],
+    };
+    const runId = "no-plan";
+    const context = buildContext(runId);
+    if (mode === "side question") {
+      context.params.executionMode = "side-question";
+    }
+    const { handlers, events } = eventFixture(context);
+    const start = { toolCallId: "card", name, kind: "mcp_tool_use" as const, args };
+    if (mode !== "uncorrelated") {
+      if (mode === "display only") {
+        handlers.emitCliDisplayToolUseStart(start);
+      } else {
+        handlers.emitParsedToolUseStart(start);
       }
-      const { handlers, events, dispose } = eventFixture(context);
-      try {
-        const start = { toolCallId: "card", name, kind: "mcp_tool_use" as const, args };
-        if (!skipStart) {
-          if (displayOnly) {
-            handlers.emitCliDisplayToolUseStart(start);
-          } else {
-            handlers.emitParsedToolUseStart(start);
-          }
-        }
-        const result = { toolCallId: "card", name, isError: failed === true, result: "receipt" };
-        if (displayOnly) {
-          handlers.emitCliDisplayToolResult(result);
-        } else {
-          handlers.emitParsedToolResult(result);
-        }
-        expect(events.filter((event) => event.stream === "plan")).toEqual([]);
-        if (sideQuestion) {
-          expect(events).toEqual([]);
-        }
-      } finally {
-        dispose();
-      }
-    },
-  );
+    }
+    const result = { toolCallId: "card", name, isError: mode === "failed", result: "receipt" };
+    if (mode === "display only") {
+      handlers.emitCliDisplayToolResult(result);
+    } else {
+      handlers.emitParsedToolResult(result);
+    }
+    expect(events.filter((event) => event.stream === "plan")).toEqual([]);
+    if (mode === "side question") {
+      expect(events).toEqual([]);
+    }
+  });
 });
 
 describe("CLI plan channel bridge", () => {
@@ -753,64 +644,52 @@ describe("CLI prepared live output", () => {
   it("uses the current output replacements for commentary, streaming, and completion", () => {
     const context = buildContext("cli-live-output-policy");
     context.backendResolved.textTransforms = { output: [{ from: /MARKER/g, to: "first" }] };
-    const { handlers, events, dispose } = eventFixture(context);
-    try {
-      handlers.emitCliCommentaryText("MARKER");
-      context.backendResolved.textTransforms = { output: [{ from: /MARKER/g, to: "second" }] };
-      handlers.emitCliAssistantDelta({ text: "MARKER", delta: "MARKER" });
-      handlers.emitCliCompletedReply("MARKER", 0);
-      expect(events.map((event) => event.data)).toEqual([
-        expect.objectContaining({ progressText: "first" }),
-        expect.objectContaining({ text: "second", delta: "second" }),
-        expect.objectContaining({ completedText: "second" }),
-      ]);
-    } finally {
-      dispose();
-    }
+    const { handlers, events } = eventFixture(context);
+    handlers.emitCliCommentaryText("MARKER");
+    context.backendResolved.textTransforms = { output: [{ from: /MARKER/g, to: "second" }] };
+    handlers.emitCliAssistantDelta({ text: "MARKER", delta: "MARKER" });
+    handlers.emitCliCompletedReply("MARKER", 0);
+    expect(events.map((event) => event.data)).toEqual([
+      expect.objectContaining({ progressText: "first" }),
+      expect.objectContaining({ text: "second", delta: "second" }),
+      expect.objectContaining({ completedText: "second" }),
+    ]);
   });
 
   it.each(["NO_REPLY.", '"NO_REPLY"', '{"action":"NO_REPLY"}', "NO_REPLY\nNO_REPLY"])(
     "preserves ordinary producer output %j",
     (raw) => {
-      const { handlers, events, dispose } = eventFixture(buildContext("cli-visible-control"));
+      const { handlers, events } = eventFixture(buildContext("cli-visible-control"));
       const text = raw.startsWith("NO_REPLY\n") ? raw.slice(9) : raw;
-      try {
-        handlers.emitCliAssistantDelta({ text: raw, delta: raw });
-        handlers.emitCliCompletedReply(raw, 0);
-        handlers.emitCliCommentaryText(raw);
-        expect(events.map((event) => event.data)).toEqual([
-          expect.objectContaining({ text, delta: text }),
-          expect.objectContaining({ completedText: text }),
-          expect.objectContaining({ progressText: text }),
-        ]);
-      } finally {
-        dispose();
-      }
+      handlers.emitCliAssistantDelta({ text: raw, delta: raw });
+      handlers.emitCliCompletedReply(raw, 0);
+      handlers.emitCliCommentaryText(raw);
+      expect(events.map((event) => event.data)).toEqual([
+        expect.objectContaining({ text, delta: text }),
+        expect.objectContaining({ completedText: text }),
+        expect.objectContaining({ progressText: text }),
+      ]);
     },
   );
 
   it.each(["NO_REPLY", "no_reply", "No_Reply"])(
     "withholds possible %s controls before releasing the full leading-line suffix",
     (token) => {
-      const { handlers, events, dispose } = eventFixture(buildContext("cli-control-prefix"));
-      try {
-        handlers.emitCliAssistantDelta({ text: token.slice(0, 2), delta: token.slice(0, 2) });
-        handlers.emitCliAssistantDelta({ text: token, delta: token.slice(2) });
-        handlers.emitCliCompletedReply(token, 0);
-        handlers.emitCliCommentaryText(` \t${token}\n`);
-        expect(events).toEqual([]);
-        handlers.emitCliAssistantDelta({
-          text: `${token}\n  Answer.\n`,
-          delta: `${token}\n  Answer.\n`,
-        });
-        expect(events).toEqual([
-          expect.objectContaining({
-            data: expect.objectContaining({ text: "  Answer.\n", delta: "  Answer.\n" }),
-          }),
-        ]);
-      } finally {
-        dispose();
-      }
+      const { handlers, events } = eventFixture(buildContext("cli-control-prefix"));
+      handlers.emitCliAssistantDelta({ text: token.slice(0, 2), delta: token.slice(0, 2) });
+      handlers.emitCliAssistantDelta({ text: token, delta: token.slice(2) });
+      handlers.emitCliCompletedReply(token, 0);
+      handlers.emitCliCommentaryText(` \t${token}\n`);
+      expect(events).toEqual([]);
+      handlers.emitCliAssistantDelta({
+        text: `${token}\n  Answer.\n`,
+        delta: `${token}\n  Answer.\n`,
+      });
+      expect(events).toEqual([
+        expect.objectContaining({
+          data: expect.objectContaining({ text: "  Answer.\n", delta: "  Answer.\n" }),
+        }),
+      ]);
     },
   );
 });

@@ -226,67 +226,34 @@ describe("generic plugin-owned live session registry", () => {
     const mcpFresh = (await createOwner({ systemPrompt: "Original system policy." })).context;
     const mcpResumed = (await createOwner({ systemPrompt: "Original system policy." })).context;
     function fingerprint(
-      params: Pick<
-        Parameters<typeof createCliLiveSessionCapability>[0],
-        "context" | "argv" | "env"
-      >,
+      context: typeof fresh,
+      args = ["--resume", "native-session"],
+      env: Record<string, string> = { PATH: "/usr/bin:/bin" },
     ) {
       return createCliLiveSessionCapability({
-        ...params,
+        context,
+        argv: ["claude", "-p", ...args],
+        env,
         beginCapture() {},
         abortSignal: new AbortController().signal,
       }).fingerprint;
     }
     mcpFresh.preparedBackend.mcpConfigHash = "stable-mcp-config";
     mcpResumed.preparedBackend.mcpConfigHash = "stable-mcp-config";
-    const env = { PATH: "/usr/bin:/bin" };
-    const freshFingerprint = fingerprint({
-      context: fresh,
-      argv: ["claude", "-p", "--session-id", "native-session"],
-      env,
-    });
-
+    const freshFingerprint = fingerprint(fresh, ["--session-id", "native-session"]);
+    expect(fingerprint(resumed)).toBe(freshFingerprint);
+    expect(fingerprint(changed)).not.toBe(freshFingerprint);
+    expect(fingerprint(resumed, ["--resume", "native-session", "--effort", "max"])).not.toBe(
+      freshFingerprint,
+    );
     expect(
-      fingerprint({
-        context: resumed,
-        argv: ["claude", "-p", "--resume", "native-session"],
-        env,
-      }),
-    ).toBe(freshFingerprint);
-    expect(
-      fingerprint({
-        context: changed,
-        argv: ["claude", "-p", "--resume", "native-session"],
-        env,
-      }),
+      fingerprint(resumed, undefined, { PATH: "/usr/bin:/bin", CLAUDE_CODE_EFFORT_LEVEL: "max" }),
     ).not.toBe(freshFingerprint);
     expect(
-      fingerprint({
-        context: resumed,
-        argv: ["claude", "-p", "--resume", "native-session", "--effort", "max"],
-        env,
-      }),
-    ).not.toBe(freshFingerprint);
-    expect(
-      fingerprint({
-        context: resumed,
-        argv: ["claude", "-p", "--resume", "native-session"],
-        env: { ...env, CLAUDE_CODE_EFFORT_LEVEL: "max" },
-      }),
-    ).not.toBe(freshFingerprint);
-
-    const mcpFreshFingerprint = fingerprint({
-      context: mcpFresh,
-      argv: ["claude", "-p", "--session-id", "native-session", "--mcp-config", "/tmp/turn-a.json"],
-      env,
-    });
-    expect(
-      fingerprint({
-        context: mcpResumed,
-        argv: ["claude", "-p", "--resume", "native-session", "--mcp-config", "/tmp/turn-b.json"],
-        env,
-      }),
-    ).toBe(mcpFreshFingerprint);
+      fingerprint(mcpResumed, ["--resume", "native-session", "--mcp-config", "/tmp/turn-b.json"]),
+    ).toBe(
+      fingerprint(mcpFresh, ["--session-id", "native-session", "--mcp-config", "/tmp/turn-a.json"]),
+    );
   });
 
   it("exposes only an active registered generation and never revives a removed owner", async () => {
