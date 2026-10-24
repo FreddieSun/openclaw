@@ -51,7 +51,7 @@ import {
   startSessionTranscriptIndexReconcile,
   waitForSessionTranscriptIndexReconcile,
 } from "./session-transcript-reconcile.js";
-import { transcriptMessage } from "./transcript-message.test-support.js";
+import { transcriptMessage, messageEvent } from "./transcript-message.test-support.js";
 import {
   createTranscriptEventInserter,
   createTranscriptPayloadUpdater,
@@ -75,12 +75,8 @@ vi.mock("../../shared/store-writer-queue.js", async (importOriginal) => {
 
 const eventIds = (events: readonly { event: unknown }[]) =>
   events.map(({ event }) => (event as { id?: unknown }).id);
-const toolEvent = (id: string, parentId: string | null, content: string) => ({
-  type: "message",
-  id,
-  parentId,
-  message: { role: "toolResult", content },
-});
+const toolEvent = (id: string, parentId: string | null, content: string) =>
+  messageEvent(id, parentId, { role: "toolResult", content });
 
 function inTransaction(db: { exec(sql: string): void }, run: () => void) {
   db.exec("BEGIN IMMEDIATE;");

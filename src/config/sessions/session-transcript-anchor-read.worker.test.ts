@@ -41,18 +41,18 @@ import { readSessionTranscriptHydrationRequest } from "./session-transcript-hydr
 import { prepareSessionTranscriptHydration } from "./session-transcript-hydration.js";
 import * as targetWorker from "./session-transcript-read-worker-runtime.js";
 import { historyLane } from "./session-transcript-worker-resources.js";
+import { messageEvent } from "./transcript-message.test-support.js";
 import { withOwnedSessionTranscriptWrites } from "./transcript-write-context.js";
 
 afterEach(() => memorySessionActorOwners.reset());
 
 const events = [
   { type: "session", id: "anchors", version: 3 },
-  {
-    type: "message",
-    id: "question",
-    parentId: null,
-    message: { role: "user", content: "question", idempotencyKey: "question-key" },
-  },
+  messageEvent("question", null, {
+    role: "user",
+    content: "question",
+    idempotencyKey: "question-key",
+  }),
   message("answer", "question", "answer", "answer-run"),
   message("alternate", "question", "other branch"),
   { type: "leaf", id: "selected-leaf", parentId: "alternate", targetId: "answer" },
@@ -124,12 +124,11 @@ function withTranscript(
 }
 
 function message(id: string, parentId: string | null, content: string, runId?: string) {
-  return {
-    type: "message",
-    id,
-    parentId,
-    message: { role: "assistant", content, ...(runId ? { __openclaw: { runId } } : {}) },
-  };
+  return messageEvent(id, parentId, {
+    role: "assistant",
+    content,
+    ...(runId ? { __openclaw: { runId } } : {}),
+  });
 }
 
 function expectTailMessage(entries: unknown, entryId: string, content: string) {
@@ -600,12 +599,7 @@ it("reuses bounded message payloads for presence without treating an omitted mes
     await replaceTranscriptEvents(scope, [
       events[0],
       metadata,
-      {
-        type: "message",
-        id: "question",
-        parentId: "metadata",
-        message: { role: "user", content: "message ".repeat(128) },
-      },
+      messageEvent("question", "metadata", { role: "user", content: "message ".repeat(128) }),
     ]);
     const included = await read();
     expect(included.result.transcript?.messagePresence).toBe(true);

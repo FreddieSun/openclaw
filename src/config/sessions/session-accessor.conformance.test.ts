@@ -63,6 +63,7 @@ vi.mock("../config.js", async () => ({
 }));
 
 import { getRuntimeConfig } from "../config.js";
+import { messageEvent } from "./transcript-message.test-support.js";
 
 type TestPaths = {
   sqlitePath: string;
@@ -1080,12 +1081,7 @@ describe("sqlite session normalization", () => {
     });
     await replaceTranscriptEvents({ ...scopeFor(parentKey), sessionId: "parent-session" }, [
       { type: "session", id: "parent-session", cwd: paths.tempDir },
-      {
-        type: "message",
-        id: "oversized-parent",
-        parentId: null,
-        message: { role: "user", content: "x".repeat(420_000) },
-      },
+      messageEvent("oversized-parent", null, { role: "user", content: "x".repeat(420_000) }),
     ]);
 
     const result = await withEnvAsync({ OPENCLAW_STATE_DIR: paths.stateDir }, () =>
