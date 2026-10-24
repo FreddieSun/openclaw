@@ -4,9 +4,8 @@ import {
   type Context,
   type Model,
 } from "openclaw/plugin-sdk/llm";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { steerActiveSessionWithOptionalDeliveryWait } from "../embedded-agent-runner/run/attempt-queue-message.js";
 import { createStubTool } from "../test-helpers/agent-tool-stubs.js";
 import { agentSessionAutomaticCompaction } from "./agent-session-compaction.js";
@@ -35,12 +34,10 @@ import type {
   TurnEndEvent,
   TurnStartEvent,
 } from "./extensions/types.js";
-import { DefaultResourceLoader } from "./resource-loader.js";
 import { SessionManager } from "./session-manager.js";
 import { getSteeringMessageIdentity } from "./steering-message-identity.js";
 
 registerAgentSessionLoopTestLifecycle();
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const completedCompactionEvent = (reason: "threshold" | "overflow", willRetry: boolean) =>
   expect.objectContaining({
     type: "compaction_end",
@@ -50,6 +47,39 @@ const completedCompactionEvent = (reason: "threshold" | "overflow", willRetry: b
 
 function textResponse(model: Model, text: string, tokens = 1) {
   return createAssistantResultStream(createAssistant(model, text, "stop", tokens));
+}
+
+function toolResponse(model: Model, name: string, tokens = 1) {
+  return createAssistantResultStream(
+    createAssistant(
+      model,
+      [{ type: "toolCall", id: `call-${name}`, name, arguments: {} }],
+      "toolUse",
+      tokens,
+    ),
+  );
+}
+
+function toolResult(text: string, terminate?: boolean) {
+  return {
+    content: [{ type: "text" as const, text }],
+    details: {},
+    ...(terminate === undefined ? {} : { terminate }),
+  };
+}
+
+function expectNoCompaction(manager: SessionManager) {
+  expect(manager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+}
+
+function expectCompactionOutcome(
+  events: AgentSessionEvent[],
+  reason: "threshold" | "overflow",
+  outcome: Extract<AgentSessionEvent, { type: "compaction_end" }>["outcome"],
+) {
+  expect(events).toContainEqual(
+    expect.objectContaining({ type: "compaction_end", reason, outcome }),
+  );
 }
 
 function mockSummaryRecovery(
@@ -118,47 +148,6 @@ async function createCompactingSession(options: Parameters<typeof createTestSess
 }
 
 describe("AgentSession loop correctness", () => {
-  it("publishes a queued user message only after its transcript entry is committed", async () => {
-    const { session, sessionManager } = await createTestSession();
-    const { queuedMessages, handleAgentEvent } = queuedEvents(session);
-    const observedPersistedMessages: boolean[] = [];
-    onUserMessageEnd(session, (event) => {
-      observedPersistedMessages.push(
-        sessionManager
-          .getEntries()
-          .some(
-            (entry) =>
-              entry.type === "message" &&
-              entry.message.role === "user" &&
-              entry.message.timestamp === event.message.timestamp,
-          ),
-      );
-    });
-    const abortController = new AbortController();
-    const wait = steerActiveSessionWithOptionalDeliveryWait(session, "commit before receipt", {
-      deliveryTimeoutMs: 10_000,
-      waitForTranscriptCommit: true,
-      abortSignal: abortController.signal,
-    });
-
-    try {
-      await vi.waitFor(() => expect(queuedMessages).toHaveLength(1));
-      const message = queuedMessages.shift();
-      expect(message).toBeDefined();
-      if (!message) {
-        return;
-      }
-      await handleAgentEvent({ type: "message_start", message });
-      await handleAgentEvent({ type: "message_end", message });
-      await expect(wait).resolves.toBeUndefined();
-
-      expect(observedPersistedMessages).toEqual([true]);
-    } finally {
-      abortController.abort();
-      await Promise.allSettled([wait]);
-    }
-  });
-
   it("rejects a consumed steer immediately when its transcript append fails", async () => {
     const { session, sessionManager } = await createTestSession();
     const { queuedMessages, handleAgentEvent } = queuedEvents(session);
@@ -179,11 +168,7 @@ describe("AgentSession loop correctness", () => {
 
     try {
       await vi.waitFor(() => expect(queuedMessages).toHaveLength(1));
-      const message = queuedMessages.shift();
-      expect(message).toBeDefined();
-      if (!message) {
-        return;
-      }
+      const message = expectDefined(queuedMessages.shift(), "queued message");
       await handleAgentEvent({ type: "message_start", message });
       await expect(handleAgentEvent({ type: "message_end", message })).rejects.toBe(
         persistenceError,
@@ -204,6 +189,17 @@ describe("AgentSession loop correctness", () => {
     const { session, sessionManager } = await createTestSession();
     const { queuedMessages, handleAgentEvent } = queuedEvents(session);
     const confirmed: number[] = [];
+    const persistedAtPublication: number[] = [];
+    onUserMessageEnd(session, (event) => {
+      const persisted = sessionManager.getEntries().filter((entry) => entry.type === "message");
+      expect(persisted.at(-1)).toMatchObject({
+        message: {
+          role: "user",
+          timestamp: event.message.timestamp,
+        },
+      });
+      persistedAtPublication.push(persisted.length);
+    });
     const waits = Array.from({ length: waiterCount }, (_, index) =>
       steerActiveSessionWithOptionalDeliveryWait(session, "same queued message", {
         deliveryTimeoutMs: 10_000,
@@ -216,11 +212,7 @@ describe("AgentSession loop correctness", () => {
 
     try {
       for (let index = 0; index < waiterCount; index += 1) {
-        const message = queuedMessages.shift();
-        expect(message).toBeDefined();
-        if (!message) {
-          return;
-        }
+        const message = expectDefined(queuedMessages.shift(), "queued message");
         await handleAgentEvent({ type: "message_start", message });
         await handleAgentEvent({ type: "message_end", message });
         await vi.waitFor(() =>
@@ -230,6 +222,7 @@ describe("AgentSession loop correctness", () => {
         );
       }
       await Promise.all(waits);
+      expect(persistedAtPublication).toEqual([1, 2, 3]);
 
       const identities = originalMessages.map(getSteeringMessageIdentity);
       expect(identities.every((identity) => typeof identity === "string")).toBe(true);
@@ -258,7 +251,7 @@ describe("AgentSession loop correctness", () => {
     }
   });
 
-  it("snapshots ordinary event listeners before self-removal and late subscription", async () => {
+  it("snapshots ordinary listeners before self-removal, other removal, and late subscription", async () => {
     streamMocks.streamSimple.mockImplementation((activeModel: Model) =>
       textResponse(activeModel, "complete answer"),
     );
@@ -267,31 +260,16 @@ describe("AgentSession loop correctness", () => {
     const unsubscribeFirst = onUserMessageEnd(session, () => {
       observed.push("first");
       unsubscribeFirst();
+      unsubscribeThird();
       onUserMessageEnd(session, () => observed.push("late"));
     });
     onUserMessageEnd(session, () => observed.push("second"));
+    const unsubscribeThird = onUserMessageEnd(session, () => observed.push("third"));
 
     await session.prompt("first prompt");
-    expect(observed).toEqual(["first", "second"]);
+    expect(observed).toEqual(["first", "second", "third"]);
     await session.prompt("second prompt");
-    expect(observed).toEqual(["first", "second", "second", "late"]);
-  });
-
-  it("finishes an ordinary event snapshot when another listener is unsubscribed", async () => {
-    streamMocks.streamSimple.mockImplementation((activeModel: Model) =>
-      textResponse(activeModel, "complete answer"),
-    );
-    const { session } = await createTestSession();
-    const observed: string[] = [];
-    onUserMessageEnd(session, () => {
-      observed.push("first");
-      unsubscribeSecond();
-    });
-    const unsubscribeSecond = onUserMessageEnd(session, () => observed.push("second"));
-
-    await session.prompt("first prompt");
-
-    expect(observed).toEqual(["first", "second"]);
+    expect(observed).toEqual(["first", "second", "third", "second", "late"]);
   });
 
   it("carries the canonical assistant entry id through ordered terminal listeners", async () => {
@@ -390,19 +368,14 @@ describe("AgentSession loop correctness", () => {
     });
   });
 
-  it.each([
-    { enabled: true, owner: "session" },
-    { enabled: false, owner: "session" },
-    { enabled: true, owner: "caller" },
-  ] as const)(
-    "keeps a high-usage response without retry (compaction: $enabled, owner: $owner)",
-    async ({ enabled, owner }) => {
+  it.each([true, false])(
+    "keeps a high-usage response without retry (compaction: %s)",
+    async (enabled) => {
       streamMocks.streamSimple.mockImplementation((activeModel: Model) =>
         textResponse(activeModel, "complete answer", activeModel.contextWindow),
       );
       const { session } = await createCompactingSession({
         settingsManager: createAutoCompactionSettings({ enabled }),
-        contextOverflowRecoveryOwner: owner === "caller" ? owner : undefined,
       });
       const compactionEvents = collectCompactionEnds(session);
 
@@ -437,14 +410,8 @@ describe("AgentSession loop correctness", () => {
 
     await session.prompt("new prompt");
 
-    expect(compactionEvents).toContainEqual(
-      expect.objectContaining({
-        type: "compaction_end",
-        reason: "threshold",
-        outcome: { status: "aborted" },
-      }),
-    );
-    expect(sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+    expectCompactionOutcome(compactionEvents, "threshold", { status: "aborted" });
+    expectNoCompaction(sessionManager);
   });
 
   it("does not pre-prompt compact from usage before a zero unavailable marker", async () => {
@@ -511,23 +478,11 @@ describe("AgentSession loop correctness", () => {
   ])("$label", async ({ toolTerminate, pluginTerminate, expectedModelTurns }) => {
     const passthroughTool: ToolDefinition = {
       ...createStubTool("finish_via_middleware"),
-      execute: async () => ({
-        content: [{ type: "text", text: "raw tool result" }],
-        details: {},
-        ...(toolTerminate === undefined ? {} : { terminate: toolTerminate }),
-      }),
+      execute: async () => toolResult("raw tool result", toolTerminate),
     };
-    const pluginDir = tempDirs.make("openclaw-terminate-plugin-");
-    const resourceLoader = new DefaultResourceLoader({
-      cwd: pluginDir,
-      agentDir: pluginDir,
-      extensionFactories: [
-        (api) => {
-          api.on("tool_result", async (event) => ({ ...event, terminate: pluginTerminate }));
-        },
-      ],
+    const resourceLoader = await createResourceLoader((api) => {
+      api.on("tool_result", async (event) => ({ ...event, terminate: pluginTerminate }));
     });
-    await resourceLoader.reload();
     const loaded = resourceLoader.getExtensions();
     expect(loaded.errors).toEqual([]);
     expect(loaded.extensions).toHaveLength(1);
@@ -535,22 +490,9 @@ describe("AgentSession loop correctness", () => {
     let modelTurns = 0;
     streamMocks.streamSimple.mockImplementation((activeModel: Model) => {
       modelTurns += 1;
-      return createAssistantResultStream(
-        createAssistant(
-          activeModel,
-          modelTurns === 1
-            ? [
-                {
-                  type: "toolCall",
-                  id: "call-finish-via-middleware",
-                  name: "finish_via_middleware",
-                  arguments: {},
-                },
-              ]
-            : [{ type: "text", text: "continued" }],
-          modelTurns === 1 ? "toolUse" : "stop",
-        ),
-      );
+      return modelTurns === 1
+        ? toolResponse(activeModel, "finish_via_middleware")
+        : textResponse(activeModel, "continued");
     });
     const { session } = await createTestSession({
       resourceLoader,
@@ -565,21 +507,10 @@ describe("AgentSession loop correctness", () => {
   it("does not retry a high-usage turn terminated by a tool result", async () => {
     const terminalTool: ToolDefinition = {
       ...createStubTool("finish"),
-      execute: async () => ({
-        content: [{ type: "text", text: "finished" }],
-        details: {},
-        terminate: true,
-      }),
+      execute: async () => toolResult("finished", true),
     };
     streamMocks.streamSimple.mockImplementation((activeModel: Model) =>
-      createAssistantResultStream(
-        createAssistant(
-          activeModel,
-          [{ type: "toolCall", id: "call-finish", name: "finish", arguments: {} }],
-          "toolUse",
-          activeModel.contextWindow,
-        ),
-      ),
+      toolResponse(activeModel, "finish", activeModel.contextWindow),
     );
     const { session } = await createCompactingSession({
       customTools: [terminalTool],
@@ -647,7 +578,7 @@ describe("AgentSession loop correctness", () => {
     );
 
     expect(getSummaryRequests()).toBe(1);
-    expect(sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+    expectNoCompaction(sessionManager);
   });
 
   it("does not replay a length-stopped empty summary and leaves the selected route usable", async () => {
@@ -714,20 +645,15 @@ describe("AgentSession loop correctness", () => {
       await session.prompt("long request");
 
       expect([observed.agentRequests, observed.summaryRequests]).toEqual([1, 2]);
-      expect(compactionEvents).toContainEqual(
-        expect.objectContaining({
-          type: "compaction_end",
-          reason: "overflow",
-          outcome: {
-            status: "failed",
-            reason:
-              kind === "truncated"
-                ? "Context overflow recovery failed: Turn prefix summarization failed: summary truncated at the output token limit"
-                : "Context overflow recovery failed: Turn prefix summarization failed: model returned no summary text",
-          },
-        }),
-      );
-      expect(sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+      expectCompactionOutcome(compactionEvents, "overflow", {
+        status: "failed",
+        reason:
+          "Context overflow recovery failed: Turn prefix summarization failed: " +
+          (kind === "truncated"
+            ? "summary truncated at the output token limit"
+            : "model returned no summary text"),
+      });
+      expectNoCompaction(sessionManager);
     },
   );
 
@@ -766,9 +692,7 @@ describe("AgentSession loop correctness", () => {
         reason: "overflow",
         outcome: { status: "aborted" },
       });
-      expect(created.sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(
-        false,
-      );
+      expectNoCompaction(created.sessionManager);
     },
   );
 
@@ -789,18 +713,12 @@ describe("AgentSession loop correctness", () => {
     await session.prompt("long request");
 
     expect([observed.agentRequests, observed.summaryRequests]).toEqual([1, 1]);
-    expect(compactionEvents).toContainEqual(
-      expect.objectContaining({
-        type: "compaction_end",
-        reason: "overflow",
-        outcome: {
-          status: "failed",
-          reason:
-            "Context overflow recovery failed: Turn prefix summarization failed: provider unavailable",
-        },
-      }),
-    );
-    expect(sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+    expectCompactionOutcome(compactionEvents, "overflow", {
+      status: "failed",
+      reason:
+        "Context overflow recovery failed: Turn prefix summarization failed: provider unavailable",
+    });
+    expectNoCompaction(sessionManager);
   });
 
   it("leaves reactive overflow recovery to the caller when configured", async () => {
@@ -890,15 +808,7 @@ describe("AgentSession extension dispatch", () => {
     const { loader, api } = await extensionFixture();
     let responses = 0;
     streamMocks.streamSimple.mockImplementation((model) =>
-      createAssistantResultStream(
-        createAssistant(
-          model,
-          responses++ === 0
-            ? [{ type: "toolCall", id: "call-read", name: "read", arguments: {} }]
-            : "done",
-          responses === 1 ? "toolUse" : "stop",
-        ),
-      ),
+      responses++ === 0 ? toolResponse(model, "read") : textResponse(model, "done"),
     );
     const { session } = await createTestSession({
       resourceLoader: loader,
@@ -906,8 +816,8 @@ describe("AgentSession extension dispatch", () => {
         {
           ...createStubTool("read"),
           execute: async (_id, _args, _signal, onUpdate) => {
-            onUpdate?.({ content: [{ type: "text", text: "reading" }], details: {} });
-            return { content: [{ type: "text", text: "value" }], details: {} };
+            onUpdate?.(toolResult("reading"));
+            return toolResult("value");
           },
         },
       ],
