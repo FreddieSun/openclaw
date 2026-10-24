@@ -5,7 +5,7 @@ import type { AgentMessage } from "../runtime/index.js";
 import { makeAgentAssistantMessage } from "../test-helpers/agent-message-fixtures.js";
 import { projectAgentHarnessTranscriptMessageForDisplay } from "./transcript-visibility.js";
 
-it("hides only the scheduled execution input, not results or requests for attention", () => {
+it("hides scheduled execution prose even without a live run registry", () => {
   const inputProvenance = { kind: "internal_system", sourceTool: "cron_execution" } as const;
   const input = { role: "user", content: "Check the queue", timestamp: 1 } as const;
   expect(
@@ -19,7 +19,7 @@ it("hides only the scheduled execution input, not results or requests for attent
     const message = { role: "assistant", content: [{ type: "text", text }] } as AgentMessage;
     expect(
       projectAgentHarnessTranscriptMessageForDisplay({ hidden: false, inputProvenance, message }),
-    ).toBe(message);
+    ).toMatchObject({ display: false });
   }
 });
 

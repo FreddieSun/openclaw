@@ -1,4 +1,3 @@
-import { readAutomationDisplayState } from "../../infra/agent-run-registry.automation.js";
 import {
   isCronExecutionInputProvenance,
   isProgressCardRefreshInputProvenance,
@@ -31,8 +30,7 @@ export function projectAgentHarnessTranscriptMessageForDisplay<T extends AgentMe
   const scheduledAssistant =
     params.message.role === "assistant" &&
     params.message.stopReason !== "error" &&
-    params.message.stopReason !== "aborted" &&
-    readAutomationDisplayState(params.runId) !== "ordinary";
+    params.message.stopReason !== "aborted";
   const executionOnly =
     scheduled &&
     (params.message.role === "user" ||
