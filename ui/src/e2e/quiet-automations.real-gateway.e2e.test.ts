@@ -594,6 +594,7 @@ suite.define(() => {
         await page.reload();
         await waitForControlUiGatewayReady(page);
         await pane.locator(".chat-bubble").getByText(fixture.done, { exact: true }).waitFor();
+        await openAutomations(page);
         await expect.poll(() => row.textContent()).toContain(fixture.done);
         proof.complete = true;
         proof.stage = "complete";
