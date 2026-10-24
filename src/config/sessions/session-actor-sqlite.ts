@@ -49,6 +49,8 @@ type NativeAdmission = {
 };
 
 export type SessionActorTransport = {
+  /** Selected at database acquisition; unscoped session keys cannot supply this identity. */
+  readonly agentId: string;
   /** The existing physical writer queue owns serialization, including warm reads. */
   run<T>(
     operation: (scope: {
@@ -362,36 +364,44 @@ export function createSqliteSessionActorExecutor(
                       }
                     }
                   }
-                  if (target.database.kind === "file" && metadata?.length) {
-                    // Terminal accounting may change the row without appending a transcript event.
-                    const databaseIdentity = target.database.physicalIdentity;
-                    const agentId = resolveAgentIdFromSessionKey(target.sessionKey);
-                    const publication = retainSessionEntryWorkerPublication({
-                      agentId,
-                      storePath: target.database.nativeLocation,
-                      databaseIdentity,
-                    });
-                    publication.beginChanges(
-                      metadata.flatMap((entryReceipt) => [...entryReceipt.facts.keys()]),
-                    );
-                    try {
-                      publication.settleMetadata(metadata, [], (previous, current) =>
-                        publishCommittedSessionIdentity(
-                          agentId,
-                          databaseIdentity,
-                          previous,
-                          current,
-                        ),
-                      );
-                    } finally {
-                      publication.settle(undefined, false);
-                    }
-                  }
                   // Partial transcript publication precedes installation of the full actor replica.
                   publishCommittedSessionTranscriptReceipts(
                     committed.receipt.transcript.authorityReceipts,
                   );
-                  observer?.committed(committed);
+                  try {
+                    observer?.committed(committed);
+                  } finally {
+                    // Record input custody before fallible identity notifications; row facts
+                    // still settle when the receipt observer reports a committed failure.
+                    if (target.database.kind === "file" && metadata?.length) {
+                      // Terminal accounting may change the row without appending a transcript event.
+                      const databaseIdentity = target.database.physicalIdentity;
+                      const agentId = resolveAgentIdFromSessionKey(
+                        target.sessionKey,
+                        params.transport.agentId,
+                      );
+                      const publication = retainSessionEntryWorkerPublication({
+                        agentId,
+                        storePath: target.database.nativeLocation,
+                        databaseIdentity,
+                      });
+                      publication.beginChanges(
+                        metadata.flatMap((entryReceipt) => [...entryReceipt.facts.keys()]),
+                      );
+                      try {
+                        publication.settleMetadata(metadata, [], (previous, current) =>
+                          publishCommittedSessionIdentity(
+                            agentId,
+                            databaseIdentity,
+                            previous,
+                            current,
+                          ),
+                        );
+                      } finally {
+                        publication.settle(undefined, false);
+                      }
+                    }
+                  }
                 } catch (error) {
                   result = preserveFailure(error);
                 }

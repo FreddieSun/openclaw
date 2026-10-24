@@ -468,6 +468,14 @@ suite.define(() => {
           retainedMeaningfulResult: meaningful,
         };
         await screenshot(page, "desktop-blocked-after-quiet-checks", fixture.name);
+        await row.hover();
+        await screenshot(page, "desktop-automation-hover", fixture.name);
+        await page.keyboard.press("Tab");
+        await row.focus();
+        expect(await row.evaluate((element) => element.matches(":focus-visible"))).toBe(true);
+        expect(await row.evaluate((element) => getComputedStyle(element).outlineWidth)).toBe("2px");
+        await screenshot(page, "desktop-automation-focus", fixture.name);
+        await row.blur();
         await closeChatDetails(page);
         await page.setViewportSize({ width: 390, height: 844 });
         await pane.locator(".agent-chat__header--mobile").waitFor();
